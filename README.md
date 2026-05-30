@@ -1,5 +1,5 @@
 # NUFSHT.jl
-Non-uniform Fast Spherical Hamornics Transforms
+Non-uniform Fast Spherical Hamornics Transforms on CPU and GPU
 
 
 See:
