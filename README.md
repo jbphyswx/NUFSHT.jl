@@ -9,4 +9,5 @@ See:
 - https://github.com/ludvigak/FINUFFT.jl
 - https://github.com/jishnub/SphericalHarmonics.jl
 - SHTns https://nschaeff.bitbucket.io/shtns/
-- parallALT https://doi.org/10.1145/3807446 
+- parallALT https://doi.org/10.1145/3807446
+- SFSHT https://www-user.tu-chemnitz.de/~potts/nfft/guide35/html/group__nfsft.html
