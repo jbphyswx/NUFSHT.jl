@@ -31,19 +31,22 @@ lmax = 100
 φ = rand(1000) .* 2π         # longitudes in [0,2π)
 plan = make_plan(θ, φ, lmax)
 
-# Type 1 (adjoint analysis): scattered field values → harmonic coefficients
-# Note: nusht_type1! is the adjoint (not inverse) of nusht_type2!.
-# It is exact at Clenshaw-Curtis grid points (sph_points); approximate elsewhere.
-f = randn(1000)               # field values at (θ,φ)
-C = similar(plan.C)           # coefficient array (lmax+1)×(2lmax+1)
-nusht_type1!(C, f, plan)
-
 # Type 2 (synthesis): harmonic coefficients → scattered field values
-f_out = similar(f)
-nusht_type2!(f_out, C, plan)
+f = zeros(1000)
+nusht_type2!(f, C, plan)
+
+# Type 1 (adjoint analysis): scattered field values → harmonic coefficients
+# Exact on Clenshaw-Curtis grid points; approximate elsewhere.
+C_out = similar(plan.C)
+nusht_type1!(C_out, f, plan)
+
+# Exact inversion at arbitrary scattered points via CG
+# (use this instead of nusht_type1! when points are NOT on the CC grid)
+C_exact = similar(plan.C)
+nusht_solve!(C_exact, f, plan; rtol=1e-6)
 
 # Filter a field: apply low-pass Gaussian filter with scale 200 km
-filter = GaussianTransfer(200e3)
+filter = gaussian_from_scale(200e3)   # or: GaussianTransfer(sigma_sq)
 f_filt = similar(f)
 nusht_filter!(f_filt, f, filter, plan)
 ```

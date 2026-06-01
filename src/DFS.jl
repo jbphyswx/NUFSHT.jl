@@ -36,8 +36,13 @@ sampled on the open CC grid (no poles, θ_i = π/Nθ * (i-0.5)), produce F̃ of
 size (2Nθ, Nφ) on the doubly-periodic torus covering [0, 2π) in θ.
 
 All Nθ rows are reflected (the open CC grid has no pole duplicates):
-  F̃[1:Nθ, :]        = F[1:Nθ, :]            (original northern half)
-  F̃[Nθ+i, j]        = F[Nθ+1-i, j+Nφ/2]   for i=1..Nθ (reflected, φ-shifted)
+  F̃[1:Nθ, :]   = F[1:Nθ, :]                       (original northern half)
+  F̃[Nθ+i, j]   = F[Nθ+1-i, mod1(j + Nφ÷2, Nφ)]  for i=1..Nθ (reflected, φ+π shifted)
+
+The shift `mod1(j + Nφ÷2, Nφ)` is used (rather than the simpler conditional
+`j <= half ? j+half : j-half`) because Nφ = 2*lmax+1 is always **odd**, and the
+simple form is not a bijection for odd Nφ (two source columns collide at the
+same target column). `mod1` gives a proper cyclic permutation for any Nφ.
 
 The doubled grid has θ cell-centres at 2π/(2Nθ) * (i-0.5) for i=1..2Nθ, which
 matches the FFTW grid after the half-pixel phase correction applied in
@@ -70,11 +75,18 @@ end
 """
     dfs_fold(F̃) -> F
 
-Adjoint of `dfs_double`. Given F̃ of size (2Nθ, Nφ) on the doubled torus,
-fold back to F of size (Nθ, Nφ) on [0,π].
+Adjoint (matrix transpose) of `dfs_double!`. Given F̃ of size (2Nθ, Nφ) on the
+doubled torus, fold back to F of size (Nθ, Nφ) on [0,π].
 
-All rows accumulate their mirror (there are no poles in the open CC grid):
-  F[i,j] = F̃[i,j] + F̃[Nθ+Nθ+1-i, j_shifted]  for i=1..Nθ
+All rows accumulate their mirror using the **inverse** of the `dfs_double!`
+φ-shift. Since `dfs_double!` shifts by `+Nφ÷2 (mod Nφ)`, the adjoint undoes
+that with `-Nφ÷2 (mod Nφ)`:
+
+  F[i,j] = F̃[i,j] + F̃[2Nθ+1-i, mod1(j - Nφ÷2, Nφ)]  for i=1..Nθ
+
+For even Nφ, `+half` and `-half` are equivalent mod Nφ so both shifts coincide.
+For odd Nφ they differ, and using the correct inverse shift is essential for
+`dfs_fold!` to be the exact algebraic adjoint of `dfs_double!`.
 """
 function dfs_fold(F̃::AbstractMatrix)
     Nθ_double, Nφ = size(F̃)
