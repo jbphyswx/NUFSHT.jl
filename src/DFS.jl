@@ -60,7 +60,7 @@ function dfs_double!(F̃::AbstractMatrix, F::AbstractMatrix)
     for i in 1:Nθ
         i_mirror = Nθ + i
         for j in 1:Nφ
-            j_shifted = j <= half ? j + half : j - half
+            j_shifted = mod1(j + half, Nφ)
             F̃[i_mirror, j] = F[Nθ + 1 - i, j_shifted]
         end
     end
@@ -93,7 +93,7 @@ function dfs_fold!(F::AbstractMatrix, F̃::AbstractMatrix)
     for i in 1:Nθ
         i_mirror = Nθ + (Nθ + 1 - i)
         for j in 1:Nφ
-            j_shifted = j <= half ? j + half : j - half
+            j_shifted = mod1(j - half, Nφ)
             F[i, j] = F̃[i, j] + F̃[i_mirror, j_shifted]
         end
     end

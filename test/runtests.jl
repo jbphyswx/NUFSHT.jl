@@ -13,4 +13,6 @@ Test.@testset "NUFSHT.jl" begin
     include("test_constant.jl")
     include("test_kernels.jl")
     include("test_roundtrip.jl")
+    include("test_synthesis.jl")
+    include("test_solve.jl")
 end
