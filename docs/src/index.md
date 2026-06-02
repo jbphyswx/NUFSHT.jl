@@ -4,6 +4,24 @@
 Double Fourier Sphere (DFS) + NUFFT algorithm for spherical harmonic transforms at
 arbitrary scattered (colatitude, longitude) points.
 
+## Results
+
+### Synthesis + Round-Trip Accuracy (10⁻¹¹ relative error)
+
+![Synthesis and Accuracy](../assets/synthesis_and_accuracy.png)
+
+### CG Inversion at Arbitrary Scattered Points
+
+![CG Inversion](../assets/cg_inversion.png)
+
+### Spectral Filtering
+
+![Spectral Filtering](../assets/spectral_filtering.png)
+
+### Ocean Mask + Renormalization
+
+![Mask Renorm](../assets/mask_renorm.png)
+
 ## What it does
 
 Given a field sampled at M arbitrary points on the sphere, NUFSHT.jl can:
