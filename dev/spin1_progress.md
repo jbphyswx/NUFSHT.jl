@@ -42,3 +42,33 @@ type2 at the doubled grid -> should return F̃, but rel_err≈1.6, NO spin invol
 Correct plan: do NOT re-derive the FFT/phase/FINUFFT layout in a prototype — reuse NUFSHT's
 existing tested scalar machinery and swap ONLY (a) the S step (scalar->spin via FastTransforms
 spin plans) and (b) the doubling rule (from the spin-DFS derivation). Re-test vs finer-grid ref.
+
+## Update 2 — blocker precisely isolated (Spin.jl is WIP/unvalidated)
+Built `src/Spin.jl` (SpinNUSHTplan, make_spin_plan, nusht_type2_spin!/type1/solve, spin_sph_mode,
+spin DFS doubling). Validation status:
+- Grid CONFIRMED: FastSphericalHarmonics.sph_points = θ=π(i-0.5)/Nθ, φ=2π(j-1)/Nφ exactly.
+- SCALAR NUFSHT reproduces synthesis at that grid to 5.8e-13 (machinery + grid correct).
+- nusht_solve_spin! is self-consistent (synth∘solve round-trips ~1e-10) but that only proves
+  internal consistency, not correctness.
+- SPIN type2 vs exact reference: rel_err ≈ 1.5–1.8. Adjoint test fails (~1.6).
+- Doubling sweep {sgn=±1}×{conj} ALL give identical ≈1.77; m-space (−1)^(m+s) also fails;
+  and crucially **s=0 through the SPIN plans also fails (≈1.38)** while scalar `sph2fourier`
+  path passes. ⇒ the failure is NOT the DFS doubling rule.
+
+### Root cause
+`spinsph2fourier`/`spinsph_synthesis` (FastTransforms) use a DIFFERENT bivariate-Fourier
+representation / grid mapping than the scalar `sph2fourier`/`sph_synthesis`. NUFSHT's scalar
+DFS+FFT+FINUFFT machinery (phase_θ half-pixel correction, even-DFS doubling, FINUFFT mode
+layout) was tuned to the SCALAR Fourier output and does not transfer to the spin output.
+
+### Clean paths forward (need the authoritative convention, not guessing)
+1. **Direct bivariate-Fourier → FINUFFT:** `spinsph2fourier` (P) already yields the bivariate
+   Fourier coefficients; map P*C straight into the FINUFFT 2D mode array (skip grid+DFS+FFT).
+   Requires Slevinsky's spin coefficient/Fourier layout (cos/sin vs complex, (m',m) ordering).
+2. **Spin DFS:** keep the grid pipeline but use the spin synthesis grid/Fourier convention
+   that FastTransforms actually produces (read `ft_execute_spinsph_synthesis` C source or
+   Slevinsky 2019 + spin generalization).
+
+Action: obtain the FastTransforms/Slevinsky spin bivariate-Fourier convention properly
+(re-run focused research or read FastTransforms C source), then finish + validate against the
+exact finer-grid reference and the adjoint test.
