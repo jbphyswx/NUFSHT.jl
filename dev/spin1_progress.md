@@ -33,3 +33,12 @@ issue: pyspherical, ssht/s2fft, Huffenberger & Wandelt, Price & McEwen (2024).
 
 Validation harness (`dev/spin_validation_harness.jl`) gives a convention-free exact reference
 (finer-grid via coeff embedding) to iterate the doubling rule against.
+
+## CORRECTION (important)
+The standalone harness's hand-rolled fft2_to_coeffs+FINUFFT replication is itself buggy: it
+fails the pure DFT->IDFT interpolation identity (arbitrary doubled F̃ -> FFT+phase -> FINUFFT
+type2 at the doubled grid -> should return F̃, but rel_err≈1.6, NO spin involved). So the
+"naive (−1)^s doubling fails" result is CONFOUNDED by this machinery bug, not conclusive.
+Correct plan: do NOT re-derive the FFT/phase/FINUFFT layout in a prototype — reuse NUFSHT's
+existing tested scalar machinery and swap ONLY (a) the S step (scalar->spin via FastTransforms
+spin plans) and (b) the doubling rule (from the spin-DFS derivation). Re-test vs finer-grid ref.
