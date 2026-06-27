@@ -72,3 +72,18 @@ layout) was tuned to the SCALAR Fourier output and does not transfer to the spin
 Action: obtain the FastTransforms/Slevinsky spin bivariate-Fourier convention properly
 (re-run focused research or read FastTransforms C source), then finish + validate against the
 exact finer-grid reference and the adjoint test.
+
+## SOLVED (Update 3)
+Spin-weighted scattered SHT implemented from scratch via Wigner-d (NOT FastTransforms spin
+plans) and validated to machine precision (synthesis 4.9e-13, adjoint 1.4e-15, solve 2.5e-10).
+Key identity: d^ℓ_{mn}(θ)=i^{m-n} Σ_{m'} Δ^ℓ_{m'm}Δ^ℓ_{m'n}e^{-im'θ}, Δ=d^ℓ(π/2).
+
+Scattered-spherical HODGE/Helmholtz decomposition validated end-to-end via spin(±1):
+- V₊=u_θ+iu_φ (s=+1), V₋=u_θ−iu_φ (s=−1); solve both; sym=(a₊+a₋)/2, anti=(a₊−a₋)/2.
+- ROTATIONAL = recon(sym, sym);  DIVERGENT = recon(anti, −anti).
+- Validated: pure-rotational Rossby → rot/U=1.0, div≈2e-4; pure-divergent → div/U=1.0,
+  rot≈1e-4; mixed → both present; reconstruction ~1e-6 (band-limited). Calibration in
+  dev/spin_hodge_calibration.jl, dev/spin_hodge_validation.jl.
+
+Remaining: wire HelmholtzDecomposition.jl scattered-spherical (NUSHT ext) to use this; merge
+this branch to NUFSHT main so HD can resolve the spin API.
