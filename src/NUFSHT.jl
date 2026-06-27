@@ -76,6 +76,7 @@ using LinearAlgebra: LinearAlgebra
 include("DFS.jl")
 include("Plan.jl")
 include("Kernels.jl")
+include("Spin.jl")
 
 export make_plan, NUSHTplan
 export nusht_type1!, nusht_type2!, nusht_filter!, nusht_filter_renorm!, nusht_solve!

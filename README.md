@@ -22,6 +22,34 @@ at arbitrary scattered (colatitude, longitude) points on the sphere.
 
 ![Mask Renormalization](docs/assets/mask_renorm.png)
 
+## Spin-weighted transforms (spin-`s`)
+
+NUFSHT also synthesizes/analyzes **spin-weighted** fields at arbitrary scattered points —
+built directly from the Wigner-`d` Fourier factorization plus a 2-D NUFFT, independent of any
+spin convention in FastTransforms. Spin-1 is the tangent-vector case (a velocity
+`U = u_θ + i u_φ` is a spin-1 field), which enables vector/Helmholtz decomposition on
+scattered spherical data.
+
+```julia
+using NUFSHT
+lmax, s = 32, 1
+θ = π .* rand(5000); φ = 2π .* rand(5000)          # scattered colatitude/longitude
+plan = make_spin_plan(θ, φ, lmax, s)
+
+# synthesis: spin-s coefficients -> complex field values at the points
+f = zeros(ComplexF64, length(θ))
+nusht_type2_spin!(f, sf, plan)                      # sf :: (lmax+1, 2lmax+1)
+
+# exact inversion at arbitrary scattered points (CG on the normal equations)
+sf = zeros(ComplexF64, lmax+1, 2lmax+1)
+nusht_solve_spin!(sf, f, plan; rtol=1e-9)
+```
+
+`make_spin_plan` / `nusht_type2_spin!` / `nusht_type1_spin!` (exact adjoint) /
+`nusht_solve_spin!`; coefficient indices via `spin_coeff_index(ℓ,m,lmax)`, direct harmonic
+values via `sYlm(s,ℓ,m,θ,φ)`. Validated to ~1e-12 (synthesis), ~1e-15 (adjoint), and exact
+scattered inversion. See `dev/spin_hodge_validation.jl` for the spin-1 Helmholtz/Hodge use.
+
 ## Installation
 
 ```julia

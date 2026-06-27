@@ -15,4 +15,5 @@ Test.@testset "NUFSHT.jl" begin
     include("test_roundtrip.jl")
     include("test_synthesis.jl")
     include("test_solve.jl")
+    include("test_spin.jl")
 end

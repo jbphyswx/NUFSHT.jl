@@ -12,6 +12,7 @@ FINUFFT = "d8beea63-0952-562e-9c6a-8e8ef7364055"
 FastSphericalHarmonics = "d335c211-7587-445e-a753-f0b1fb7e445f"
 FastTransforms = "057dd010-8810-581a-b7be-e3fc3b93f78c"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 
 [compat]
 FFTW = "1"
@@ -19,5 +20,5 @@ FINUFFT = "3"
 FastSphericalHarmonics = "1"
 FastTransforms = "0.17.1"
 LinearAlgebra = "1"
+SpecialFunctions = "2.8.0"
 julia = "1.9"
-
