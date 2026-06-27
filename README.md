@@ -22,6 +22,10 @@ at arbitrary scattered (colatitude, longitude) points on the sphere.
 
 ![Mask Renormalization](docs/assets/mask_renorm.png)
 
+### Spin-weighted synthesis + spin-1 Hodge decomposition
+
+![Spin-weighted transforms](docs/assets/spin_synthesis.png)
+
 ## Spin-weighted transforms (spin-`s`)
 
 NUFSHT also synthesizes/analyzes **spin-weighted** fields at arbitrary scattered points —

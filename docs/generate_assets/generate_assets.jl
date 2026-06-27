@@ -343,6 +343,70 @@ function figure_mask_renorm()
     println("Saved: $outpath")
 end
 
+
+# ─── Figure 5: Spin-weighted synthesis + spin-1 Hodge decomposition ───────
+
+function figure_spin()
+    lmax, s = 20, 1
+    shp = (lmax+1, 2lmax+1)
+    M = 4000
+    θ = rand(M) .* π
+    φ = rand(M) .* 2π
+    plan = NUFSHT.make_spin_plan(θ, φ, lmax, s; tol=1e-10)
+
+    # A spin-1 field from a few modes
+    sf = zeros(ComplexF64, shp)
+    for (ℓ,m) in ((1,0),(2,1),(3,-2),(4,2))
+        sf[NUFSHT.spin_coeff_index(ℓ,m,lmax)] = randn(ComplexF64)
+    end
+    f = zeros(ComplexF64, M); NUFSHT.nusht_type2_spin!(f, sf, plan)
+
+    # Mixed tangent field (rotational Rossby + divergent) → Hodge split
+    lat = (π/2) .- θ
+    n,mm,q,pp = 3,2,2,3
+    ue = [n*cos(mm*φ[j])*cos(lat[j])^(n-1)*sin(lat[j]) + 0.6*(q/cos(lat[j])*cos(q*φ[j])*cos(lat[j])^pp) for j in 1:M]
+    un = [-mm/cos(lat[j])*sin(mm*φ[j])*cos(lat[j])^n + 0.6*(-pp*sin(q*φ[j])*cos(lat[j])^(pp-1)*sin(lat[j])) for j in 1:M]
+    uθ = -un; uφ = ue
+    planp = NUFSHT.make_spin_plan(θ, φ, lmax, +1; tol=1e-10)
+    planm = NUFSHT.make_spin_plan(θ, φ, lmax, -1; tol=1e-10)
+    ap = zeros(ComplexF64, shp); NUFSHT.nusht_solve_spin!(ap, uθ .+ im.*uφ, planp; rtol=1e-9)
+    am = zeros(ComplexF64, shp); NUFSHT.nusht_solve_spin!(am, uθ .- im.*uφ, planm; rtol=1e-9)
+    sym = (ap.+am)./2; anti = (ap.-am)./2
+    function spd(a1,a2)
+        V1=zeros(ComplexF64,M); NUFSHT.nusht_type2_spin!(V1,a1,planp)
+        V2=zeros(ComplexF64,M); NUFSHT.nusht_type2_spin!(V2,a2,planm)
+        ue1=real.((V1.-V2)./(2im)); un1=-real.((V1.+V2)./2)
+        sqrt.(ue1.^2 .+ un1.^2)
+    end
+    spd_orig = sqrt.(ue.^2 .+ un.^2)
+    spd_rot = spd(sym, sym)
+    spd_div = spd(anti, .-anti)
+
+    φd = φ .* (180/π); θd = θ .* (180/π)
+    fig = CairoMakie.Figure(; size=(1500, 360), fontsize=13)
+    CairoMakie.Label(fig[0, 1:10], "Spin-weighted scattered transforms (spin-1)"; fontsize=17, font=:bold)
+    c1 = maximum(abs.(real.(f)))
+    ax1 = CairoMakie.Axis(fig[1,1]; title="Re ₁f  (synthesis at 4000 pts)", xlabel="φ (°)", ylabel="θ (°)", yreversed=true)
+    s1 = CairoMakie.scatter!(ax1, φd, θd; color=real.(f), colormap=:RdBu, colorrange=(-c1,c1), markersize=5)
+    CairoMakie.Colorbar(fig[1,2], s1; width=10)
+    ax2 = CairoMakie.Axis(fig[1,3]; title="Im ₁f", xlabel="φ (°)", ylabel="θ (°)", yreversed=true)
+    s2 = CairoMakie.scatter!(ax2, φd, θd; color=imag.(f), colormap=:RdBu, colorrange=(-c1,c1), markersize=5)
+    CairoMakie.Colorbar(fig[1,4], s2; width=10)
+    cm = maximum(spd_orig)
+    ax3 = CairoMakie.Axis(fig[1,5]; title="|u| mixed field", xlabel="φ (°)", ylabel="θ (°)", yreversed=true)
+    s3 = CairoMakie.scatter!(ax3, φd, θd; color=spd_orig, colormap=:viridis, colorrange=(0,cm), markersize=5)
+    CairoMakie.Colorbar(fig[1,6], s3; width=10)
+    ax4 = CairoMakie.Axis(fig[1,7]; title="|u_rot| (rotational)", xlabel="φ (°)", ylabel="θ (°)", yreversed=true)
+    s4 = CairoMakie.scatter!(ax4, φd, θd; color=spd_rot, colormap=:viridis, colorrange=(0,cm), markersize=5)
+    CairoMakie.Colorbar(fig[1,8], s4; width=10)
+    ax5 = CairoMakie.Axis(fig[1,9]; title="|u_div| (divergent)", xlabel="φ (°)", ylabel="θ (°)", yreversed=true)
+    s5 = CairoMakie.scatter!(ax5, φd, θd; color=spd_div, colormap=:viridis, colorrange=(0,cm), markersize=5)
+    CairoMakie.Colorbar(fig[1,10], s5; width=10)
+    outpath = joinpath(ASSETS_DIR, "spin_synthesis.png")
+    CairoMakie.save(outpath, fig; px_per_unit=2)
+    println("Saved: $outpath")
+end
+
 # ─── Generate all ─────────────────────────────────────────────────────────
 
 println("Generating documentation assets for NUFSHT.jl...")
@@ -351,5 +415,6 @@ figure_synthesis_and_accuracy()
 figure_cg_inversion()
 figure_spectral_filtering()
 figure_mask_renorm()
+figure_spin()
 println()
 println("Done! Assets saved to: $ASSETS_DIR")
