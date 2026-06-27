@@ -15,6 +15,23 @@ nusht_type1!
 nusht_solve!
 ```
 
+## Spin-weighted transforms
+
+Synthesis/analysis/inversion of spin-weighted (`spin = s`) fields at arbitrary scattered
+points, built from the Wigner-`d` Fourier factorization + a 2-D NUFFT. Spin-1 is the
+tangent-vector case (velocity `u_θ + i u_φ`), enabling vector / Helmholtz decomposition on
+scattered spherical data.
+
+```@docs
+make_spin_plan
+SpinNUSHTplan
+nusht_type2_spin!
+nusht_type1_spin!
+nusht_solve_spin!
+sYlm
+spin_coeff_index
+```
+
 ## Filtering
 
 ```@docs
