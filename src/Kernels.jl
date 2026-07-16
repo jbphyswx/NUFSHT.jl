@@ -92,15 +92,18 @@ end
 """
     apply_transfer!(C, filter, lmax)
 
-Multiply a FastSphericalHarmonics coefficient array C (size (lmax+1)×(2lmax+1))
-in-place by the transfer function H(ℓ) for each degree ℓ.
+Multiply a FastSphericalHarmonics coefficient array `C` — size `(lmax+1, 2lmax+1)` or batched
+`(lmax+1, 2lmax+1, B)` — in-place by the transfer function `H(ℓ)` for each degree `ℓ` (broadcast
+across the batch dimension).
 """
 function apply_transfer!(C, filter, lmax)
     for ℓ in 0:lmax
         h = kernel_transfer(filter, ℓ)
         for m in -ℓ:ℓ
             idx = FastSphericalHarmonics.sph_mode(ℓ, m)
-            C[idx] *= h
+            @inbounds for b in axes(C, 3)
+                C[idx, b] *= h
+            end
         end
     end
     return C

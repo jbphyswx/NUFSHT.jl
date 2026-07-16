@@ -1,70 +1,26 @@
 """
     NUFSHT.jl — Non-Uniform Fast Spherical Harmonic Transform (native Julia)
 
-Implements the Double Fourier Sphere (DFS) + nuFFT algorithm for computing
-spherical harmonic transforms at arbitrary scattered (colatitude, longitude) points.
+Double Fourier Sphere (DFS) + nuFFT spherical harmonic transforms at arbitrary scattered
+`(colatitude, longitude)` points. The synthesis operator factors as `A = N·F·D·S`:
 
-## Algorithm
+- **S** (`plan_sph2fourier`/`plan_sph_synthesis`): iso-latitude Legendre step between SH
+  coefficients and an equiangular Clenshaw-Curtis grid.
+- **D** (`dfs_double!`/`dfs_fold!`): "doubling" that extends colatitude [0,π] → [0,2π) across the
+  south pole, making the field doubly-periodic.
+- **F** (`fft_plan`/`ifft_plan` + half-pixel phase): 2D FFT on the doubled torus.
+- **N** (FINUFFT guru type 2 / type 1): non-uniform FFT evaluating the 2D Fourier series at the
+  scattered points.
 
-The algorithm decomposes the non-uniform SHT (nuSHT) into four operations
-(following Reinecke & Seljebotn 2013 and Belkner et al. 2024):
-
-    Y = N · F · D · S
-
-where:
-- **S** (`sph_transform` / `sph_evaluate`): iso-latitude rSHT between
-  spherical harmonic coefficients c_ℓm and an equiangular Clenshaw-Curtis grid.
-- **D** (`dfs_double` / `dfs_fold`): "doubling" that extends the colatitude range
-  from [0,π] to [0,2π) across the south pole, making the field doubly-periodic.
-- **F** (implicit 2D FFT embedded in FINUFFT): standard 2D DFT on the doubled torus.
-- **N** (`nufft2d2` / `nufft2d1`): non-uniform FFT evaluating the 2D Fourier series
-  at the arbitrary scattered points.
-
-## Usage
-
-```julia
-using NUFSHT
-
-# Create a plan for M scattered points up to degree lmax
-lmax = 100
-θ = rand(1000) .* π          # colatitudes in [0,π]
-φ = rand(1000) .* 2π         # longitudes in [0,2π)
-plan = make_plan(θ, φ, lmax)
-
-# Type 2 (synthesis): harmonic coefficients → scattered field values
-f = zeros(1000)
-nusht_type2!(f, C, plan)
-
-# Type 1 (adjoint analysis): scattered field values → harmonic coefficients
-# Exact on Clenshaw-Curtis grid points; approximate elsewhere.
-C_out = similar(plan.C)
-nusht_type1!(C_out, f, plan)
-
-# Exact inversion at arbitrary scattered points via CG
-# (use this instead of nusht_type1! when points are NOT on the CC grid)
-C_exact = similar(plan.C)
-nusht_solve!(C_exact, f, plan; rtol=1e-6)
-
-# Filter a field: apply low-pass Gaussian filter with scale 200 km
-filter = gaussian_from_scale(200e3)   # or: GaussianTransfer(sigma_sq)
-f_filt = similar(f)
-nusht_filter!(f_filt, f, filter, plan)
-```
+A [`NUSHTplan`](@ref) owns persistent FINUFFT guru plans (built once, points set once) and every
+work buffer, so repeated transforms — filtering, or the hundreds of matvecs in [`nusht_solve!`](@ref)
+— allocate nothing and never re-plan. All calls transform a batch of `B = plan.B` co-located fields
+(`ntrans`); `B = 1` methods accept plain vectors/matrices.
 
 ## References
-
-- Merilees, P.E. (1973): The pseudospectral approximation applied to the shallow
-  water equations on a sphere. Atmosphere, 11(1), 13–20.
-- Townsend, A. & Olver, S. (2015): The automatic solution of partial differential
-  equations using a global spectral method. J. Comput. Phys., 299, 106–123.
-- Reinecke, M. & Seljebotn, D.S. (2013): Libsharp – spherical harmonic transforms
-  revisited. A&A, 554, A112. https://doi.org/10.1051/0004-6361/201220728
-- Keiner, J., Kunis, S. & Potts, D. (2009): Using NFFT3 – a software library for
-  various nonequispaced fast Fourier transforms. ACM Trans. Math. Softw., 36, 19.
-- Belkner, S. et al. (2024): cunuSHT – GPU Accelerated Spherical Harmonic Transforms
-  on Arbitrary Pixelizations. arXiv:2406.14542.
-- FastSphericalHarmonics.jl: https://github.com/eschnett/FastSphericalHarmonics.jl
-- FINUFFT.jl: https://github.com/ludvigak/FINUFFT.jl
+- Merilees (1973); Townsend & Olver (2015); Reinecke & Seljebotn (2013, A&A 554 A112);
+  Keiner, Kunis & Potts (2009); Belkner et al. (2024, arXiv:2406.14542).
+- FastSphericalHarmonics.jl, FINUFFT.jl, FastTransforms.jl.
 """
 module NUFSHT
 
@@ -78,99 +34,203 @@ include("Plan.jl")
 include("Kernels.jl")
 include("Spin.jl")
 
-export make_plan, NUSHTplan
+export make_plan, NUSHTplan, close!, CGWorkspace
 export nusht_type1!, nusht_type2!, nusht_filter!, nusht_filter_renorm!, nusht_solve!
 export TopHatTransfer, GaussianTransfer, SharpSpectralTransfer
 export kernel_transfer, cutoff_degree, gaussian_from_scale
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Type 1: scattered map → spherical harmonic coefficients
-# ─────────────────────────────────────────────────────────────────────────────
+export nusht_type2_threaded!, nusht_type1_threaded!, nusht_solve_threaded!
+export nusht_type2_distributed, nusht_solve_distributed
+export nusht_adjoint_mpi!, nusht_solve_mpi!
+export plot_field
 
 """
-    nusht_type1!(C, f, plan)
+    plot_field(θ, φ, f; colormap=:RdBu, markersize=8, title="", colorbarlabel="Field value") -> Figure
 
-**Type 1 (adjoint synthesis):** Given real field values `f` at M scattered
-points (θᵢ, φᵢ) defined in `plan`, compute the adjoint spherical harmonic
-projection `C = Y† f` up to degree `plan.lmax`.
-
-This is the **adjoint** (not the inverse) of `nusht_type2!`. On the Clenshaw-
-Curtis grid (as returned by `FastSphericalHarmonics.sph_points`), the adjoint
-coincides with the inverse and gives machine-precision coefficients. For
-general scattered non-uniform points, use `nusht_solve!` for exact inversion.
-
-Algorithm (Y† = S† · D† · F† · N†):
-1. N†: FINUFFT type 1 at the M scattered points → 2D Fourier modes on doubled torus
-2. F†: adjoint 2D FFT (with θ phase correction for CC cell-center offset)
-3. D†: DFS fold → equiangular CC half-sphere map (using mod-correct φ+π shift)
-4. S†: `sph_transform!` = S⁻¹ on the CC grid (exact analysis/inverse, equivalent to the
-   Euclidean adjoint when input points lie on the Clenshaw-Curtis quadrature grid)
+Scatter-plot a scalar field `f` sampled at scattered colatitude/longitude points
+(`θ ∈ [0,π]`, `φ ∈ [0,2π)`), coloured by `real(f)` (so a complex/spin field plots its real part).
+Longitude on x, colatitude on y (poles top/bottom). Method supplied by `NUFSHTCairoMakieExt` — load
+it with `using CairoMakie`.
 """
-function nusht_type1!(C, f, plan::NUSHTplan{T}) where {T}
-    (; lmax, Nθ, Nφ, F̃, Fhat, tol) = plan
+function plot_field end
 
-    M = length(f)
-    @assert M == length(plan.θ_nodes) == length(plan.φ_nodes)
-    @assert size(C) == (Nθ, Nφ)
+# ── Parallel-execution API (methods supplied by the accelerator extensions) ────
+# Two shapes, reflecting how each backend shares work:
+#
+#  • In-process (`NUFSHTOhMyThreadsExt`, `using OhMyThreads`): a single FINUFFT plan is not safe to
+#    `exec!` concurrently, so the *_threaded! methods parallelize over independent
+#    (output, input, plan) triples — one plan per task — mutating the outputs in place.
+#
+#  • Cross-process (`NUFSHTDistributedExt`, `using Distributed`): FINUFFT plans hold C pointers and
+#    cannot be serialized to workers, so the *_distributed methods take *node sets* and each worker
+#    builds its own plan (farm of independent problems), returning fresh results.
+#
+#  • `NUFSHTMPIExt` (`using MPI`) point-decomposes a *single* transform across ranks (see the ext).
 
-    f_cmplx = Complex{T}.(f)
+"""
+    nusht_type2_threaded!(fs, Cs, plans)
 
-    Fhat_vec = FINUFFT.nufft2d1(
-        plan.φ_nodes, plan.θ_nodes,
-        f_cmplx,
-        +1, tol,
-        Nφ, 2Nθ,
-    )
+Synthesize a collection of independent problems in parallel: for each `i`, `nusht_type2!(fs[i],
+Cs[i], plans[i])`. One plan per task (FINUFFT plans are not concurrency-safe). Requires an
+extension — e.g. `using OhMyThreads` or `using Distributed`.
+"""
+function nusht_type2_threaded! end
 
-    Fhat_2d = dropdims(Fhat_vec, dims=3)
+"""
+    nusht_type1_threaded!(Cs, fs, plans)
 
-    F̃_real = ifft2_from_coeffs(Fhat_2d, plan)
+Parallel adjoint analysis over independent problems; see [`nusht_type2_threaded!`](@ref).
+"""
+function nusht_type1_threaded! end
 
-    F_folded = dfs_fold(F̃_real)
+"""
+    nusht_solve_threaded!(Cs, fs, plans; kwargs...)
 
-    C .= F_folded
-    FastSphericalHarmonics.sph_transform!(C)
+Parallel exact inversion over independent problems: for each `i`, `nusht_solve!(Cs[i], fs[i],
+plans[i]; kwargs...)`. See [`nusht_type2_threaded!`](@ref).
+"""
+function nusht_solve_threaded! end
 
-    return C
+"""
+    nusht_type2_distributed(θs, φs, Cs, lmax; kwargs...) -> fs
+
+Farm `N` independent synthesis problems across `Distributed` workers: for each `i`, a plan is built
+on a worker from `(θs[i], φs[i])`, `nusht_type2!` evaluates `Cs[i]`, and the field is returned as
+`fs[i]`. `kwargs` are forwarded to `make_plan` (`tol`, `T`, `ntrans`, `nthreads`). Requires
+`using Distributed` (and `@everywhere using NUFSHT`).
+"""
+function nusht_type2_distributed end
+
+"""
+    nusht_solve_distributed(θs, φs, fs, lmax; kwargs...) -> Cs
+
+Farm `N` independent inversions across `Distributed` workers (one plan built per problem on a
+worker). Returns the recovered coefficient arrays. See [`nusht_type2_distributed`](@ref).
+"""
+function nusht_solve_distributed end
+
+"""
+    nusht_adjoint_mpi!(C, f_local, plan_local, comm)
+
+MPI point-decomposed **adjoint** `A†f`. Each rank owns a disjoint subset of the `M` points with a
+local plan; since `A†` is a sum over points, each rank computes its local contribution and the
+result is `MPI.Allreduce!`-summed into `C` (replicated on every rank; communication is O(lmax²),
+independent of `M`). Requires `using MPI`.
+"""
+function nusht_adjoint_mpi! end
+
+"""
+    nusht_solve_mpi!(C, f_local, plan_local, comm; maxiter, rtol, verbose) -> (C, iters, rel_res)
+
+MPI point-decomposed **exact inversion**: conjugate gradients on `A†A c = A†f` where the points are
+partitioned across ranks. `A` (synthesis) needs no communication; `A†` and the CG inner products are
+`Allreduce`d. Solves the *global* least-squares system with `C` replicated on every rank. Requires
+`using MPI`.
+"""
+function nusht_solve_mpi! end
+
+# FastTransforms' `__init__` starts its bundled OpenMP FFTW with `ceil(CPU_THREADS/2)` threads
+# (FastTransforms/src/libfasttransforms.jl `__init__`). Its butterfly transforms and sphere FFTs then
+# run inside OpenMP parallel regions. Executing such a transform from a **non-root Julia task**
+# (`@async`/`Threads.@spawn`/a `Distributed` worker's message-handler task) silently corrupts the
+# result — it reproduces even at `-t1` (one OS thread), so it is the OpenMP runtime being entered from
+# a task context, not thread migration or oversubscription. Forcing FastTransforms to a single thread
+# takes its serial code path (no OpenMP parallel region) and is exact in a task (verified round-trip
+# 3e-16 in `@async` vs ~0.5 multi-threaded). `ft_set_num_threads(1)` covers the butterfly step and
+# `ft_fftw_plan_with_nthreads(1)` the FFTW plans built afterward. MPI is unaffected: ranks are separate
+# processes running on their main task. There is no FastTransforms thread-count getter, so the
+# `__init__` default `cld(CPU_THREADS, 2)` is the value to restore.
+_fasttransforms_default_nthreads() = max(1, cld(Sys.CPU_THREADS, 2))
+
+"""
+    _fasttransforms_single!()
+
+Force FastTransforms single-threaded **without restoring** (set-only). Idempotent and race-free to
+call concurrently — every caller writes the same value `1` — so it is the safe primitive to invoke
+inside each farmed worker task, where the coordinator's barrier-protected restore cannot reach the
+worker's process. See [`_with_fasttransforms_single`](@ref) for why single-threading is required.
+"""
+function _fasttransforms_single!()
+    FastTransforms.ft_set_num_threads(1)
+    FastTransforms.ft_fftw_plan_with_nthreads(1)
+    return nothing
 end
 
 """
-    _nusht_true_adjoint!(C, f, plan)
+    _with_fasttransforms_single(f)
 
-Internal: compute the **true Euclidean adjoint** of `nusht_type2!` at arbitrary
-scattered points. Unlike `nusht_type1!`, this uses `PS’·P’` as the S† step (the
-exact matrix-transpose adjoint of `sph_evaluate!` = PS·P), making the composite
-operator `A† = S†·D†·F†·N†` the true adjoint of `A = N·F·D·S`.
-
-Used internally by `nusht_solve!` to build the normal equations `A†Ac = A†f`.
-At CC grid points `nusht_type1!` (using `sph_transform!`) and this function are
-equivalent (they differ only when input points are off the CC grid).
+Run `f()` with FastTransforms single-threaded, restoring the `__init__` default afterward. Wrap the
+**entire** task-parallel section in this from the coordinating (root) task — the set happens before
+any task is spawned and the restore after the join barrier, so concurrent worker tasks never touch
+the global thread count and cannot race on it. (Wrapping each task's body individually instead would
+let one task's restore corrupt another's in-flight transform.) Remote `Distributed` workers live in
+other processes that this restore cannot reach; they call [`_fasttransforms_single!`](@ref)
+themselves. See its comment above for the underlying FastTransforms OpenMP-in-task hazard.
 """
-function _nusht_true_adjoint!(C, f, plan::NUSHTplan{T}) where {T}
-    (; Nθ, Nφ, tol) = plan
+function _with_fasttransforms_single(f)
+    default_nt = _fasttransforms_default_nthreads()
+    try
+        _fasttransforms_single!()
+        return f()
+    finally
+        FastTransforms.ft_set_num_threads(default_nt)
+        FastTransforms.ft_fftw_plan_with_nthreads(default_nt)
+    end
+end
 
-    M = length(f)
-    @assert M == length(plan.θ_nodes) == length(plan.φ_nodes)
-    @assert size(C) == (Nθ, Nφ)
+# ─────────────────────────────────────────────────────────────────────────────
+# Shape helpers (B=1 ergonomics): user passes vectors/matrices; cores work on (…, B).
+# ─────────────────────────────────────────────────────────────────────────────
 
-    f_cmplx = Complex{T}.(f)
+@inline _npts(plan::NUSHTplan) = length(plan.θ_nodes)
+@inline _slicelen(plan::NUSHTplan) = plan.Nθ * plan.Nφ
 
-    Fhat_vec = FINUFFT.nufft2d1(
-        plan.φ_nodes, plan.θ_nodes,
-        f_cmplx,
-        +1, tol,
-        Nφ, 2Nθ,
-    )
+@inline function _assert_coeffs(C, plan::NUSHTplan)
+    @assert length(C) == plan.Nθ * plan.Nφ * plan.B "coefficient array has $(length(C)) entries, expected $(plan.Nθ*plan.Nφ*plan.B) = Nθ·Nφ·B"
+end
+@inline function _assert_field(f, plan::NUSHTplan)
+    @assert length(f) == _npts(plan) * plan.B "field array has $(length(f)) entries, expected $(_npts(plan)*plan.B) = M·B"
+end
 
-    Fhat_2d  = dropdims(Fhat_vec, dims=3)
-    F̃_real  = ifft2_from_coeffs(Fhat_2d, plan)
-    F_folded = dfs_fold(F̃_real)
+# Copy batch slice `b` of a linear `(Nθ·Nφ·B)` array `A` ↔ the dense `(Nθ,Nφ)` `Fslice` scratch,
+# without views or reshapes (both allocate small headers per call) — keeps the hot path zero-alloc.
+@inline _load_slice!(Fslice, A, plan::NUSHTplan, b) =
+    copyto!(Fslice, 1, A, (b - 1) * _slicelen(plan) + 1, _slicelen(plan))
+@inline _store_slice!(A, Fslice, plan::NUSHTplan, b) =
+    copyto!(A, (b - 1) * _slicelen(plan) + 1, Fslice, 1, _slicelen(plan))
 
-    C .= F_folded
-    LinearAlgebra.lmul!(plan.sph_plan_synth', C)
-    LinearAlgebra.lmul!(plan.sph_plan', C)
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal S / D·F·N cores (operate entirely on plan buffers).
+# ─────────────────────────────────────────────────────────────────────────────
 
-    return C
+# S (forward): sph_evaluate! = PS·P, applied per batch slice through the dense `Fslice`.
+function _sph_evaluate!(plan::NUSHTplan)
+    @inbounds for b in 1:plan.B
+        _load_slice!(plan.Fslice, plan.F, plan, b)
+        LinearAlgebra.lmul!(plan.sph_plan, plan.Fslice)
+        LinearAlgebra.lmul!(plan.sph_plan_synth, plan.Fslice)
+        _store_slice!(plan.F, plan.Fslice, plan, b)
+    end
+    return plan
+end
+
+# D·F·N (forward): doubled map → torus FFT → half-pixel phase → type-2 NUFFT into `fbuf`.
+# `phase_scaled` is a length-2Nθ vector; broadcasting it against `Fhat` (2Nθ,Nφ,B) aligns dim 1 and
+# spreads over the (φ, batch) dims — no reshape needed.
+function _dfn_synthesis!(plan::NUSHTplan)
+    dfs_double!(plan.F̃, plan.F)
+    LinearAlgebra.mul!(plan.Fhat, plan.fft_plan, plan.F̃)
+    plan.Fhat .*= plan.phase_scaled
+    _nufft_exec!(plan.nufft_type2, plan.Fhat, plan.fbuf)
+    return plan
+end
+
+# N†·F†·D† (adjoint): type-1 NUFFT (from `fbuf`) → conj phase → inverse FFT → fold into real `F`.
+function _dfn_analysis!(plan::NUSHTplan)
+    _nufft_exec!(plan.nufft_type1, plan.fbuf, plan.Fhat)
+    plan.Fhat .*= plan.phase_conj
+    LinearAlgebra.mul!(plan.F̃, plan.ifft_plan, plan.Fhat)
+    dfs_fold!(plan.F, plan.F̃)
+    return plan
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -180,94 +240,113 @@ end
 """
     nusht_type2!(f, C, plan)
 
-**Type 2 (synthesis):** Given spherical harmonic coefficients `C` up to degree
-`plan.lmax`, evaluate the field at the M scattered points (θᵢ, φᵢ), writing
-results into `f`.
+**Type 2 (synthesis):** evaluate the field with spherical harmonic coefficients `C` at the `M`
+scattered points, writing values into `f`. Batched: `C` is `(Nθ, Nφ)` / `(Nθ, Nφ, B)` and `f` is
+length-`M` / `(M, B)`.
 
-This is the adjoint of `nusht_type1!`.
-
-Algorithm:
-1. FastSphericalHarmonics forward rSHT (S): c_ℓm in C → equiangular CC map F
-2. DFS double (D): extend F on [0,π] to doubled torus F̃ on [0,2π)
-3. FINUFFT Type 2: F̃ Fourier coefficients → scattered point values f
+Algorithm `A = N·F·D·S`: forward rSHT (S) → DFS double (D) → torus FFT + half-pixel phase (F) →
+FINUFFT type 2 (N).
 """
 function nusht_type2!(f, C, plan::NUSHTplan{T}) where {T}
-    (; lmax, Nθ, Nφ, F, F̃, tol) = plan
-
-    M = length(f)
-    @assert M == length(plan.θ_nodes) == length(plan.φ_nodes)
-    @assert size(C) == (Nθ, Nφ)
-
-    F .= C
-    LinearAlgebra.lmul!(plan.sph_plan, F)
-    LinearAlgebra.lmul!(plan.sph_plan_synth, F)
-
-    F̃ .= zero(T)
-    dfs_double!(F̃, F)
-
-    Fhat_2d = fft2_to_coeffs(F̃, plan)
-
-    f_cmplx = FINUFFT.nufft2d2(plan.φ_nodes, plan.θ_nodes, -1, tol, Fhat_2d)
-
-    @. f = real(f_cmplx)
-
+    _assert_coeffs(C, plan)
+    _assert_field(f, plan)
+    copyto!(plan.F, C)
+    _sph_evaluate!(plan)
+    _dfn_synthesis!(plan)
+    @inbounds for i in eachindex(f)
+        f[i] = real(plan.fbuf[i])
+    end
     return f
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Filter: apply spectral filter in harmonic space
+# Type 1: scattered map → spherical harmonic coefficients
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    nusht_type1!(C, f, plan)
+
+**Type 1 (adjoint analysis):** given field values `f` at the `M` scattered points, compute
+coefficients `C`. On the Clenshaw-Curtis grid this is the exact inverse of `nusht_type2!`
+(machine-precision round-trip); at general scattered points it is only the adjoint — use
+[`nusht_solve!`](@ref) for exact inversion there.
+
+The S† step uses the CC-grid analysis `S⁻¹ = P⁻¹·PA` via the plan's persistent `plan_sph_analysis`
+(PA) and `plan_sph2fourier` (P), replicating `FastSphericalHarmonics.sph_transform!` without its
+per-call plan rebuild.
+"""
+function nusht_type1!(C, f, plan::NUSHTplan{T}) where {T}
+    _assert_field(f, plan)
+    _assert_coeffs(C, plan)
+    @inbounds for i in eachindex(plan.fbuf)
+        plan.fbuf[i] = f[i]
+    end
+    _dfn_analysis!(plan)
+    @inbounds for b in 1:plan.B
+        _load_slice!(plan.Fslice, plan.F, plan, b)
+        LinearAlgebra.lmul!(plan.sph_plan_analysis, plan.Fslice)
+        LinearAlgebra.ldiv!(plan.sph_plan, plan.Fslice)
+        _store_slice!(C, plan.Fslice, plan, b)
+    end
+    return C
+end
+
+"""
+    _nusht_true_adjoint!(C, f, plan)
+
+Internal: the **exact Euclidean adjoint** of `nusht_type2!`. Identical to `nusht_type1!` except the
+S† step applies `PS'·P'` (the matrix transpose of `PS·P`) via the conjugate FastTransforms plans,
+making `A†A` symmetric positive definite for CG. At CC-grid points it coincides with `nusht_type1!`.
+"""
+function _nusht_true_adjoint!(C, f, plan::NUSHTplan{T}) where {T}
+    _assert_field(f, plan)
+    _assert_coeffs(C, plan)
+    @inbounds for i in eachindex(plan.fbuf)
+        plan.fbuf[i] = f[i]
+    end
+    _dfn_analysis!(plan)
+    @inbounds for b in 1:plan.B
+        _load_slice!(plan.Fslice, plan.F, plan, b)
+        LinearAlgebra.lmul!(plan.sph_plan_synth_adj, plan.Fslice)
+        LinearAlgebra.lmul!(plan.sph_plan_adj, plan.Fslice)
+        _store_slice!(C, plan.Fslice, plan, b)
+    end
+    return C
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Filtering
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
     nusht_filter!(f_out, f_in, filter, plan)
 
-Apply a spectral filter to `f_in` at scattered points, writing the filtered
-field to `f_out`. Both must be length-M vectors matching `plan`.
-
-The filter is applied by:
-1. `nusht_type1!`: f_in → c_ℓm
-2. `apply_transfer!`: c_ℓm × H(ℓ) in-place
-3. `nusht_type2!`: filtered c_ℓm → f_out
-
-For land masking: set masked values to 0 in `f_in` before calling, then
-renormalise `f_out` by the local kernel mass over wet points (see `nusht_filter_renorm!`).
+Apply a spectral filter to `f_in` at the scattered points, writing to `f_out` (both length-`M` /
+`(M, B)`): `nusht_type1!` → `apply_transfer!` (× H(ℓ)) → `nusht_type2!`. Uses the plan's coefficient
+scratch, allocation-free.
 """
 function nusht_filter!(f_out, f_in, filter, plan::NUSHTplan)
-    C = copy(plan.C)
-    nusht_type1!(C, f_in, plan)
-    apply_transfer!(C, filter, plan.lmax)
-    nusht_type2!(f_out, C, plan)
+    nusht_type1!(plan.C, f_in, plan)
+    apply_transfer!(plan.C, filter, plan.lmax)
+    nusht_type2!(f_out, plan.C, plan)
     return f_out
 end
 
 """
     nusht_filter_renorm!(f_out, mask, filter, plan)
 
-Renormalise the output of `nusht_filter!` to correct for land/ocean masking.
-
-When a mask is applied by zeroing out land points in `f_in` before calling
-`nusht_filter!`, the filtered result at each ocean point is biased toward zero
-because the kernel integrates over land area where the field was forced to 0.
-This function corrects that bias by dividing the filtered field by the
-locally-filtered mask (the fraction of kernel weight falling over ocean).
-
-Arguments:
-- `f_out`: filtered field (overwritten in-place); must have been computed via
-  `nusht_filter!(f_out, f_masked, filter, plan)` where `f_masked = f .* mask`.
-- `mask`: binary (0/1) or fractional land-sea mask at the M scattered points;
-  1 = ocean (valid), 0 = land (masked).
-- `filter`: the same filter used in `nusht_filter!`.
-- `plan`: the same NUSHTplan.
-
-Points where the filtered mask is below a small threshold (< 0.01) are set to
-0 to avoid division by near-zero values near coasts.
+Renormalise the output of `nusht_filter!` to correct for land/ocean masking: divide by the
+filtered mask (the fraction of kernel weight over ocean). `f_out` must have been produced by
+`nusht_filter!(f_out, f .* mask, filter, plan)`. Points where the filtered mask is below `0.01`
+are set to 0.
 """
 function nusht_filter_renorm!(f_out, mask, filter, plan::NUSHTplan{T}) where {T}
     mask_filt = similar(f_out)
-    mask_T = T.(mask)
+    mask_T = similar(f_out)
+    @. mask_T = mask
     nusht_filter!(mask_filt, mask_T, filter, plan)
     threshold = T(0.01)
-    for i in eachindex(f_out)
+    @inbounds for i in eachindex(f_out)
         w = mask_filt[i]
         f_out[i] = abs(w) >= threshold ? f_out[i] / w : zero(T)
     end
@@ -275,129 +354,121 @@ function nusht_filter_renorm!(f_out, mask, filter, plan::NUSHTplan{T}) where {T}
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Exact inversion: Conjugate Gradient solver
+# Exact inversion: batched Conjugate Gradients on the normal equations A†A c = A†f
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
-    nusht_solve!(C, f, plan; maxiter=500, rtol=1e-6, verbose=false)
+    CGWorkspace(plan)
 
-**Exact inversion:** Solve `A c = f` for spherical harmonic coefficients `C`
-given field values `f` at the M scattered points in `plan`, using Conjugate
-Gradients on the normal equations `(A†A) c = A† f`.
+Reusable scratch for [`nusht_solve!`](@ref). Holding one across solves makes CG allocation-free.
+Per-column scalars are length-`B` vectors so the `B` columns run as `B` independent single-column
+CGs (batched result == looping single transforms).
+"""
+struct CGWorkspace{AT3<:AbstractArray, FT2<:AbstractMatrix, VT<:AbstractVector}
+    x::AT3
+    r::AT3
+    p::AT3
+    Ap::AT3
+    rhs::AT3
+    f::FT2
+    rsold::VT
+    rsnew::VT
+    pAp::VT
+    α::VT
+    β::VT
+    rel::VT
+    rhsnorm::VT
+end
 
-This gives the minimum-norm least-squares solution and is exact (to tolerance
-`rtol`) for any distribution of scattered points with M ≥ (lmax+1)², provided
-the points are reasonably well-distributed (no large gaps at scale 1/lmax).
+function CGWorkspace(plan::NUSHTplan{T}) where {T}
+    Nθ, Nφ, B = plan.Nθ, plan.Nφ, plan.B
+    M = _npts(plan)
+    z3() = zeros(T, Nθ, Nφ, B)
+    vB() = zeros(T, B)
+    return CGWorkspace(z3(), z3(), z3(), z3(), z3(), zeros(T, M, B),
+                       vB(), vB(), vB(), vB(), vB(), vB(), vB())
+end
 
-Unlike `nusht_type1!` (which uses `sph_transform!`, the exact inverse only on the
-Clenshaw-Curtis grid), this function uses the **true Euclidean adjoint** `A†`
-(`_nusht_true_adjoint!` via `PS'·P'`), making `A†A` symmetric positive definite
-and CG guaranteed to converge.
+# Per-column reductions / updates over a (Nθ, Nφ, B) array — zero-allocation.
+function _col_dot!(dst, a, b)
+    @inbounds for k in axes(a, 3)
+        s = zero(eltype(a))
+        for j in axes(a, 2), i in axes(a, 1)
+            s += a[i, j, k] * b[i, j, k]
+        end
+        dst[k] = s
+    end
+    return dst
+end
 
-Arguments:
-- `C`:       output coefficient array (lmax+1)×(2lmax+1), overwritten in-place
-- `f`:       input field values at M scattered points
-- `plan`:    NUSHTplan with pre-computed NUFFT and FFTW plans
-- `maxiter`: maximum CG iterations (default 500)
-- `rtol`:    relative residual tolerance for convergence (default 1e-6)
-- `verbose`: print residual at each iteration if true
+function _col_axpy!(y, α, x, σ)   # y[:,:,k] += σ·α[k]·x[:,:,k]
+    @inbounds for k in axes(y, 3)
+        c = σ * α[k]
+        for j in axes(y, 2), i in axes(y, 1)
+            y[i, j, k] += c * x[i, j, k]
+        end
+    end
+    return y
+end
 
-Returns `(C, iters, rel_res)` where `iters` is the number of CG iterations
-performed and `rel_res` is the final relative residual `‖r‖/‖A†f‖`.
+function _col_pbp!(p, r, β)       # p[:,:,k] = r[:,:,k] + β[k]·p[:,:,k]
+    @inbounds for k in axes(p, 3)
+        c = β[k]
+        for j in axes(p, 2), i in axes(p, 1)
+            p[i, j, k] = r[i, j, k] + c * p[i, j, k]
+        end
+    end
+    return p
+end
+
+_AtA!(Ap, p, ws::CGWorkspace, plan::NUSHTplan) = (nusht_type2!(ws.f, p, plan); _nusht_true_adjoint!(Ap, ws.f, plan))
+
+"""
+    nusht_solve!(C, f, plan; ws=CGWorkspace(plan), maxiter=500, rtol=1e-6, verbose=false)
+
+**Exact inversion:** solve `A c = f` for coefficients `C` via Conjugate Gradients on the normal
+equations `(A†A) c = A† f`, using the true Euclidean adjoint (`_nusht_true_adjoint!`), so `A†A` is
+SPD and CG converges for any well-distributed scattered point set. Batched (`B > 1`) runs the columns
+as independent single-column CGs. Returns `(C, iters, rel_res)` with `rel_res = max_k ‖r_k‖/‖A†f_k‖`.
 """
 function nusht_solve!(
     C, f, plan::NUSHTplan{T};
-    maxiter::Int  = 500,
-    rtol::Real    = 1e-6,
+    ws::CGWorkspace = CGWorkspace(plan),
+    maxiter::Int = 500,
+    rtol::Real = 1e-6,
     verbose::Bool = false,
 ) where {T}
-    (; Nθ, Nφ) = plan
-    K = Nθ * Nφ
+    _assert_coeffs(C, plan)
+    _assert_field(f, plan)
+    _nusht_true_adjoint!(ws.rhs, f, plan)
+    _col_dot!(ws.rhsnorm, ws.rhs, ws.rhs)
+    ws.rhsnorm .= sqrt.(ws.rhsnorm)
 
-    @assert size(C) == (Nθ, Nφ)
-    @assert length(f) == length(plan.θ_nodes)
+    fill!(ws.x, zero(T))
+    copyto!(ws.r, ws.rhs)
+    copyto!(ws.p, ws.r)
+    _col_dot!(ws.rsold, ws.r, ws.r)
+    fill!(ws.rel, one(T))
 
-    buf_C  = zeros(T, Nθ, Nφ)
-    buf_f  = zeros(T, length(f))
-    buf_C2 = zeros(T, Nθ, Nφ)
-
-    function matvec!(y, x)
-        buf_C .= reshape(x, Nθ, Nφ)
-        nusht_type2!(buf_f, buf_C, plan)
-        _nusht_true_adjoint!(buf_C2, buf_f, plan)
-        y .= vec(buf_C2)
-    end
-
-    rhs = zeros(T, K)
-    _nusht_true_adjoint!(buf_C, f, plan)
-    rhs .= vec(buf_C)
-    rhs_norm = LinearAlgebra.norm(rhs)
-
-    x = zeros(T, K)
-    r = copy(rhs)
-    p = copy(r)
-    rsold = LinearAlgebra.dot(r, r)
-    Ap = zeros(T, K)
-
-    rel_res = one(T)
     iters = 0
     for i in 1:maxiter
         iters = i
-        matvec!(Ap, p)
-        α = rsold / LinearAlgebra.dot(p, Ap)
-        x .+= α .* p
-        r .-= α .* Ap
-        rsnew = LinearAlgebra.dot(r, r)
-        rel_res = sqrt(rsnew) / rhs_norm
-        verbose && @info "nusht_solve! iter $i: rel_res=$rel_res"
-        if rel_res < rtol
-            break
-        end
-        p .= r .+ (rsnew / rsold) .* p
-        rsold = rsnew
+        _AtA!(ws.Ap, ws.p, ws, plan)
+        _col_dot!(ws.pAp, ws.p, ws.Ap)
+        @. ws.α = ifelse(ws.pAp == 0, zero(T), ws.rsold / ws.pAp)
+        _col_axpy!(ws.x, ws.α, ws.p, one(T))
+        _col_axpy!(ws.r, ws.α, ws.Ap, -one(T))
+        _col_dot!(ws.rsnew, ws.r, ws.r)
+        @. ws.rel = ifelse(ws.rhsnorm == 0, zero(T), sqrt(ws.rsnew) / ws.rhsnorm)
+        verbose && @info "nusht_solve! iter $i: rel_res=$(maximum(ws.rel))"
+        maximum(ws.rel) < rtol && break
+        @. ws.β = ifelse(ws.rsold == 0, zero(T), ws.rsnew / ws.rsold)
+        _col_pbp!(ws.p, ws.r, ws.β)
+        copyto!(ws.rsold, ws.rsnew)
     end
 
-    C .= reshape(x, Nθ, Nφ)
-    return C, iters, rel_res
-end
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Internal FFT helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-"""
-    fft2_to_coeffs(F̃, plan) -> Fhat
-
-2D FFT of the doubled map F̃ (size Nθ_dbl × Nφ), returning complex Fourier
-coefficients in the layout expected by FINUFFT Type 2 (row-major Nφ × Nθ_dbl,
-with FINUFFT-centered mode order).
-
-The DFS doubled grid places data at cell-center positions θ̃ᵢ = 2π/Nθ_dbl*(i-0.5),
-which are offset by half a pixel from FFTW's assumed integer-index positions.
-A per-mode θ phase correction exp(-πi kθ/Nθ_dbl) compensates for this offset so
-that nufft2d2 evaluated at natural θ ∈ [0,π] coordinates gives the correct values.
-The φ grid φⱼ = 2π/Nφ*(j-1) is already zero-based (no φ phase correction needed).
-"""
-function fft2_to_coeffs(F̃, plan::NUSHTplan)
-    Nθ_dbl = 2 * plan.Nθ; Nφ = plan.Nφ
-    @assert size(F̃) == (Nθ_dbl, Nφ)
-    Fhat_raw = plan.fft_plan * F̃  # pre-planned FFT, no per-call FFTW planning
-    Fhat_corrected = (Fhat_raw .* plan.phase_θ) ./ (Nθ_dbl * Nφ)
-    return collect(FFTW.fftshift(Fhat_corrected)')
-end
-
-"""
-    ifft2_from_coeffs(Fhat_2d, plan) -> F̃
-
-Adjoint of `fft2_to_coeffs`: maps FINUFFT type-1 mode coefficients back to a
-spatial map on the doubled cell-center grid (Nθ_dbl × Nφ).
-
-Applies the conjugate θ phase correction exp(+πi kθ/Nθ_dbl) before the inverse
-FFT to correctly invert the half-pixel offset compensation in `fft2_to_coeffs`.
-"""
-function ifft2_from_coeffs(Fhat_2d, plan::NUSHTplan)
-    Fhat_shifted = FFTW.ifftshift(collect(Fhat_2d'))  # back to FFTW natural order
-    return real.(plan.ifft_plan * (Fhat_shifted .* plan.phase_θ_conj))
+    copyto!(C, ws.x)
+    return C, iters, maximum(ws.rel)
 end
 
 end # module NUFSHT

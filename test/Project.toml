@@ -1,13 +1,19 @@
 [deps]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 FastSphericalHarmonics = "d335c211-7587-445e-a753-f0b1fb7e445f"
+GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
+JLArrays = "27aeb0d3-9eb9-45fb-866b-73c2ecf80fcb"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
 NUFSHT = "e99b67a3-9706-455a-90e2-85b195a33206"
+OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [compat]
-julia = "1.9"
+julia = "1.11"
 
 [sources]
 NUFSHT = { path = ".." }

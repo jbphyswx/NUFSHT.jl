@@ -8,19 +8,19 @@ arbitrary scattered (colatitude, longitude) points.
 
 ### Synthesis + Round-Trip Accuracy (10⁻¹¹ relative error)
 
-![Synthesis and Accuracy](../assets/synthesis_and_accuracy.png)
+![Synthesis and Accuracy](assets/synthesis_and_accuracy.png)
 
 ### CG Inversion at Arbitrary Scattered Points
 
-![CG Inversion](../assets/cg_inversion.png)
+![CG Inversion](assets/cg_inversion.png)
 
 ### Spectral Filtering
 
-![Spectral Filtering](../assets/spectral_filtering.png)
+![Spectral Filtering](assets/spectral_filtering.png)
 
 ### Ocean Mask + Renormalization
 
-![Mask Renorm](../assets/mask_renorm.png)
+![Mask Renorm](assets/mask_renorm.png)
 
 ## What it does
 

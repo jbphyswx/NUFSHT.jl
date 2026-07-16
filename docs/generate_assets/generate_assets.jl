@@ -17,7 +17,7 @@ using Statistics: Statistics
 
 Random.seed!(42)
 
-const ASSETS_DIR = joinpath(@__DIR__, "..", "assets")
+const ASSETS_DIR = joinpath(@__DIR__, "..", "src", "assets")
 mkpath(ASSETS_DIR)
 
 # ─── Figure 1: Synthesis + Round-Trip Accuracy ────────────────────────────

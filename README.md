@@ -8,23 +8,23 @@ at arbitrary scattered (colatitude, longitude) points on the sphere.
 
 ### Synthesis at Scattered Points + Round-Trip Accuracy
 
-![Synthesis and Accuracy](docs/assets/synthesis_and_accuracy.png)
+![Synthesis and Accuracy](docs/src/assets/synthesis_and_accuracy.png)
 
 ### CG Inversion at Arbitrary Scattered Points
 
-![CG Inversion](docs/assets/cg_inversion.png)
+![CG Inversion](docs/src/assets/cg_inversion.png)
 
 ### Spectral Filtering (Gaussian and Sharp Cutoff)
 
-![Spectral Filtering](docs/assets/spectral_filtering.png)
+![Spectral Filtering](docs/src/assets/spectral_filtering.png)
 
 ### Ocean Mask + Renormalization
 
-![Mask Renormalization](docs/assets/mask_renorm.png)
+![Mask Renormalization](docs/src/assets/mask_renorm.png)
 
 ### Spin-weighted synthesis + spin-1 Hodge decomposition
 
-![Spin-weighted transforms](docs/assets/spin_synthesis.png)
+![Spin-weighted transforms](docs/src/assets/spin_synthesis.png)
 
 ## Spin-weighted transforms (spin-`s`)
 
@@ -38,15 +38,16 @@ scattered spherical data.
 using NUFSHT
 lmax, s = 32, 1
 θ = π .* rand(5000); φ = 2π .* rand(5000)          # scattered colatitude/longitude
-plan = make_spin_plan(θ, φ, lmax, s)
+plan = make_spin_plan(θ, φ, lmax, s)                # add ntrans=B for batches; T=Float32 for f32
 
 # synthesis: spin-s coefficients -> complex field values at the points
-f = zeros(ComplexF64, length(θ))
-nusht_type2_spin!(f, sf, plan)                      # sf :: (lmax+1, 2lmax+1)
+sf = zeros(ComplexF64, lmax+1, 2lmax+1)             # spin-s coefficients (set some modes)
+f  = zeros(ComplexF64, length(θ))
+nusht_type2_spin!(f, sf, plan)
 
 # exact inversion at arbitrary scattered points (CG on the normal equations)
-sf = zeros(ComplexF64, lmax+1, 2lmax+1)
-nusht_solve_spin!(sf, f, plan; rtol=1e-9)
+sf_rec = zeros(ComplexF64, lmax+1, 2lmax+1)
+nusht_solve_spin!(sf_rec, f, plan; rtol=1e-9)
 ```
 
 `make_spin_plan` / `nusht_type2_spin!` / `nusht_type1_spin!` (exact adjoint) /
@@ -60,6 +61,37 @@ scattered inversion. See `dev/spin_hodge_validation.jl` for the spin-1 Helmholtz
 using Pkg
 Pkg.add(url="https://github.com/jbphyswx/NUFSHT.jl")
 ```
+
+## Performance, batching, parallelism & GPU
+
+Everything below is dependency-light by default — the accelerators are **package extensions**, loaded
+only when you load their trigger package, so a plain `using NUFSHT` never pulls in MPI/CUDA/etc.
+
+- **Persistent guru plans, zero allocation.** A plan builds the FINUFFT guru plans once (points set
+  once) and pre-allocates every buffer, so warmed-up `nusht_type2!`/`nusht_type1!` and the hundreds of
+  CG matvecs inside `nusht_solve!` allocate **nothing** and never re-plan. (Single-threaded FINUFFT is
+  exactly zero-alloc; the all-cores default adds only FINUFFT's own small planner-lock allocation.)
+- **Batching (`ntrans = B`).** Transform `B` co-located fields (same points) in one call —
+  `make_plan(θ, φ, lmax; ntrans = B)`, coefficients/fields carry a trailing batch axis. FFTW and
+  FINUFFT parallelize *across the batch* internally (measured ~4.5× / ~2.8× on small transforms), which
+  is the recommended way to use many cores on one node.
+- **Mixed precision.** `T = Float32` is supported on the spin/recurrence path (the scalar DFS path is
+  Float64-only, a FastTransforms limitation).
+- **Parallel extensions** (each keyed on its trigger package):
+  - `using OhMyThreads` — thread-parallel over independent problems (one plan per task).
+  - `using Distributed` — farm independent problems across worker **processes** (`addprocs`); falls
+    back to serial when there are none.
+  - `using MPI` — point-decomposition: partition the `M` points across ranks; `A` needs no
+    communication, `A†` and the CG inner products are `Allreduce`d.
+  > Note: FastTransforms is *not* safe to call from a Julia task/thread (its OpenMP corrupts results);
+  > the thread/process extensions force it single-threaded, which is why batching + processes are the
+  > recommended scaling paths. See `dev/fasttransforms_task_safety.md`.
+- **GPU** (`using CUDA`, with `using KernelAbstractions`). The array-indexed steps (DFS doubling/folding
+  and the spin Wigner-`d` recurrence + bivariate-Fourier assembly) are KernelAbstractions `@kernel`s —
+  **written once, run on any backend** — and the NUFFT is bound to cuFINUFFT. A device node set yields a
+  device-resident plan (buffers `similar` to the nodes). The device kernels are validated bit-for-bit
+  against the CPU path on `JLArrays`; end-to-end GPU parity (incl. cuFINUFFT) is in `test/gpu_cuda.jl`,
+  to run on NVIDIA hardware.
 
 ## Algorithm
 
@@ -75,8 +107,13 @@ Type 1 (adjoint):     A† = S† · D† · F† · N†
 |------|-----------|---------|---------|
 | **S** | Iso-latitude rSHT: SH coefficients ↔ CC grid | `sph_evaluate!` (PS·P) | `sph_transform!` (S⁻¹, exact on CC) |
 | **D** | DFS doubling: extend [0,π] → [0,2π) torus | `dfs_double!` | `dfs_fold!` |
-| **F** | 2D FFT with half-pixel CC phase correction | `fft2_to_coeffs` | `ifft2_from_coeffs` |
-| **N** | NUFFT: evaluate Fourier series at scattered points | `nufft2d2` | `nufft2d1` |
+| **F** | 2D FFT + fused half-pixel CC phase (in-place, `modeord=1`) | stored FFTW plan + phase broadcast | conj-phase + inverse FFT |
+| **N** | NUFFT: evaluate Fourier series at scattered points | guru type-2 plan | guru type-1 plan |
+
+(The scalar path above uses FastTransforms for **S**; the **spin** path replaces **S** with an
+on-the-fly Trapani–Navaza Wigner-`d` recurrence — O(lmax²) memory and numerically stable to
+lmax ≈ 1024, whereas the previous dense-`Δ` / explicit-factorial evaluation used O(lmax³) memory and
+was silently inaccurate above lmax ≈ 40. The recurrence is also the device S-engine.)
 
 The DFS doubling extends the sphere to a doubly-periodic torus by reflecting across
 the south pole with a φ+π shift. The shift uses `mod1(j + Nφ÷2, Nφ)` to ensure a
