@@ -5,6 +5,7 @@
 ```@docs
 make_plan
 NUSHTplan
+close!
 ```
 
 ## Core transforms
@@ -50,6 +51,27 @@ kernel_transfer
 cutoff_degree
 ```
 
+## Parallel execution
+
+Provided by the accelerator extensions (`using OhMyThreads` / `Distributed` / `MPI`). See the
+performance section of the README for the threads-vs-processes trade-offs.
+
+```@docs
+nusht_type2_threaded!
+nusht_type1_threaded!
+nusht_solve_threaded!
+nusht_type2_distributed
+nusht_solve_distributed
+nusht_adjoint_mpi!
+nusht_solve_mpi!
+```
+
+## Plotting
+
+```@docs
+plot_field
+```
+
 ## DFS utilities (internal / advanced)
 
 ```@docs
@@ -62,8 +84,6 @@ NUFSHT.dfs_doubled_grid_coords
 ## Internal helpers
 
 ```@docs
-NUFSHT.fft2_to_coeffs
-NUFSHT.ifft2_from_coeffs
 NUFSHT.apply_transfer!
 NUFSHT._nusht_true_adjoint!
 ```

@@ -8,23 +8,23 @@ at arbitrary scattered (colatitude, longitude) points on the sphere.
 
 ### Synthesis at Scattered Points + Round-Trip Accuracy
 
-![Synthesis and Accuracy](docs/assets/synthesis_and_accuracy.png)
+![Synthesis and Accuracy](docs/src/assets/synthesis_and_accuracy.png)
 
 ### CG Inversion at Arbitrary Scattered Points
 
-![CG Inversion](docs/assets/cg_inversion.png)
+![CG Inversion](docs/src/assets/cg_inversion.png)
 
 ### Spectral Filtering (Gaussian and Sharp Cutoff)
 
-![Spectral Filtering](docs/assets/spectral_filtering.png)
+![Spectral Filtering](docs/src/assets/spectral_filtering.png)
 
 ### Ocean Mask + Renormalization
 
-![Mask Renormalization](docs/assets/mask_renorm.png)
+![Mask Renormalization](docs/src/assets/mask_renorm.png)
 
 ### Spin-weighted synthesis + spin-1 Hodge decomposition
 
-![Spin-weighted transforms](docs/assets/spin_synthesis.png)
+![Spin-weighted transforms](docs/src/assets/spin_synthesis.png)
 
 ## Spin-weighted transforms (spin-`s`)
 
