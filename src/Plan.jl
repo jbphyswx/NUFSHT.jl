@@ -8,6 +8,7 @@ FINUFFT. All array/plan fields are type parameters so the same struct instantiat
 today and device arrays later.
 """
 
+using AbstractFFTs: AbstractFFTs
 using FFTW: FFTW
 using FastTransforms: FastTransforms
 using FINUFFT: FINUFFT
@@ -26,12 +27,22 @@ export NUSHTplan, make_plan, close!
 @inline _nufft_destroy!(p::FINUFFT.finufft_plan) = FINUFFT.finufft_destroy!(p)
 @inline _nufft_makeplan(::AbstractVector, type, n_modes, iflag, ntrans, tol; kwargs...) =
     FINUFFT.finufft_makeplan(type, n_modes, iflag, ntrans, tol; kwargs...)
-@inline _nufft_setpts!(p::FINUFFT.finufft_plan, x, y) = FINUFFT.finufft_setpts!(p, x, y)
+# Host FINUFFT needs host coordinate vectors. `_host` is a no-op for a host `Array` and copies a
+# device-array's coords to host (nodes are set once, so the copy is not on any hot path). A real
+# `CuArray` node set instead selects the cuFINUFFT `_nufft_setpts!` in the CUDA extension.
+@inline _host(x::Array) = x
+@inline _host(x::AbstractArray) = Array(x)
+@inline _nufft_setpts!(p::FINUFFT.finufft_plan, x, y) = FINUFFT.finufft_setpts!(p, _host(x), _host(y))
 
 # Backend-generic zeroed buffer shaped like `ref` (host `Array` for CPU nodes, device array for GPU
 # nodes) — used so a device node set yields device-resident plan buffers.
 @inline _zeros_like(ref::AbstractArray, ::Type{S}, dims::Integer...) where {S} =
     fill!(similar(ref, S, dims...), zero(S))
+
+# A copy of host array `a` moved to `ref`'s backend (host stays host, device→device). Used for the
+# small precomputed phase vectors so they match a device node set (a device broadcast against a host
+# vector would fail / be wrong).
+@inline _to_like(ref::AbstractArray, a::AbstractArray) = copyto!(similar(ref, eltype(a), size(a)...), a)
 
 """
     NUSHTplan{T}
@@ -133,27 +144,32 @@ function make_plan(
     Nθ_dbl = 2Nθ
     M = length(θ_nodes)
 
-    θ = Vector{T}(θ_nodes)
-    φ = Vector{T}(φ_nodes)
+    # Nodes keep their input array type (host `Vector` or device array), eltype coerced to `T`; every
+    # buffer is allocated `similar` to the nodes, so a device node set yields a device-resident plan.
+    θ = T.(θ_nodes)
+    φ = T.(φ_nodes)
 
-    C    = zeros(T, Nθ, Nφ, B)
-    F    = zeros(T, Nθ, Nφ, B)
-    F̃    = zeros(Complex{T}, Nθ_dbl, Nφ, B)
-    Fhat = zeros(Complex{T}, Nθ_dbl, Nφ, B)
-    fbuf = zeros(Complex{T}, M, B)
+    C    = _zeros_like(θ, T, Nθ, Nφ, B)
+    F    = _zeros_like(θ, T, Nθ, Nφ, B)
+    F̃    = _zeros_like(θ, Complex{T}, Nθ_dbl, Nφ, B)
+    Fhat = _zeros_like(θ, Complex{T}, Nθ_dbl, Nφ, B)
+    fbuf = _zeros_like(θ, Complex{T}, M, B)
 
-    # FFTs act on the (θ̃, φ) plane only; the batch axis is left untransformed.
-    fft_plan  = FFTW.plan_fft(F̃, (1, 2))
-    ifft_plan = FFTW.plan_ifft(Fhat, (1, 2))
+    # FFTs act on the (θ̃, φ) plane only; the batch axis is left untransformed. `AbstractFFTs.plan_fft`
+    # resolves to FFTW for a host `Array` (byte-identical to `FFTW.plan_fft`) and to CUFFT for a CuArray.
+    fft_plan  = AbstractFFTs.plan_fft(F̃, (1, 2))
+    ifft_plan = AbstractFFTs.plan_ifft(Fhat, (1, 2))
 
-    # Half-pixel θ phase for the CC cell-center offset, built in FFTW-native (modeord=1) k order.
+    # Half-pixel θ phase for the CC cell-center offset, built host-side in FFTW-native (modeord=1) k
+    # order, then moved to the node backend so the `Fhat .*= phase_*` broadcast is device-resident.
     k_θ = [k < Nθ_dbl ÷ 2 ? k : k - Nθ_dbl for k in 0:(Nθ_dbl - 1)]
     phase        = Complex{T}.(cis.(-π .* T.(k_θ) ./ Nθ_dbl))
-    phase_scaled = phase ./ (Nθ_dbl * Nφ)
-    phase_conj   = conj.(phase)
+    phase_scaled = _to_like(θ, phase ./ (Nθ_dbl * Nφ))
+    phase_conj   = _to_like(θ, conj.(phase))
 
-    # FastTransforms plans operate on a single dense (Nθ, Nφ) `Matrix`; each batch slice is
-    # `copyto!`-ed through `Fslice`. Persistent P/PS/PA plans avoid `sph_transform!`'s per-call rebuild.
+    # FastTransforms plans operate on a single dense (Nθ, Nφ) HOST `Matrix` (FastTransforms is CPU-only);
+    # each batch slice is `copyto!`-ed through `Fslice` (host↔device for a device plan — the S-step is an
+    # inherent host bounce). Persistent P/PS/PA plans avoid `sph_transform!`'s per-call rebuild.
     Fslice             = zeros(T, Nθ, Nφ)
     sph_plan           = FastTransforms.plan_sph2fourier(Fslice)
     sph_plan_synth     = FastTransforms.plan_sph_synthesis(Fslice)

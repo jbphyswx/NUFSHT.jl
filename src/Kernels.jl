@@ -97,8 +97,9 @@ Multiply a FastSphericalHarmonics coefficient array `C` — size `(lmax+1, 2lmax
 across the batch dimension).
 """
 function apply_transfer!(C, filter, lmax)
+    RT = real(eltype(C))
     for ℓ in 0:lmax
-        h = kernel_transfer(filter, ℓ)
+        h = RT(kernel_transfer(filter, ℓ))
         for m in -ℓ:ℓ
             idx = FastSphericalHarmonics.sph_mode(ℓ, m)
             @inbounds for b in axes(C, 3)
@@ -107,4 +108,19 @@ function apply_transfer!(C, filter, lmax)
         end
     end
     return C
+end
+
+# Host-built `(lmax+1, 2lmax+1)` transfer matrix (element type `RT`): `H(ℓ)` at each valid mode slot,
+# `1` at the unused corners (so `C .*= H` is the exact identity there, matching the scalar loop, which
+# leaves those entries untouched). Used by the device `apply_transfer!` (one broadcast); the CPU path
+# uses the zero-alloc loop above.
+function _transfer_matrix(filter, lmax, ::Type{RT}) where {RT}
+    H = ones(RT, lmax + 1, 2lmax + 1)
+    for ℓ in 0:lmax
+        h = RT(kernel_transfer(filter, ℓ))
+        for m in -ℓ:ℓ
+            H[FastSphericalHarmonics.sph_mode(ℓ, m)] = h
+        end
+    end
+    return H
 end

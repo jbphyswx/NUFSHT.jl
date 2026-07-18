@@ -233,7 +233,7 @@ function _assemble_G!(G, sf, plan::SpinNUSHTplan{T}) where {T}
             _wigner_d_halfpi_step!(dl, dlp, ℓ, off)
         end
         ℓ < abs(s) && continue
-        Nℓ = _Nℓ(ℓ)
+        Nℓ = T(_Nℓ(ℓ))
         for b in 1:plan.B
             for m in -ℓ:ℓ
                 val = sf[ℓ + 1, m + lmax + 1, b]
@@ -261,7 +261,7 @@ function _assemble_G_adjoint!(sf, Ĝ, plan::SpinNUSHTplan{T}) where {T}
             _wigner_d_halfpi_step!(dl, dlp, ℓ, off)
         end
         ℓ < abs(s) && continue
-        Nℓ = _Nℓ(ℓ)
+        Nℓ = T(_Nℓ(ℓ))
         for b in 1:plan.B
             for m in -ℓ:ℓ
                 phc = conj((Complex{T}(0, 1))^(m + s)) * Nℓ

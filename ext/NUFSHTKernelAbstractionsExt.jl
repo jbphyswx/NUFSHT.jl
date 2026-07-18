@@ -232,4 +232,43 @@ function NUFSHT._col_pbp_c!(p::GPUArraysCore.AbstractGPUArray, r, β)       # p[
     return p
 end
 
+# ── Device scalar CG reductions ─────────────────────────────────────────────────
+# The real-valued scalar-path analogues of the spin `_col_*_c!` above (the `src` versions are CPU
+# scalar loops over a real `(Nθ,Nφ,B)` array — no `conj`/`real`). Dispatched on the data array being a
+# device array so `nusht_solve!` runs on the GPU; CPU stays on the zero-alloc loop methods.
+function NUFSHT._col_dot!(dst, a::GPUArraysCore.AbstractGPUArray, b)       # dst[k] = Σ_ij a·b
+    dst .= dropdims(sum(a .* b; dims = (1, 2)); dims = (1, 2))
+    return dst
+end
+function NUFSHT._col_axpy!(y::GPUArraysCore.AbstractGPUArray, α, x, σ)     # y[:,:,k] += σ·α[k]·x[:,:,k]
+    y .+= σ .* reshape(α, 1, 1, :) .* x
+    return y
+end
+function NUFSHT._col_pbp!(p::GPUArraysCore.AbstractGPUArray, r, β)         # p[:,:,k] = r + β[k]·p[:,:,k]
+    p .= r .+ reshape(β, 1, 1, :) .* p
+    return p
+end
+
+# ── Device real↔complex field copy (scalar type-2/type-1 bracket) ───────────────
+# `f` may be `(M,)` or `(M,B)`; `fbuf` is `(M,B)` and equal length — a `reshape`d broadcast handles
+# either shape (the `src` versions are CPU scalar loops). Dispatched on the plan buffer `fbuf`.
+function NUFSHT._copy_real!(f, fbuf::GPUArraysCore.AbstractGPUArray)       # f = real(fbuf)
+    f .= real.(reshape(fbuf, size(f)))
+    return f
+end
+function NUFSHT._copy_field!(fbuf::GPUArraysCore.AbstractGPUArray, f)      # fbuf = f (real→complex)
+    fbuf .= reshape(f, size(fbuf))
+    return fbuf
+end
+
+# ── Device spectral filter (× H(ℓ)) ─────────────────────────────────────────────
+# `C` is `(lmax+1, 2lmax+1, B)`; build the host transfer matrix once, move it to `C`'s backend, and
+# broadcast-multiply across the batch (the `src` version is a scalar mode loop).
+function NUFSHT.apply_transfer!(C::GPUArraysCore.AbstractGPUArray, filter, lmax)
+    H = NUFSHT._transfer_matrix(filter, lmax, real(eltype(C)))
+    Hd = NUFSHT._to_like(C, H)
+    C .*= reshape(Hd, size(Hd, 1), size(Hd, 2), 1)
+    return C
+end
+
 end # module NUFSHTKernelAbstractionsExt
