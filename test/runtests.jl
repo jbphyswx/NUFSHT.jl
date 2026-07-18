@@ -18,6 +18,7 @@ Test.@testset "NUFSHT.jl" begin
     include("test_spin.jl")
     include("test_precision.jl")
     include("test_adjoint.jl")
+    include("test_allocs.jl")
     include("test_ka.jl")
     include("test_threaded.jl")
     include("test_distributed.jl")

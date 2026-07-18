@@ -37,7 +37,7 @@ which `Nφ = 2lmax+1` always is); the naive conditional shift is not a bijection
 """
 function dfs_double(F::AbstractMatrix)
     Nθ, Nφ = size(F)
-    F̃ = zeros(eltype(F), 2Nθ, Nφ)
+    F̃ = similar(F, 2Nθ, Nφ)   # every entry is written by dfs_double! — no pre-zeroing
     dfs_double!(F̃, F)
     return F̃
 end
@@ -82,7 +82,7 @@ function dfs_fold(F̃::AbstractMatrix)
     Nθ_double, Nφ = size(F̃)
     @assert iseven(Nθ_double)
     Nθ = Nθ_double ÷ 2
-    F = zeros(real(eltype(F̃)), Nθ, Nφ)
+    F = similar(F̃, real(eltype(F̃)), Nθ, Nφ)   # every entry is written by dfs_fold! — no pre-zeroing
     dfs_fold!(F, F̃)
     return F
 end

@@ -198,6 +198,22 @@ end
 @inline _store_slice!(A, Fslice, plan::NUSHTplan, b) =
     copyto!(A, (b - 1) * _slicelen(plan) + 1, Fslice, 1, _slicelen(plan))
 
+# Real-part extraction `fbuf → f` and field load `f → fbuf` (real↔complex), shape-agnostic (`f` may be
+# `(M,)` or `(M,B)`; `fbuf` is `(M,B)` — equal length). Host: zero-alloc scalar loop. Device methods
+# (a `reshape`d broadcast) live in the KA extension, dispatched on the plan buffer `fbuf`.
+function _copy_real!(f, fbuf)
+    @inbounds for i in eachindex(f)
+        f[i] = real(fbuf[i])
+    end
+    return f
+end
+function _copy_field!(fbuf, f)
+    @inbounds for i in eachindex(fbuf)
+        fbuf[i] = f[i]
+    end
+    return fbuf
+end
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal S / D·F·N cores (operate entirely on plan buffers).
 # ─────────────────────────────────────────────────────────────────────────────
@@ -253,9 +269,7 @@ function nusht_type2!(f, C, plan::NUSHTplan{T}) where {T}
     copyto!(plan.F, C)
     _sph_evaluate!(plan)
     _dfn_synthesis!(plan)
-    @inbounds for i in eachindex(f)
-        f[i] = real(plan.fbuf[i])
-    end
+    _copy_real!(f, plan.fbuf)
     return f
 end
 
@@ -278,9 +292,7 @@ per-call plan rebuild.
 function nusht_type1!(C, f, plan::NUSHTplan{T}) where {T}
     _assert_field(f, plan)
     _assert_coeffs(C, plan)
-    @inbounds for i in eachindex(plan.fbuf)
-        plan.fbuf[i] = f[i]
-    end
+    _copy_field!(plan.fbuf, f)
     _dfn_analysis!(plan)
     @inbounds for b in 1:plan.B
         _load_slice!(plan.Fslice, plan.F, plan, b)
@@ -301,9 +313,7 @@ making `A†A` symmetric positive definite for CG. At CC-grid points it coincide
 function _nusht_true_adjoint!(C, f, plan::NUSHTplan{T}) where {T}
     _assert_field(f, plan)
     _assert_coeffs(C, plan)
-    @inbounds for i in eachindex(plan.fbuf)
-        plan.fbuf[i] = f[i]
-    end
+    _copy_field!(plan.fbuf, f)
     _dfn_analysis!(plan)
     @inbounds for b in 1:plan.B
         _load_slice!(plan.Fslice, plan.F, plan, b)
@@ -333,23 +343,18 @@ function nusht_filter!(f_out, f_in, filter, plan::NUSHTplan)
 end
 
 """
-    nusht_filter_renorm!(f_out, mask, filter, plan)
+    nusht_filter_renorm!(f_out, mask, filter, plan; mask_filt=similar(f_out))
 
 Renormalise the output of `nusht_filter!` to correct for land/ocean masking: divide by the
 filtered mask (the fraction of kernel weight over ocean). `f_out` must have been produced by
 `nusht_filter!(f_out, f .* mask, filter, plan)`. Points where the filtered mask is below `0.01`
-are set to 0.
+are set to 0. Pass a reusable `mask_filt` scratch (shaped like `f_out`) to run allocation-free.
 """
-function nusht_filter_renorm!(f_out, mask, filter, plan::NUSHTplan{T}) where {T}
-    mask_filt = similar(f_out)
-    mask_T = similar(f_out)
-    @. mask_T = mask
-    nusht_filter!(mask_filt, mask_T, filter, plan)
+function nusht_filter_renorm!(f_out, mask, filter, plan::NUSHTplan{T}; mask_filt = similar(f_out)) where {T}
+    nusht_filter!(mask_filt, mask, filter, plan)   # `mask` is read straight into `plan.fbuf` — no copy needed
     threshold = T(0.01)
-    @inbounds for i in eachindex(f_out)
-        w = mask_filt[i]
-        f_out[i] = abs(w) >= threshold ? f_out[i] / w : zero(T)
-    end
+    # `mask_filt` is shaped like `f_out` → a single fused broadcast, zero-alloc + device-safe.
+    f_out .= ifelse.(abs.(mask_filt) .>= threshold, f_out ./ mask_filt, zero(T))
     return f_out
 end
 
@@ -383,9 +388,10 @@ end
 function CGWorkspace(plan::NUSHTplan{T}) where {T}
     Nθ, Nφ, B = plan.Nθ, plan.Nφ, plan.B
     M = _npts(plan)
-    z3() = zeros(T, Nθ, Nφ, B)
-    vB() = zeros(T, B)
-    return CGWorkspace(z3(), z3(), z3(), z3(), z3(), zeros(T, M, B),
+    # Buffers shaped like the plan's (so a device plan gets a device workspace).
+    z3() = _zeros_like(plan.F, T, Nθ, Nφ, B)
+    vB() = _zeros_like(plan.θ_nodes, T, B)
+    return CGWorkspace(z3(), z3(), z3(), z3(), z3(), _zeros_like(plan.fbuf, T, M, B),
                        vB(), vB(), vB(), vB(), vB(), vB(), vB())
 end
 

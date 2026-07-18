@@ -90,3 +90,86 @@ Test.@testset "KernelAbstractions extension: device spin CG reductions (JLArray)
     pj = JLArrays.JLArray(copy(a)); NUFSHT._col_pbp_c!(pj, JLArrays.JLArray(b), JLArrays.JLArray(β))
     Test.@test Array(pj) ≈ pc
 end
+
+# Structural device-type propagation: building a plan from device node arrays must yield a plan (and CG
+# workspace) whose buffers are ALL device-resident. This is the regression guard for issue #6 — the
+# scalar `make_plan` previously built host buffers for device nodes (silently, since JLArray coords copy
+# to host for FINUFFT), shipping a plan that could not run on GPU. (The FFT plan on a JLArray falls back
+# to host FFTW — JLArrays are CPU-backed strided memory — so the device *FFT* itself is only validated on
+# real CUDA, in test/gpu_cuda.jl; here we assert the buffer array types, which is what regressed.)
+Test.@testset "KernelAbstractions extension: device plan buffers are device-resident (JLArray)" begin
+    isdev(x) = x isa GPUArraysCore.AbstractGPUArray
+    Random.seed!(404)
+    lmax = 6; M = 60; B = 2
+    θ = JLArrays.JLArray(clamp.(π .* rand(M), 1e-9, π - 1e-9))
+    φ = JLArrays.JLArray(2π .* rand(M))
+
+    plan = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-8, ntrans = B)
+    for f in (:θ_nodes, :φ_nodes, :C, :F, :F̃, :Fhat, :fbuf)
+        Test.@test isdev(getfield(plan, f))
+    end
+    ws = NUFSHT.CGWorkspace(plan)
+    for f in (:x, :r, :p, :Ap, :rhs, :f, :rsold, :α)
+        Test.@test isdev(getfield(ws, f))
+    end
+    NUFSHT.close!(plan)
+
+    splan = NUFSHT.make_spin_plan(θ, φ, lmax, 2; tol = 1e-8, ntrans = B)
+    for f in (:θ_nodes, :φ_nodes, :dl_curr, :dl_prev, :G, :fbuf)
+        Test.@test isdev(getfield(splan, f))
+    end
+    sws = NUFSHT.SpinCGWorkspace(splan)
+    for f in (:x, :r, :p, :Ap, :rhs, :f)
+        Test.@test isdev(getfield(sws, f))
+    end
+    NUFSHT.close!(splan)
+    @info "KernelAbstractions ext: scalar+spin device plans/workspaces are device-resident (issue #6)"
+end
+
+# Device-generic scalar CG reductions + real↔complex field copy (so the *scalar* nusht_solve!/type-2/1
+# run on GPU) — must match the CPU scalar-loop `src` methods bit-for-bit on JLArray.
+Test.@testset "KernelAbstractions extension: device scalar reductions + field copy (JLArray)" begin
+    Random.seed!(505)
+    N = 7; Nφ = 13; B = 4
+    a = randn(N, Nφ, B); b = randn(N, Nφ, B); x = randn(N, Nφ, B)
+    α = randn(B); β = randn(B); σ = -1.0
+
+    dc = zeros(B); NUFSHT._col_dot!(dc, a, b)
+    dj = JLArrays.JLArray(zeros(B)); NUFSHT._col_dot!(dj, JLArrays.JLArray(a), JLArrays.JLArray(b))
+    Test.@test Array(dj) ≈ dc
+
+    yc = copy(a); NUFSHT._col_axpy!(yc, α, x, σ)
+    yj = JLArrays.JLArray(copy(a)); NUFSHT._col_axpy!(yj, JLArrays.JLArray(α), JLArrays.JLArray(x), σ)
+    Test.@test Array(yj) ≈ yc
+
+    pc = copy(a); NUFSHT._col_pbp!(pc, b, β)
+    pj = JLArrays.JLArray(copy(a)); NUFSHT._col_pbp!(pj, JLArrays.JLArray(b), JLArrays.JLArray(β))
+    Test.@test Array(pj) ≈ pc
+
+    # real↔complex field copy, both `f` shapes: (M, B) and (M,) with B=1.
+    M = 20
+    for (fsz, bufsz) in (((M, B), (M, B)), ((M,), (M, 1)))
+        fbuf = randn(ComplexF64, bufsz...)
+        fc = zeros(fsz...); NUFSHT._copy_real!(fc, fbuf)
+        fj = JLArrays.JLArray(zeros(fsz...)); NUFSHT._copy_real!(fj, JLArrays.JLArray(fbuf))
+        Test.@test Array(fj) == fc
+
+        fsrc = randn(fsz...)
+        bc = zeros(ComplexF64, bufsz...); NUFSHT._copy_field!(bc, fsrc)
+        bj = JLArrays.JLArray(zeros(ComplexF64, bufsz...)); NUFSHT._copy_field!(bj, JLArrays.JLArray(fsrc))
+        Test.@test Array(bj) == bc
+    end
+end
+
+# Device-generic spectral filter (`apply_transfer!`, × H(ℓ)) — must match the CPU scalar mode loop
+# bit-for-bit on JLArray, for both a smooth (Gaussian) and a sharp (top-hat) transfer.
+Test.@testset "KernelAbstractions extension: device apply_transfer! (JLArray)" begin
+    Random.seed!(606)
+    lmax = 8; N = lmax + 1; Nφ = 2lmax + 1; B = 3
+    for filt in (NUFSHT.gaussian_from_scale(2000e3), NUFSHT.TopHatTransfer(4))
+        C = randn(N, Nφ, B)
+        Cc = copy(C); NUFSHT.apply_transfer!(Cc, filt, lmax)
+        Cj = JLArrays.JLArray(copy(C)); NUFSHT.apply_transfer!(Cj, filt, lmax)
+        Test.@test Array(Cj) == Cc
+    end
+end

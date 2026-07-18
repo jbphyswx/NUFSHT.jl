@@ -9,9 +9,8 @@ device fallback, so it is bound per-vendor here; a ROCm/Metal NUFFT would be an 
 extension.
 
 A `CuArray` node set selects cuFINUFFT via the creation seam (`_nufft_makeplan`); execution and
-teardown dispatch on the returned `cufinufft_plan`. cuFINUFFT and FINUFFT share `setkwopts!`, so the
-same keyword options (`dtype`/`modeord`/`nthreads`) forward unchanged (cuFINUFFT ignores `nthreads`).
-Loaded by `using CUDA`.
+teardown dispatch on the returned `cufinufft_plan`. `dtype`/`modeord` forward to cuFINUFFT unchanged;
+`nthreads` is dropped here because `cufinufft_opts` has no such field. Loaded by `using CUDA`.
 """
 module NUFSHTCUDAExt
 
@@ -19,7 +18,7 @@ using NUFSHT: NUFSHT
 using FINUFFT: FINUFFT
 using CUDA: CUDA
 
-NUFSHT._nufft_makeplan(::CUDA.CuArray, type, n_modes, iflag, ntrans, tol; kwargs...) =
+NUFSHT._nufft_makeplan(::CUDA.CuArray, type, n_modes, iflag, ntrans, tol; nthreads = nothing, kwargs...) =
     FINUFFT.cufinufft_makeplan(type, n_modes, iflag, ntrans, tol; kwargs...)
 NUFSHT._nufft_setpts!(p::FINUFFT.cufinufft_plan, x, y) = (FINUFFT.cufinufft_setpts!(p, x, y); p)
 NUFSHT._nufft_exec!(p::FINUFFT.cufinufft_plan, input, output) =
