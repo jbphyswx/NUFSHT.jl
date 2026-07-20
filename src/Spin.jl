@@ -131,8 +131,8 @@ function make_spin_plan(θ_nodes, φ_nodes, lmax::Integer, s::Integer;
     nufft_type1 = _nufft_makeplan(negθ, 1, n_modes, -1, B, Float64(tol); dtype = T, nthreads = nthr)
     _nufft_setpts!(nufft_type2, negθ, φ)
     _nufft_setpts!(nufft_type1, negθ, φ)
-    finalizer(_nufft_destroy!, nufft_type2)
-    finalizer(_nufft_destroy!, nufft_type1)
+    _nufft_finalize!(nufft_type2)
+    _nufft_finalize!(nufft_type1)
 
     tol64 = Float64(tol)
     return SpinNUSHTplan{T, typeof(θ), typeof(dl_curr), typeof(G), typeof(fbuf),

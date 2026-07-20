@@ -1,5 +1,6 @@
 [deps]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 FastSphericalHarmonics = "d335c211-7587-445e-a753-f0b1fb7e445f"
 GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"

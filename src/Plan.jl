@@ -25,6 +25,9 @@ export NUSHTplan, make_plan, close!
 # to both — the seam passes them through unchanged.
 @inline _nufft_exec!(p::FINUFFT.finufft_plan, input, output) = FINUFFT.finufft_exec!(p, input, output)
 @inline _nufft_destroy!(p::FINUFFT.finufft_plan) = FINUFFT.finufft_destroy!(p)
+# Attach the GC finalizer through the seam, so a device plan handle forwards it to its wrapped
+# (mutable) cuFINUFFT plan (the CUDA extension's method); the host plan is itself mutable.
+@inline _nufft_finalize!(p::FINUFFT.finufft_plan) = (finalizer(_nufft_destroy!, p); p)
 @inline _nufft_makeplan(::AbstractVector, type, n_modes, iflag, ntrans, tol; kwargs...) =
     FINUFFT.finufft_makeplan(type, n_modes, iflag, ntrans, tol; kwargs...)
 # Host FINUFFT needs host coordinate vectors. `_host` is a no-op for a host `Array` and copies a
@@ -193,8 +196,8 @@ function make_plan(
     nufft_type1 = _nufft_makeplan(θ, 1, n_modes, -1, B, Float64(tol); dtype = T, modeord = 1, nthreads = nthr)
     _nufft_setpts!(nufft_type2, θ, φ)
     _nufft_setpts!(nufft_type1, θ, φ)
-    finalizer(_nufft_destroy!, nufft_type2)
-    finalizer(_nufft_destroy!, nufft_type1)
+    _nufft_finalize!(nufft_type2)
+    _nufft_finalize!(nufft_type1)
 
     tol64 = Float64(tol)
     return NUSHTplan{T, typeof(θ), typeof(C), typeof(Fslice), typeof(F̃), typeof(fbuf),
