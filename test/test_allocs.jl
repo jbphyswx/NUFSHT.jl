@@ -10,7 +10,7 @@
 # the call twice before measuring, to clear one-time per-plan initialization (FastTransforms adjoint-plan /
 # FFTW planner setup allocates once on the first real call, then never again).
 #
-# Zero allocation is a single-threaded guarantee (issue #4): under a multithreaded Julia, FINUFFT's
+# Zero allocation is a single-threaded guarantee: under a multithreaded Julia, FINUFFT's
 # thread-safe FFTW-planner lock adds small external per-call allocations outside NUFSHT's control, so these
 # assertions run only at `-t1` (matching `test_adjoint.jl`).
 
@@ -44,10 +44,10 @@ _a_caxpyc(y, al, x, s)   = (NUFSHT._col_axpy_c!(y, al, x, s); @allocated NUFSHT.
 _a_cpbpc(p, r, be)       = (NUFSHT._col_pbp_c!(p, r, be); @allocated NUFSHT._col_pbp_c!(p, r, be); @allocated NUFSHT._col_pbp_c!(p, r, be))
 _a_solves(sf, f, p, ws)  = (NUFSHT.nusht_solve_spin!(sf, f, p; ws = ws, maxiter = 60, rtol = 1e-8); @allocated NUFSHT.nusht_solve_spin!(sf, f, p; ws = ws, maxiter = 60, rtol = 1e-8); @allocated NUFSHT.nusht_solve_spin!(sf, f, p; ws = ws, maxiter = 60, rtol = 1e-8))
 
-Test.@testset "allocation: full hot-path surface is allocation-free (issue #4)" begin
+Test.@testset "allocation: full hot-path surface is allocation-free" begin
     single = Threads.nthreads() == 1
     if !single
-        @info "zero-alloc is a single-threaded guarantee (issue #4); skipping @allocated==0 asserts at -t$(Threads.nthreads())"
+        @info "zero-alloc is a single-threaded guarantee; skipping @allocated==0 asserts at -t$(Threads.nthreads())"
     end
     Random.seed!(9)
     lmax = 8

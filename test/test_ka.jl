@@ -91,12 +91,9 @@ Test.@testset "KernelAbstractions extension: device spin CG reductions (JLArray)
     Test.@test Array(pj) ≈ pc
 end
 
-# Structural device-type propagation: building a plan from device node arrays must yield a plan (and CG
-# workspace) whose buffers are ALL device-resident. This is the regression guard for issue #6 — the
-# scalar `make_plan` previously built host buffers for device nodes (silently, since JLArray coords copy
-# to host for FINUFFT), shipping a plan that could not run on GPU. (The FFT plan on a JLArray falls back
-# to host FFTW — JLArrays are CPU-backed strided memory — so the device *FFT* itself is only validated on
-# real CUDA, in test/gpu_cuda.jl; here we assert the buffer array types, which is what regressed.)
+# A plan (and its CG workspace) built from device node arrays must have ALL buffers device-resident.
+# An FFT plan on a JLArray falls back to host FFTW (JLArrays are CPU-backed strided memory), so the
+# device FFT itself is only validated on real CUDA (test/gpu_cuda.jl); here we assert buffer array types.
 Test.@testset "KernelAbstractions extension: device plan buffers are device-resident (JLArray)" begin
     isdev(x) = x isa GPUArraysCore.AbstractGPUArray
     Random.seed!(404)
@@ -123,7 +120,7 @@ Test.@testset "KernelAbstractions extension: device plan buffers are device-resi
         Test.@test isdev(getfield(sws, f))
     end
     NUFSHT.close!(splan)
-    @info "KernelAbstractions ext: scalar+spin device plans/workspaces are device-resident (issue #6)"
+    @info "KernelAbstractions ext: scalar+spin device plans/workspaces are device-resident"
 end
 
 # Device-generic scalar CG reductions + real↔complex field copy (so the *scalar* nusht_solve!/type-2/1

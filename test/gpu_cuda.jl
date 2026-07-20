@@ -55,7 +55,7 @@ else
 
     # Scalar path on device: the full A = N·F·D·S pipeline (FastTransforms S-step host-bounces, DFS
     # doubling is a KA kernel, the 2-D FFT goes through AbstractFFTs ⇒ CUFFT, the NUFFT via cuFINUFFT).
-    # This is the path issue #6 was about — `make_plan(CuArray)` must yield device buffers AND run.
+    # `make_plan(CuArray)` must yield device-resident buffers and run.
     @testset "CUDA device scalar transform == CPU" begin
         Random.seed!(11)
         for (lmax, B) in ((16, 1), (24, 2))
@@ -68,7 +68,7 @@ else
 
             pc = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-9, ntrans = B)
             pg = NUFSHT.make_plan(CuArray(θ), CuArray(φ), lmax; tol = 1e-9, ntrans = B)
-            @test pg.F isa CuArray && pg.fbuf isa CuArray   # device-resident buffers (issue #6)
+            @test pg.F isa CuArray && pg.fbuf isa CuArray   # device-resident buffers
 
             # type 2 (synthesis)
             fc = zeros(M, B); NUFSHT.nusht_type2!(fc, C, pc)

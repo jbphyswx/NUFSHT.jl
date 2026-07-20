@@ -117,7 +117,7 @@ function make_spin_plan(θ_nodes, φ_nodes, lmax::Integer, s::Integer;
     negθ = -θ                                  # absorbs the e^{-im'θ} factor into iflag=+1
 
     # Buffers are shaped like the nodes, so device nodes ⇒ device-resident plan. Reused Wigner-d(π/2)
-    # recurrence buffers are O(lmax²) (vs the old O(lmax³) dense per-ℓ store).
+    # recurrence buffers are O(lmax²), not the O(lmax³) of a dense per-ℓ store.
     dl_curr = _zeros_like(θ, T, L, L)
     dl_prev = _zeros_like(θ, T, L, L)
     G    = _zeros_like(θ, Complex{T}, L, L, B)

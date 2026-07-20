@@ -78,7 +78,7 @@ Fields:
 
 The FINUFFT axis convention is `x = θ` (`ms = 2Nθ`), `y = φ` (`mt = Nφ`); with `modeord = 1` the
 FFTW-native mode order is used directly, so no `fftshift`/transpose is needed. `iflag = +1` on the
-synthesis plan supplies the reconstruction sign that the old code obtained via a conjugate-transpose.
+synthesis plan supplies the reconstruction sign directly (no conjugate-transpose of the modes needed).
 """
 struct NUSHTplan{T<:AbstractFloat, RV<:AbstractVector{T}, AT3<:AbstractArray{T,3},
                  AT2<:AbstractMatrix{T}, CT3<:AbstractArray{Complex{T},3},
@@ -181,9 +181,8 @@ function make_plan(
     sph_plan_synth_adj = sph_plan_synth'    # PS'
 
     # iflag +1 for synthesis (type 2): reconstruction uses the +i (inverse-DFT) sign, so the raw
-    # FFT modes need no conjugation. The old code used iflag −1 with a conjugate-transpose (`'`); the
-    # conjugation there was load-bearing (conj(c)·e^{-ikx} = c·e^{+ikx}) — dropping the transpose in
-    # favor of an axis swap requires flipping the sign instead. type 1 (−1) stays the exact adjoint.
+    # FFT modes need no conjugation — an axis swap takes the place of a conjugate-transpose
+    # (conj(c)·e^{-ikx} = c·e^{+ikx}). type 1 (−1) is the exact adjoint.
     # `nthreads` is forwarded straight to FINUFFT: 0 (default) = ALL available cores (FINUFFT's
     # sentinel, not "zero threads") — fastest for a single transform; FastTransforms' Legendre step
     # is already multithreaded. Set a small count (e.g. 1) when running many plans concurrently via
