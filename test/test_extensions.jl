@@ -3,8 +3,9 @@
 # transform (that needs hardware — see test/gpu_cuda.jl).
 using CUDA: CUDA
 
-Test.@testset "package extension NUFSHTCUDAExt loads" begin
-    Test.@test Base.get_extension(NUFSHT, :NUFSHTCUDAExt) !== nothing
-    Test.@test hasmethod(NUFSHT._nufft_makeplan, Tuple{CUDA.CuArray, Int, Vector{Int64}, Int, Int, Float64})
-    @info "NUFSHTCUDAExt loaded (CUDA.functional() = $(CUDA.functional()))"
+Test.@testset "package extension NUFSHTcuFINUFFTExt loads" begin
+    Test.@test Base.get_extension(NUFSHT, :NUFSHTcuFINUFFTExt) !== nothing
+    Test.@test hasmethod(NUFSHT._nufft_makeplan,
+                         Tuple{NUFSHT.FINUFFTBackend, CUDA.CuArray, Int, Vector{Int64}, Int, Int, Float64})
+    @info "NUFSHTcuFINUFFTExt loaded (CUDA.functional() = $(CUDA.functional()))"
 end

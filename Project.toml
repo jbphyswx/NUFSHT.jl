@@ -8,34 +8,44 @@ projects = ["test", "docs"]
 
 [deps]
 AbstractFFTs = "621f4979-c628-5d54-868e-fcf4e3e8185c"
+ComputationalBackends = "5c6e2104-4040-447f-8fc0-66ec2223b019"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
-FINUFFT = "d8beea63-0952-562e-9c6a-8e8ef7364055"
 FastSphericalHarmonics = "d335c211-7587-445e-a753-f0b1fb7e445f"
 FastTransforms = "057dd010-8810-581a-b7be-e3fc3b93f78c"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
+SpectralBackends = "289ded02-b044-41b2-8b2d-71f2a47755d1"
 
 [weakdeps]
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
+FINUFFT = "d8beea63-0952-562e-9c6a-8e8ef7364055"
 GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+NonuniformFFTs = "cd96f58b-6017-4a02-bb9e-f4d81626177f"
 OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
 
+[sources]
+ComputationalBackends = {url = "https://github.com/jbphyswx/ComputationalBackends.jl.git"}
+SpectralBackends = {url = "https://github.com/jbphyswx/SpectralBackends.jl.git"}
+
 [extensions]
-NUFSHTCUDAExt = "CUDA"
+NUFSHTcuFINUFFTExt = ["CUDA", "FINUFFT"]
 NUFSHTCairoMakieExt = "CairoMakie"
 NUFSHTDistributedExt = "Distributed"
+NUFSHTFINUFFTExt = "FINUFFT"
 NUFSHTKernelAbstractionsExt = ["KernelAbstractions", "GPUArraysCore"]
 NUFSHTMPIExt = "MPI"
+NUFSHTNonuniformFFTsExt = "NonuniformFFTs"
 NUFSHTOhMyThreadsExt = "OhMyThreads"
 
 [compat]
 AbstractFFTs = "1"
 CUDA = "5, 6"
 CairoMakie = "0.15"
+ComputationalBackends = "0.1"
 Distributed = "1"
 FFTW = "1"
 FINUFFT = "3"
@@ -45,6 +55,8 @@ GPUArraysCore = "0.1, 0.2"
 KernelAbstractions = "0.9"
 LinearAlgebra = "1"
 MPI = "0.20"
+NonuniformFFTs = "0.9.6"
 OhMyThreads = "0.7, 0.8"
 SpecialFunctions = "2.8.0"
+SpectralBackends = "0.1"
 julia = "1.11"

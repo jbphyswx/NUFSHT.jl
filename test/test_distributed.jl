@@ -1,4 +1,5 @@
 using Distributed: Distributed   # triggers NUFSHTDistributedExt
+using ComputationalBackends: ComputationalBackends
 
 # Farming independent problems across Distributed *worker processes* (process isolation makes
 # FastTransforms safe — each worker has its own OpenMP/FFTW state). We add real workers so the test
@@ -38,7 +39,7 @@ Test.@testset "Distributed extension: farm over worker processes" begin
 
         # Synthesis farm: type-2 is a deterministic gather (nthreads=1), so the farm must match the
         # serial transform bit-for-bit — validates the pmap-to-workers dispatch + plan-per-worker.
-        fs = NUFSHT.nusht_type2_distributed(θs, φs, Ctrue, lmax; tol = 1e-10, nthreads = 1)
+        fs = NUFSHT.nusht_type2(θs, φs, Ctrue, lmax, ComputationalBackends.DistributedBackend(); tol = 1e-10, nthreads = 1)
         for i in 1:P
             plan = NUFSHT.make_plan(θs[i], φs[i], lmax; tol = 1e-10, nthreads = 1)
             fref = zeros(M); NUFSHT.nusht_type2!(fref, Ctrue[i], plan)
@@ -47,7 +48,7 @@ Test.@testset "Distributed extension: farm over worker processes" begin
         end
 
         # Inversion farm: each solve reconstructs its field to CG tolerance.
-        Cs = NUFSHT.nusht_solve_distributed(θs, φs, fs, lmax;
+        Cs = NUFSHT.nusht_solve(θs, φs, fs, lmax, ComputationalBackends.DistributedBackend();
                                             tol = 1e-10, nthreads = 1, rtol = 1e-6, maxiter = 1000)
         for i in 1:P
             plan = NUFSHT.make_plan(θs[i], φs[i], lmax; tol = 1e-10, nthreads = 1)

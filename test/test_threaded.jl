@@ -1,4 +1,5 @@
 using OhMyThreads: OhMyThreads   # triggers NUFSHTOhMyThreadsExt
+using ComputationalBackends: ComputationalBackends
 
 # Node-local thread parallelism over independent problems. FastTransforms is unsafe to *drive* from a
 # Julia task, so the extension forces it single-threaded around the whole threaded section; the plans
@@ -37,13 +38,13 @@ Test.@testset "OhMyThreads extension: threaded == serial, main task intact" begi
     health_before = zeros(M); NUFSHT.nusht_type2!(health_before, Cs[1], plans[1])
 
     fs = [zeros(M) for _ in 1:P]
-    NUFSHT.nusht_type2_threaded!(fs, Cs, plans)
+    NUFSHT.nusht_type2!(fs, Cs, plans, ComputationalBackends.ThreadedBackend())
     for i in 1:P
         Test.@test fs[i] ≈ fref[i]
     end
 
     Cs_out = [zeros(N, Nφ) for _ in 1:P]
-    NUFSHT.nusht_type1_threaded!(Cs_out, fs, plans)
+    NUFSHT.nusht_type1!(Cs_out, fs, plans, ComputationalBackends.ThreadedBackend())
     for i in 1:P
         Cref = zeros(N, Nφ); NUFSHT.nusht_type1!(Cref, fs[i], plans[i])
         Test.@test Cs_out[i] ≈ Cref
@@ -51,7 +52,7 @@ Test.@testset "OhMyThreads extension: threaded == serial, main task intact" begi
 
     # Threaded solve: each recovers its field to CG tolerance.
     Cs_sol = [zeros(N, Nφ) for _ in 1:P]
-    NUFSHT.nusht_solve_threaded!(Cs_sol, fs, plans; rtol = 1e-6, maxiter = 1000)
+    NUFSHT.nusht_solve!(Cs_sol, fs, plans, ComputationalBackends.ThreadedBackend(); rtol = 1e-6, maxiter = 1000)
     for i in 1:P
         frec = zeros(M); NUFSHT.nusht_type2!(frec, Cs_sol[i], plans[i])
         Test.@test sqrt(sum(abs2, frec .- fs[i]) / sum(abs2, fs[i])) < 1e-3

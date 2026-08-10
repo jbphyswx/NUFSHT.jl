@@ -24,12 +24,13 @@ work buffer, so repeated transforms — filtering, or the hundreds of matvecs in
 """
 module NUFSHT
 
+using ComputationalBackends: ComputationalBackends
 using FFTW: FFTW
-using FINUFFT: FINUFFT
 using FastSphericalHarmonics: FastSphericalHarmonics
 using LinearAlgebra: LinearAlgebra
 
 include("DFS.jl")
+include("NUFFT.jl")
 include("Plan.jl")
 include("Kernels.jl")
 include("Spin.jl")
@@ -38,9 +39,8 @@ export make_plan, NUSHTplan, close!, CGWorkspace
 export nusht_type1!, nusht_type2!, nusht_filter!, nusht_filter_renorm!, nusht_solve!
 export TopHatTransfer, GaussianTransfer, SharpSpectralTransfer
 export kernel_transfer, cutoff_degree, gaussian_from_scale
-export nusht_type2_threaded!, nusht_type1_threaded!, nusht_solve_threaded!
-export nusht_type2_distributed, nusht_solve_distributed
-export nusht_adjoint_mpi!, nusht_solve_mpi!
+export nusht_type2_spin!, nusht_type1_spin!, nusht_solve_spin!
+export nusht_type2, nusht_solve
 export plot_field
 
 """
@@ -53,80 +53,38 @@ it with `using CairoMakie`.
 """
 function plot_field end
 
-# ── Parallel-execution API (methods supplied by the accelerator extensions) ────
-# Two shapes, reflecting how each backend shares work:
+# ── Parallel execution: backend dispatch ──────────────────────────────────────
+# Parallelism is a `ComputationalBackends.AbstractExecutionBackend` argument, in two families:
 #
-#  • In-process (`NUFSHTOhMyThreadsExt`, `using OhMyThreads`): a single FINUFFT plan is not safe to
-#    `exec!` concurrently, so the *_threaded! methods parallelize over independent
-#    (output, input, plan) triples — one plan per task — mutating the outputs in place.
+#  • **Farm over independent problems** (collection methods below). A FINUFFT plan is not safe to
+#    `exec!` concurrently, so each problem carries its own. `DistributedBackend` needs the node-set
+#    form — plans hold C pointers and cannot be serialized, so each worker builds its own.
+#  • **Decompose one transform** — `MPIBackend`, partitioning the `M` points across ranks.
 #
-#  • Cross-process (`NUFSHTDistributedExt`, `using Distributed`): FINUFFT plans hold C pointers and
-#    cannot be serialized to workers, so the *_distributed methods take *node sets* and each worker
-#    builds its own plan (farm of independent problems), returning fresh results.
-#
-#  • `NUFSHTMPIExt` (`using MPI`) point-decomposes a *single* transform across ranks (see the ext).
+# GPU is not a backend argument: it follows from the plan's array types.
+
+@inline _omt_loaded() = Base.get_extension(@__MODULE__, :NUFSHTOhMyThreadsExt) !== nothing
 
 """
-    nusht_type2_threaded!(fs, Cs, plans)
+    _resolve_backend(backend) -> AbstractExecutionBackend
 
-Synthesize a collection of independent problems in parallel: for each `i`, `nusht_type2!(fs[i],
-Cs[i], plans[i])`. One plan per task (FINUFFT plans are not concurrency-safe). Requires an
-extension — e.g. `using OhMyThreads` or `using Distributed`.
-"""
-function nusht_type2_threaded! end
+Concrete backends pass through untouched. `AutoBackend` is the only thing allowed to choose, and it
+chooses on **real capability**: a `ThreadedBackend` only when Julia has more than one thread *and* the
+OhMyThreads extension is loaded, otherwise `SerialBackend`. A backend the caller named explicitly is
+either honoured exactly or refused — never silently downgraded.
 
+This is deliberately NUFSHT's own function rather than a method on `ComputationalBackends.resolve_backend`,
+which would be type piracy.
 """
-    nusht_type1_threaded!(Cs, fs, plans)
+@inline _resolve_backend(backend::ComputationalBackends.AbstractExecutionBackend) = backend
+@inline _resolve_backend(::ComputationalBackends.AbstractAutoBackend) =
+    (Threads.nthreads() > 1 && _omt_loaded()) ? ComputationalBackends.ThreadedBackend() :
+                                                ComputationalBackends.SerialBackend()
 
-Parallel adjoint analysis over independent problems; see [`nusht_type2_threaded!`](@ref).
-"""
-function nusht_type1_threaded! end
-
-"""
-    nusht_solve_threaded!(Cs, fs, plans; kwargs...)
-
-Parallel exact inversion over independent problems: for each `i`, `nusht_solve!(Cs[i], fs[i],
-plans[i]; kwargs...)`. See [`nusht_type2_threaded!`](@ref).
-"""
-function nusht_solve_threaded! end
-
-"""
-    nusht_type2_distributed(θs, φs, Cs, lmax; kwargs...) -> fs
-
-Farm `N` independent synthesis problems across `Distributed` workers: for each `i`, a plan is built
-on a worker from `(θs[i], φs[i])`, `nusht_type2!` evaluates `Cs[i]`, and the field is returned as
-`fs[i]`. `kwargs` are forwarded to `make_plan` (`tol`, `T`, `ntrans`, `nthreads`). Requires
-`using Distributed` (and `@everywhere using NUFSHT`).
-"""
-function nusht_type2_distributed end
-
-"""
-    nusht_solve_distributed(θs, φs, fs, lmax; kwargs...) -> Cs
-
-Farm `N` independent inversions across `Distributed` workers (one plan built per problem on a
-worker). Returns the recovered coefficient arrays. See [`nusht_type2_distributed`](@ref).
-"""
-function nusht_solve_distributed end
-
-"""
-    nusht_adjoint_mpi!(C, f_local, plan_local, comm)
-
-MPI point-decomposed **adjoint** `A†f`. Each rank owns a disjoint subset of the `M` points with a
-local plan; since `A†` is a sum over points, each rank computes its local contribution and the
-result is `MPI.Allreduce!`-summed into `C` (replicated on every rank; communication is O(lmax²),
-independent of `M`). Requires `using MPI`.
-"""
-function nusht_adjoint_mpi! end
-
-"""
-    nusht_solve_mpi!(C, f_local, plan_local, comm; maxiter, rtol, verbose) -> (C, iters, rel_res)
-
-MPI point-decomposed **exact inversion**: conjugate gradients on `A†A c = A†f` where the points are
-partitioned across ranks. `A` (synthesis) needs no communication; `A†` and the CG inner products are
-`Allreduce`d. Solves the *global* least-squares system with `C` replicated on every rank. Requires
-`using MPI`.
-"""
-function nusht_solve_mpi! end
+_backend_unavailable(backend, what) = throw(ArgumentError(
+    "$(nameof(typeof(backend))) cannot run $what here — the extension providing it is not loaded. " *
+    "ThreadedBackend needs `using OhMyThreads`, DistributedBackend `using Distributed`, " *
+    "MPIBackend `using MPI`."))
 
 # FastTransforms' `__init__` starts its bundled OpenMP FFTW with `ceil(CPU_THREADS/2)` threads
 # (FastTransforms/src/libfasttransforms.jl `__init__`). Its butterfly transforms and sphere FFTs then
@@ -167,13 +125,15 @@ other processes that this restore cannot reach; they call [`_fasttransforms_sing
 themselves. See its comment above for the underlying FastTransforms OpenMP-in-task hazard.
 """
 function _with_fasttransforms_single(f)
-    default_nt = _fasttransforms_default_nthreads()
+    # FastTransforms and FFTW.jl share one libfftw3, so the planner count has a real getter and can be
+    # restored exactly; the butterfly count has none, so that one falls back to the `__init__` default.
+    prev_planner = FFTW.get_num_threads()
     try
         _fasttransforms_single!()
         return f()
     finally
-        FastTransforms.ft_set_num_threads(default_nt)
-        FastTransforms.ft_fftw_plan_with_nthreads(default_nt)
+        FastTransforms.ft_set_num_threads(_fasttransforms_default_nthreads())
+        FastTransforms.ft_fftw_plan_with_nthreads(prev_planner)
     end
 end
 
@@ -181,7 +141,7 @@ end
 # Shape helpers (B=1 ergonomics): user passes vectors/matrices; cores work on (…, B).
 # ─────────────────────────────────────────────────────────────────────────────
 
-@inline _npts(plan::NUSHTplan) = length(plan.θ_nodes)
+@inline _npts(plan::NUSHTplan) = length(_θnodes(plan))
 @inline _slicelen(plan::NUSHTplan) = plan.Nθ * plan.Nφ
 
 @inline function _assert_coeffs(C, plan::NUSHTplan)
@@ -214,6 +174,11 @@ function _copy_field!(fbuf, f)
     return fbuf
 end
 
+# The NUFFT always returns complex strengths; a real field drops the imaginary residue.
+_copy_out!(f, fbuf, ::AbstractNUSHTplan) = _copy_field!(f, fbuf)
+_copy_out!(f, fbuf, ::NUSHTplan{T,FE}) where {T,FE<:Real} = _copy_real!(f, fbuf)
+_copy_out!(f, fbuf, ::NUSHTplan{T,FE}) where {T,FE<:Complex} = _copy_field!(f, fbuf)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal S / D·F·N cores (operate entirely on plan buffers).
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,17 +197,98 @@ end
 # D·F·N (forward): doubled map → torus FFT → half-pixel phase → type-2 NUFFT into `fbuf`.
 # `phase_scaled` is a length-2Nθ vector; broadcasting it against `Fhat` (2Nθ,Nφ,B) aligns dim 1 and
 # spreads over the (φ, batch) dims — no reshape needed.
-function _dfn_synthesis!(plan::NUSHTplan)
-    dfs_double!(plan.F̃, plan.F)
-    LinearAlgebra.mul!(plan.Fhat, plan.fft_plan, plan.F̃)
-    plan.Fhat .*= plan.phase_scaled
-    _nufft_exec!(plan.nufft_type2, plan.Fhat, plan.fbuf)
+# A real field's spectrum is Hermitian, so `rfft`'s `k₁ ≥ 0` half, weighted by `phase_scaled`'s
+# `{1,2,…,2,1}`, reproduces the whole sum. Which of the two mode layouts is in use is carried by the
+# plan's `θ_shift` type: without one, the half goes into the head of a full-length array whose tail
+# stays zero; with one, the array is the half itself, in centered order on both axes.
+function _pack_modes!(Fhat, Fhalf, phase, ::Nothing)
+    n1, n2 = size(Fhat, 1), size(Fhat, 2)
+    nh = size(Fhalf, 1)
+    @inbounds for b in axes(Fhalf, 3), j in 1:n2
+        d = (b - 1) * n1 * n2 + (j - 1) * n1
+        s = (b - 1) * nh * n2 + (j - 1) * nh
+        @simd for i in 1:nh
+            Fhat[d + i] = Fhalf[s + i] * phase[i]
+        end
+    end
+    return Fhat
+end
+
+function _unpack_modes!(Fhalf, Fhat, phase, ::Nothing)
+    n1, n2 = size(Fhat, 1), size(Fhat, 2)
+    nh = size(Fhalf, 1)
+    z = zero(eltype(Fhat))
+    @inbounds for b in axes(Fhalf, 3), j in 1:n2
+        d = (b - 1) * n1 * n2 + (j - 1) * n1
+        s = (b - 1) * nh * n2 + (j - 1) * nh
+        @simd for i in 1:nh
+            Fhalf[s + i] = Fhat[d + i] * phase[i]
+        end
+        # Type-1 writes the whole array; synthesis needs the negative half zero.
+        @simd for i in (nh + 1):n1
+            Fhat[d + i] = z
+        end
+    end
+    return Fhalf
+end
+
+function _pack_modes!(Fhat, Fhalf, phase, ::AbstractVector)
+    n2 = size(Fhalf, 2)
+    h = n2 ÷ 2
+    @inbounds for b in axes(Fhalf, 3), j in 1:n2
+        @views Fhat[:, mod1(j + h, n2), b] .= Fhalf[:, j, b] .* phase
+    end
+    return Fhat
+end
+
+function _unpack_modes!(Fhalf, Fhat, phase, ::AbstractVector)
+    n2 = size(Fhalf, 2)
+    h = n2 ÷ 2
+    @inbounds for b in axes(Fhalf, 3), j in 1:n2
+        @views Fhalf[:, j, b] .= Fhat[:, mod1(j + h, n2), b] .* phase
+    end
+    return Fhalf
+end
+
+# Undo the constant wavenumber offset centered ordering imposes; `conj` keeps the pair an exact transpose.
+_rephase!(fbuf, ::Nothing) = fbuf
+_rephase!(fbuf, s::AbstractVector) = (fbuf .*= s; fbuf)
+_rephase_conj!(fbuf, ::Nothing) = fbuf
+_rephase_conj!(fbuf, s::AbstractVector) = (fbuf .*= conj.(s); fbuf)
+
+function _dfn_synthesis!(plan::NUSHTplan{T,FE}) where {T,FE<:Real}
+    F̃, Fhalf, fp = plan.F̃, plan.Fhalf, plan.fft_plan
+    dfs_double!(F̃, plan.F)
+    LinearAlgebra.mul!(Fhalf, fp, F̃)
+    _pack_modes!(plan.Fhat, Fhalf, plan.phase_scaled, _θshift(plan))
+    _nufft_exec!(_nufft2(plan), plan.Fhat, _fbuf(plan))
+    _rephase!(_fbuf(plan), _θshift(plan))
     return plan
 end
 
-# N†·F†·D† (adjoint): type-1 NUFFT (from `fbuf`) → conj phase → inverse FFT → fold into real `F`.
-function _dfn_analysis!(plan::NUSHTplan)
-    _nufft_exec!(plan.nufft_type1, plan.fbuf, plan.Fhat)
+function _dfn_synthesis!(plan::NUSHTplan{T,FE}) where {T,FE<:Complex}
+    dfs_double!(plan.F̃, plan.F)
+    LinearAlgebra.mul!(plan.Fhat, plan.fft_plan, plan.F̃)
+    plan.Fhat .*= plan.phase_scaled
+    _nufft_exec!(_nufft2(plan), plan.Fhat, _fbuf(plan))
+    return plan
+end
+
+# N†·F†·D† (adjoint): type-1 NUFFT (from `fbuf`) → conj phase → inverse FFT → fold into `F`.
+# `phase_conj` carries no Hermitian weight — `brfft` already applies that doubling, and applying it on
+# both sides breaks the adjoint identity `nusht_solve!` depends on.
+function _dfn_analysis!(plan::NUSHTplan{T,FE}) where {T,FE<:Real}
+    F̃, Fhalf, ip = plan.F̃, plan.Fhalf, plan.ifft_plan
+    _rephase_conj!(_fbuf(plan), _θshift(plan))
+    _nufft_exec!(_nufft1(plan), _fbuf(plan), plan.Fhat)
+    _unpack_modes!(Fhalf, plan.Fhat, plan.phase_conj, _θshift(plan))
+    LinearAlgebra.mul!(F̃, ip, Fhalf)
+    dfs_fold!(plan.F, F̃)
+    return plan
+end
+
+function _dfn_analysis!(plan::NUSHTplan{T,FE}) where {T,FE<:Complex}
+    _nufft_exec!(_nufft1(plan), _fbuf(plan), plan.Fhat)
     plan.Fhat .*= plan.phase_conj
     LinearAlgebra.mul!(plan.F̃, plan.ifft_plan, plan.Fhat)
     dfs_fold!(plan.F, plan.F̃)
@@ -269,7 +315,7 @@ function nusht_type2!(f, C, plan::NUSHTplan{T}) where {T}
     copyto!(plan.F, C)
     _sph_evaluate!(plan)
     _dfn_synthesis!(plan)
-    _copy_real!(f, plan.fbuf)
+    _copy_out!(f, _fbuf(plan), plan)
     return f
 end
 
@@ -292,7 +338,7 @@ per-call plan rebuild.
 function nusht_type1!(C, f, plan::NUSHTplan{T}) where {T}
     _assert_field(f, plan)
     _assert_coeffs(C, plan)
-    _copy_field!(plan.fbuf, f)
+    _copy_field!(_fbuf(plan), f)
     _dfn_analysis!(plan)
     @inbounds for b in 1:plan.B
         _load_slice!(plan.Fslice, plan.F, plan, b)
@@ -313,7 +359,7 @@ making `A†A` symmetric positive definite for CG. At CC-grid points it coincide
 function _nusht_true_adjoint!(C, f, plan::NUSHTplan{T}) where {T}
     _assert_field(f, plan)
     _assert_coeffs(C, plan)
-    _copy_field!(plan.fbuf, f)
+    _copy_field!(_fbuf(plan), f)
     _dfn_analysis!(plan)
     @inbounds for b in 1:plan.B
         _load_slice!(plan.Fslice, plan.F, plan, b)
@@ -351,7 +397,7 @@ filtered mask (the fraction of kernel weight over ocean). `f_out` must have been
 are set to 0. Pass a reusable `mask_filt` scratch (shaped like `f_out`) to run allocation-free.
 """
 function nusht_filter_renorm!(f_out, mask, filter, plan::NUSHTplan{T}; mask_filt = similar(f_out)) where {T}
-    nusht_filter!(mask_filt, mask, filter, plan)   # `mask` is read straight into `plan.fbuf` — no copy needed
+    nusht_filter!(mask_filt, mask, filter, plan)   # `mask` is read straight into the strengths buffer
     threshold = T(0.01)
     # `mask_filt` is shaped like `f_out` → a single fused broadcast, zero-alloc + device-safe.
     f_out .= ifelse.(abs.(mask_filt) .>= threshold, f_out ./ mask_filt, zero(T))
@@ -390,8 +436,8 @@ function CGWorkspace(plan::NUSHTplan{T}) where {T}
     M = _npts(plan)
     # Buffers shaped like the plan's (so a device plan gets a device workspace).
     z3() = _zeros_like(plan.F, T, Nθ, Nφ, B)
-    vB() = _zeros_like(plan.θ_nodes, T, B)
-    return CGWorkspace(z3(), z3(), z3(), z3(), z3(), _zeros_like(plan.fbuf, T, M, B),
+    vB() = _zeros_like(_θnodes(plan), T, B)
+    return CGWorkspace(z3(), z3(), z3(), z3(), z3(), _zeros_like(_fbuf(plan), T, M, B),
                        vB(), vB(), vB(), vB(), vB(), vB(), vB())
 end
 
@@ -476,5 +522,231 @@ function nusht_solve!(
     copyto!(C, ws.x)
     return C, iters, maximum(ws.rel)
 end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Collections of independent problems, split across a backend
+# ─────────────────────────────────────────────────────────────────────────────
+# One plan per problem; `SerialBackend` loops here, `ThreadedBackend` in NUFSHTOhMyThreadsExt.
+
+@inline function _check_farm(outs, ins, plans)
+    @assert length(outs) == length(ins) == length(plans) "outs, ins and plans must have equal length"
+    return nothing
+end
+
+"""
+    nusht_type2!(fs, Cs, plans, backend = AutoBackend()) -> fs
+
+Synthesize a collection of independent problems: for each `i`, `nusht_type2!(fs[i], Cs[i], plans[i])`.
+`ThreadedBackend` requires `using OhMyThreads`.
+"""
+nusht_type2!(fs, Cs, plans::AbstractVector) = nusht_type2!(fs, Cs, plans, ComputationalBackends.AutoBackend())
+nusht_type2!(fs, Cs, plans::AbstractVector, b::ComputationalBackends.AbstractAutoBackend) =
+    nusht_type2!(fs, Cs, plans, _resolve_backend(b))
+function nusht_type2!(fs, Cs, plans::AbstractVector, ::ComputationalBackends.AbstractSerialBackend)
+    _check_farm(fs, Cs, plans)
+    for i in eachindex(plans)
+        nusht_type2!(fs[i], Cs[i], plans[i])
+    end
+    return fs
+end
+
+"""
+    nusht_type1!(Cs, fs, plans, backend = AutoBackend()) -> Cs
+
+Adjoint analysis over a collection of independent problems; see [`nusht_type2!`](@ref).
+"""
+nusht_type1!(Cs, fs, plans::AbstractVector) = nusht_type1!(Cs, fs, plans, ComputationalBackends.AutoBackend())
+nusht_type1!(Cs, fs, plans::AbstractVector, b::ComputationalBackends.AbstractAutoBackend) =
+    nusht_type1!(Cs, fs, plans, _resolve_backend(b))
+function nusht_type1!(Cs, fs, plans::AbstractVector, ::ComputationalBackends.AbstractSerialBackend)
+    _check_farm(Cs, fs, plans)
+    for i in eachindex(plans)
+        nusht_type1!(Cs[i], fs[i], plans[i])
+    end
+    return Cs
+end
+
+"""
+    nusht_solve!(Cs, fs, plans, backend = AutoBackend(); kwargs...) -> Cs
+
+Exact inversion over a collection of independent problems; `kwargs` go to the single-problem method.
+"""
+nusht_solve!(Cs, fs, plans::AbstractVector; kwargs...) = nusht_solve!(Cs, fs, plans, ComputationalBackends.AutoBackend(); kwargs...)
+nusht_solve!(Cs, fs, plans::AbstractVector, b::ComputationalBackends.AbstractAutoBackend; kwargs...) =
+    nusht_solve!(Cs, fs, plans, _resolve_backend(b); kwargs...)
+function nusht_solve!(Cs, fs, plans::AbstractVector,
+                      ::ComputationalBackends.AbstractSerialBackend; kwargs...)
+    _check_farm(Cs, fs, plans)
+    for i in eachindex(plans)
+        nusht_solve!(Cs[i], fs[i], plans[i]; kwargs...)
+    end
+    return Cs
+end
+
+"""
+    nusht_filter!(outs, ins, filter, plans, backend = AutoBackend()) -> outs
+
+Spectral filtering over a collection of independent problems; see [`nusht_type2!`](@ref).
+"""
+nusht_filter!(outs, ins, filter, plans::AbstractVector) =
+    nusht_filter!(outs, ins, filter, plans, ComputationalBackends.AutoBackend())
+nusht_filter!(outs, ins, filter, plans::AbstractVector, b::ComputationalBackends.AbstractAutoBackend) =
+    nusht_filter!(outs, ins, filter, plans, _resolve_backend(b))
+function nusht_filter!(outs, ins, filter, plans::AbstractVector,
+                       ::ComputationalBackends.AbstractSerialBackend)
+    _check_farm(outs, ins, plans)
+    for i in eachindex(plans)
+        nusht_filter!(outs[i], ins[i], filter, plans[i])
+    end
+    return outs
+end
+
+"""
+    nusht_type2_spin!(fs, sfs, plans, backend = AutoBackend()) -> fs
+
+Spin-weighted synthesis over a collection of independent problems. This path touches no FastTransforms
+state, so it carries none of the in-task hazard the scalar path works around.
+"""
+nusht_type2_spin!(fs, sfs, plans::AbstractVector) = nusht_type2_spin!(fs, sfs, plans, ComputationalBackends.AutoBackend())
+nusht_type2_spin!(fs, sfs, plans::AbstractVector, b::ComputationalBackends.AbstractAutoBackend) =
+    nusht_type2_spin!(fs, sfs, plans, _resolve_backend(b))
+function nusht_type2_spin!(fs, sfs, plans::AbstractVector,
+                           ::ComputationalBackends.AbstractSerialBackend)
+    _check_farm(fs, sfs, plans)
+    for i in eachindex(plans)
+        nusht_type2_spin!(fs[i], sfs[i], plans[i])
+    end
+    return fs
+end
+
+"""
+    nusht_type1_spin!(sfs, fs, plans, backend = AutoBackend()) -> sfs
+
+Spin-weighted adjoint analysis over a collection; see [`nusht_type2_spin!`](@ref).
+"""
+nusht_type1_spin!(sfs, fs, plans::AbstractVector) = nusht_type1_spin!(sfs, fs, plans, ComputationalBackends.AutoBackend())
+nusht_type1_spin!(sfs, fs, plans::AbstractVector, b::ComputationalBackends.AbstractAutoBackend) =
+    nusht_type1_spin!(sfs, fs, plans, _resolve_backend(b))
+function nusht_type1_spin!(sfs, fs, plans::AbstractVector,
+                           ::ComputationalBackends.AbstractSerialBackend)
+    _check_farm(sfs, fs, plans)
+    for i in eachindex(plans)
+        nusht_type1_spin!(sfs[i], fs[i], plans[i])
+    end
+    return sfs
+end
+
+"""
+    nusht_solve_spin!(sfs, fs, plans, backend = AutoBackend(); kwargs...) -> sfs
+
+Spin-weighted exact inversion over a collection; see [`nusht_type2_spin!`](@ref).
+"""
+nusht_solve_spin!(sfs, fs, plans::AbstractVector; kwargs...) =
+    nusht_solve_spin!(sfs, fs, plans, ComputationalBackends.AutoBackend(); kwargs...)
+nusht_solve_spin!(sfs, fs, plans::AbstractVector, b::ComputationalBackends.AbstractAutoBackend; kwargs...) =
+    nusht_solve_spin!(sfs, fs, plans, _resolve_backend(b); kwargs...)
+function nusht_solve_spin!(sfs, fs, plans::AbstractVector,
+                           ::ComputationalBackends.AbstractSerialBackend; kwargs...)
+    _check_farm(sfs, fs, plans)
+    for i in eachindex(plans)
+        nusht_solve_spin!(sfs[i], fs[i], plans[i]; kwargs...)
+    end
+    return sfs
+end
+
+# Any backend with no method above is one whose extension is not loaded — refuse, never downgrade.
+nusht_type2!(fs, Cs, plans::AbstractVector, b::ComputationalBackends.AbstractExecutionBackend) =
+    _backend_unavailable(b, "a collection of syntheses")
+nusht_type1!(Cs, fs, plans::AbstractVector, b::ComputationalBackends.AbstractExecutionBackend) =
+    _backend_unavailable(b, "a collection of analyses")
+nusht_solve!(Cs, fs, plans::AbstractVector, b::ComputationalBackends.AbstractExecutionBackend; kwargs...) =
+    _backend_unavailable(b, "a collection of solves")
+nusht_filter!(outs, ins, filter, plans::AbstractVector, b::ComputationalBackends.AbstractExecutionBackend) =
+    _backend_unavailable(b, "a collection of filters")
+nusht_type2_spin!(fs, sfs, plans::AbstractVector, b::ComputationalBackends.AbstractExecutionBackend) =
+    _backend_unavailable(b, "a collection of spin syntheses")
+nusht_type1_spin!(sfs, fs, plans::AbstractVector, b::ComputationalBackends.AbstractExecutionBackend) =
+    _backend_unavailable(b, "a collection of spin analyses")
+nusht_solve_spin!(sfs, fs, plans::AbstractVector, b::ComputationalBackends.AbstractExecutionBackend; kwargs...) =
+    _backend_unavailable(b, "a collection of spin solves")
+
+# ── Node-set form: build the plans internally ─────────────────────────────────
+# Takes node sets rather than plans, so it serves backends a plan cannot reach — see the header note.
+
+"""
+    nusht_type2(θs, φs, Cs, lmax, backend = AutoBackend(); tol, ntrans, tuning) -> fs
+
+Synthesize `N` independent problems given their node sets: for each `i` a plan is built from
+`(θs[i], φs[i])`, `Cs[i]` is evaluated, and the field is returned as `fs[i]`.
+
+Use this instead of the plan-collection [`nusht_type2!`](@ref) when the backend is a
+`DistributedBackend`. When you already hold plans and are on a local backend, prefer the in-place
+form — it reuses them.
+"""
+nusht_type2(θs, φs, Cs, lmax; kwargs...) = nusht_type2(θs, φs, Cs, lmax, ComputationalBackends.AutoBackend(); kwargs...)
+nusht_type2(θs, φs, Cs, lmax, b::ComputationalBackends.AbstractAutoBackend; kwargs...) =
+    nusht_type2(θs, φs, Cs, lmax, _resolve_backend(b); kwargs...)
+
+function nusht_type2(θs, φs, Cs, lmax, ::ComputationalBackends.AbstractLocalBackend; kwargs...)
+    @assert length(θs) == length(φs) == length(Cs) "θs, φs and Cs must have equal length"
+    return map(eachindex(θs)) do i
+        plan = make_plan(θs[i], φs[i], lmax; kwargs...)
+        try
+            f = zeros(T, length(θs[i]))
+            nusht_type2!(f, Cs[i], plan)
+            return f
+        finally
+            close!(plan)
+        end
+    end
+end
+
+nusht_type2(θs, φs, Cs, lmax, b::ComputationalBackends.AbstractExecutionBackend; kwargs...) =
+    _backend_unavailable(b, "a node-set synthesis farm")
+
+"""
+    nusht_solve(θs, φs, fs, lmax, backend = AutoBackend(); tol, rtol, maxiter, …) -> Cs
+
+Exact inversion of `N` independent problems given their node sets; see [`nusht_type2`](@ref).
+"""
+nusht_solve(θs, φs, fs, lmax; kwargs...) = nusht_solve(θs, φs, fs, lmax, ComputationalBackends.AutoBackend(); kwargs...)
+nusht_solve(θs, φs, fs, lmax, b::ComputationalBackends.AbstractAutoBackend; kwargs...) =
+    nusht_solve(θs, φs, fs, lmax, _resolve_backend(b); kwargs...)
+
+function nusht_solve(θs, φs, fs, lmax, ::ComputationalBackends.AbstractLocalBackend;
+                     rtol = 1e-6, maxiter = 500, kwargs...)
+    @assert length(θs) == length(φs) == length(fs) "θs, φs and fs must have equal length"
+    return map(eachindex(fs)) do i
+        plan = make_plan(θs[i], φs[i], lmax; kwargs...)
+        try
+            C = zeros(T, lmax + 1, 2lmax + 1)
+            nusht_solve!(C, fs[i], plan; rtol = rtol, maxiter = maxiter)
+            return C
+        finally
+            close!(plan)
+        end
+    end
+end
+
+nusht_solve(θs, φs, fs, lmax, b::ComputationalBackends.AbstractExecutionBackend; kwargs...) =
+    _backend_unavailable(b, "a node-set solve farm")
+
+# ── Decomposing a single transform ────────────────────────────────────────────
+# A local backend on one transform is just the ordinary call; `MPIBackend` partitions the M points
+# across ranks and is supplied by NUFSHTMPIExt.
+
+nusht_type1!(C, f, plan::NUSHTplan, ::ComputationalBackends.AbstractLocalBackend) =
+    nusht_type1!(C, f, plan)
+nusht_type1!(C, f, plan::NUSHTplan, b::ComputationalBackends.AbstractAutoBackend) =
+    nusht_type1!(C, f, plan, _resolve_backend(b))
+nusht_type1!(C, f, plan::NUSHTplan, b::ComputationalBackends.AbstractExecutionBackend) =
+    _backend_unavailable(b, "a point-decomposed adjoint")
+
+nusht_solve!(C, f, plan::NUSHTplan, ::ComputationalBackends.AbstractLocalBackend; kwargs...) =
+    nusht_solve!(C, f, plan; kwargs...)
+nusht_solve!(C, f, plan::NUSHTplan, b::ComputationalBackends.AbstractAutoBackend; kwargs...) =
+    nusht_solve!(C, f, plan, _resolve_backend(b); kwargs...)
+nusht_solve!(C, f, plan::NUSHTplan, b::ComputationalBackends.AbstractExecutionBackend; kwargs...) =
+    _backend_unavailable(b, "a point-decomposed solve")
 
 end # module NUFSHT

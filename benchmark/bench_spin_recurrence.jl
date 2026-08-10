@@ -26,7 +26,7 @@ for lmax in (16, 64, 128, 256, 512)
     plan = NUFSHT.make_spin_plan(θ, φ, lmax, s; tol = 1e-8)
 
     # recurrence buffers: 2 real (L×L) + G/fbuf complex — O(lmax²).
-    buf_bytes = 2 * sizeof(plan.dl_curr) + sizeof(plan.G) + sizeof(plan.fbuf)
+    buf_bytes = 2 * sizeof(plan.dl_curr) + sizeof(plan.G) + sizeof(plan.nodes.fbuf)
     dense_bytes = sum((2ℓ + 1)^2 for ℓ in 0:lmax) * sizeof(Float64)   # old O(lmax³) dense-Δ store
 
     # zero-alloc assembly on the hot path

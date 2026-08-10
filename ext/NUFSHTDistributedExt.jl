@@ -1,10 +1,12 @@
 """
     NUFSHTDistributedExt
 
-Coarse-grained farming of *independent* NUFSHT problems across `Distributed` **worker processes**.
-FINUFFT plans hold C pointers and cannot be serialized, so each worker builds its own plan from the
-node set it is given, runs the transform, frees the plan, and returns the result. Loaded by
-`using Distributed` (with `@everywhere using NUFSHT` so workers have the package).
+Coarse-grained farming of *independent* NUFSHT problems across `Distributed` **worker processes**,
+selected by passing a `ComputationalBackends.DistributedBackend`. FINUFFT plans hold C pointers and
+cannot be serialized, so this extension implements the **node-set** entry points (`nusht_type2`,
+`nusht_solve`): each worker builds its own plan from the node set it is given, runs the transform,
+frees the plan, and returns the result. Loaded by `using Distributed` (with `@everywhere using
+NUFSHT` so workers have the package).
 
 ## Why processes, not local tasks
 
@@ -26,6 +28,7 @@ not bit-reproducible) and avoids oversubscribing cores across concurrently farme
 module NUFSHTDistributedExt
 
 using NUFSHT: NUFSHT
+using ComputationalBackends: ComputationalBackends
 using Distributed: Distributed
 
 # Run `work(i)` for i in 1:n on worker processes when available, else serially on the main task.
@@ -42,11 +45,11 @@ function _farm(work, on_worker, n::Integer)
     end
 end
 
-function NUFSHT.nusht_type2_distributed(θs, φs, Cs, lmax;
-                                        tol = 1e-8, T::Type{<:AbstractFloat} = Float64, nthreads = 1)
-    @assert length(θs) == length(φs) == length(Cs) "θs, φs, Cs must have equal length"
+function NUFSHT.nusht_type2(θs, φs, Cs, lmax, ::ComputationalBackends.AbstractDistributedBackend;
+                            tol = 1e-8, T::Type{<:AbstractFloat} = Float64, nthreads = 1, kwargs...)
+    @assert length(θs) == length(φs) == length(Cs) "θs, φs and Cs must have equal length"
     return _farm(NUFSHT._fasttransforms_single!, length(θs)) do i
-        plan = NUFSHT.make_plan(θs[i], φs[i], lmax; tol = tol, T = T, nthreads = nthreads)
+        plan = NUFSHT.make_plan(θs[i], φs[i], lmax; tol = tol, T = T, nthreads = nthreads, kwargs...)
         try
             f = zeros(T, length(θs[i]))
             NUFSHT.nusht_type2!(f, Cs[i], plan)
@@ -57,12 +60,12 @@ function NUFSHT.nusht_type2_distributed(θs, φs, Cs, lmax;
     end
 end
 
-function NUFSHT.nusht_solve_distributed(θs, φs, fs, lmax;
-                                        tol = 1e-8, T::Type{<:AbstractFloat} = Float64, nthreads = 1,
-                                        rtol = 1e-6, maxiter = 500)
-    @assert length(θs) == length(φs) == length(fs) "θs, φs, fs must have equal length"
+function NUFSHT.nusht_solve(θs, φs, fs, lmax, ::ComputationalBackends.AbstractDistributedBackend;
+                            tol = 1e-8, T::Type{<:AbstractFloat} = Float64, nthreads = 1,
+                            rtol = 1e-6, maxiter = 500, kwargs...)
+    @assert length(θs) == length(φs) == length(fs) "θs, φs and fs must have equal length"
     return _farm(NUFSHT._fasttransforms_single!, length(fs)) do i
-        plan = NUFSHT.make_plan(θs[i], φs[i], lmax; tol = tol, T = T, nthreads = nthreads)
+        plan = NUFSHT.make_plan(θs[i], φs[i], lmax; tol = tol, T = T, nthreads = nthreads, kwargs...)
         try
             C = zeros(T, lmax + 1, 2lmax + 1)
             NUFSHT.nusht_solve!(C, fs[i], plan; rtol = rtol, maxiter = maxiter)

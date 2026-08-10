@@ -86,25 +86,27 @@ end
 
 # Trapani–Navaza degree step, one workitem per column n∈0:ℓ: Stage A (row m=ℓ) then the downward
 # Stage B m-sweep for that column (self-contained — no cross-column dependency).
+# `dl` is n-major (`dl[n+off, m+off] = d^ℓ_{m,n}`), matching `src/Spin.jl`: consecutive workitems then
+# read and write consecutive addresses, so these accesses coalesce.
 @kernel function _recur_AB_kern!(dl, @Const(dlp), ℓ, off)
     c = @index(Global)
     n = c - 1
     RT = eltype(dl)
     @inbounds begin
         if n == 0
-            dl[ℓ + off, off] = -sqrt(RT(2ℓ - 1) / RT(2ℓ)) * dlp[(ℓ - 1) + off, off]
+            dl[off, ℓ + off] = -sqrt(RT(2ℓ - 1) / RT(2ℓ)) * dlp[off, (ℓ - 1) + off]
         else
-            dl[ℓ + off, n + off] =
-                sqrt(RT(ℓ) * RT(2ℓ - 1) / (RT(2) * RT(ℓ + n) * RT(ℓ + n - 1))) * dlp[(ℓ - 1) + off, (n - 1) + off]
+            dl[n + off, ℓ + off] =
+                sqrt(RT(ℓ) * RT(2ℓ - 1) / (RT(2) * RT(ℓ + n) * RT(ℓ + n - 1))) * dlp[(n - 1) + off, (ℓ - 1) + off]
         end
         if ℓ - 1 >= n
             m = ℓ - 1
-            dl[m + off, n + off] = RT(2n) / sqrt(RT(ℓ - m) * RT(ℓ + m + 1)) * dl[(m + 1) + off, n + off]
+            dl[n + off, m + off] = RT(2n) / sqrt(RT(ℓ - m) * RT(ℓ + m + 1)) * dl[n + off, (m + 1) + off]
         end
         for m in (ℓ - 2):-1:n
             s1 = sqrt(RT(ℓ - m) * RT(ℓ + m + 1))
             s2 = sqrt(RT(ℓ - m - 1) * RT(ℓ + m + 2) / (RT(ℓ - m) * RT(ℓ + m + 1)))
-            dl[m + off, n + off] = RT(2n) / s1 * dl[(m + 1) + off, n + off] - s2 * dl[(m + 2) + off, n + off]
+            dl[n + off, m + off] = RT(2n) / s1 * dl[n + off, (m + 1) + off] - s2 * dl[n + off, (m + 2) + off]
         end
     end
 end
@@ -118,7 +120,7 @@ end
     m = i - 1; n = j - 1
     if n > m
         RT = eltype(dl)
-        @inbounds dl[m + off, n + off] = ifelse(iseven(m + n), one(RT), -one(RT)) * dl[n + off, m + off]
+        @inbounds dl[n + off, m + off] = ifelse(iseven(m + n), one(RT), -one(RT)) * dl[m + off, n + off]
     end
 end
 
@@ -126,62 +128,65 @@ end
     i, j = @index(Global, NTuple)
     mabs = i; n = j - 1
     RT = eltype(dl)
-    @inbounds dl[(-mabs) + off, n + off] = ifelse(iseven(ℓ + n), one(RT), -one(RT)) * dl[mabs + off, n + off]
+    @inbounds dl[n + off, (-mabs) + off] = ifelse(iseven(ℓ + n), one(RT), -one(RT)) * dl[n + off, mabs + off]
 end
 
 @kernel function _recur_S3_kern!(dl, ℓ, off)         # n → −n: half → full
     i, j = @index(Global, NTuple)
     m = i - 1 - ℓ; nabs = j
     RT = eltype(dl)
-    @inbounds dl[m + off, (-nabs) + off] = ifelse(iseven(ℓ + abs(m)), one(RT), -one(RT)) * dl[m + off, nabs + off]
-end
-
-# i^k for integer k ∈ ℤ (GPU-safe, no generic complex power): cycles 1, i, −1, −i.
-@inline function _im_pow(::Type{CT}, k) where {CT}
-    r = mod(k, 4)
-    return r == 0 ? CT(1, 0) : r == 1 ? CT(0, 1) : r == 2 ? CT(-1, 0) : CT(0, -1)
+    @inbounds dl[(-nabs) + off, m + off] = ifelse(iseven(ℓ + abs(m)), one(RT), -one(RT)) * dl[nabs + off, m + off]
 end
 
 # Forward contraction for degree ℓ: G_{m'm} += i^{m+s} N_ℓ sf_{ℓm} Δ^ℓ_{m'm} Δ^ℓ_{m',−s}.
-@kernel function _contract_kern!(G, @Const(dl), @Const(sf), ℓ, s, lmax, off, Nℓ)
+# `mp0` is the first m' the mode buffer carries (`-ℓ` complex, `0` real) and `goff` maps m' to its row.
+@kernel function _contract_kern!(G, @Const(dl), @Const(sf), ℓ, s, lmax, off, Nℓ, mp0, goff)
     i, j, b = @index(Global, NTuple)
-    mp = i - 1 - ℓ; m = j - 1 - ℓ
+    mp = i - 1 + mp0; m = j - 1 - ℓ
     CT = eltype(G)
     @inbounds begin
-        ph = _im_pow(CT, m + s) * sf[ℓ + 1, m + lmax + 1, b] * Nℓ
-        G[mp + off, m + off, b] += ph * dl[m + off, mp + off] * dl[(-s) + off, mp + off]
+        ph = NUFSHT._im_pow(CT, m + s) * sf[ℓ + 1, m + lmax + 1, b] * Nℓ
+        G[mp + goff, m + off, b] += ph * dl[mp + off, m + off] * dl[mp + off, (-s) + off]
     end
 end
 
 # Adjoint contraction for degree ℓ: sf_{ℓm} = conj(i^{m+s}) N_ℓ Σ_{m'} Δ^ℓ_{m'm} Δ^ℓ_{m',−s} Ĝ_{m'm}.
-@kernel function _contract_adj_kern!(sf, @Const(dl), @Const(Ĝ), ℓ, s, lmax, off, Nℓ)
+@kernel function _contract_adj_kern!(sf, @Const(dl), @Const(Ĝ), ℓ, s, lmax, off, Nℓ, mp0, goff)
     j, b = @index(Global, NTuple)
     m = j - 1 - ℓ
     CT = eltype(sf)
     @inbounds begin
-        phc = conj(_im_pow(CT, m + s)) * Nℓ
+        phc = conj(NUFSHT._im_pow(CT, m + s)) * Nℓ
         acc = zero(CT)
-        for mp in -ℓ:ℓ
-            acc += dl[m + off, mp + off] * dl[(-s) + off, mp + off] * Ĝ[mp + off, m + off, b]
+        for mp in mp0:ℓ
+            acc += dl[mp + off, m + off] * dl[mp + off, (-s) + off] * Ĝ[mp + goff, m + off, b]
         end
         sf[ℓ + 1, m + lmax + 1, b] = phc * acc
     end
 end
 
+# Which of the two layouts the plan's mode buffer is in, read off its θ extent.
+@inline _fold_index(G, lmax, off, ℓ) =
+    size(G, 1) == 2lmax + 1 ? (-ℓ, off) : (0, 1)
+
+# The four stages are dependent (S1 reads Stage B, S2 reads S1, S3 reads S2) but they run on one
+# backend, which executes launches in order — so no sync is needed between them, only before a host
+# read. Syncing per launch cost ~4·lmax full device barriers per spin transform.
 function _recur_step_device!(backend, dl, dlp, ℓ, off)
-    _recur_AB_kern!(backend)(dl, dlp, ℓ, off; ndrange = (ℓ + 1,)); _sync(backend)
-    _recur_S1_kern!(backend)(dl, ℓ, off; ndrange = (ℓ + 1, ℓ + 1)); _sync(backend)
-    _recur_S2_kern!(backend)(dl, ℓ, off; ndrange = (ℓ, ℓ + 1)); _sync(backend)
-    _recur_S3_kern!(backend)(dl, ℓ, off; ndrange = (2ℓ + 1, ℓ)); _sync(backend)
+    _recur_AB_kern!(backend)(dl, dlp, ℓ, off; ndrange = (ℓ + 1,))
+    _recur_S1_kern!(backend)(dl, ℓ, off; ndrange = (ℓ + 1, ℓ + 1))
+    _recur_S2_kern!(backend)(dl, ℓ, off; ndrange = (ℓ, ℓ + 1))
+    _recur_S3_kern!(backend)(dl, ℓ, off; ndrange = (2ℓ + 1, ℓ))
     return nothing
 end
 
-function NUFSHT._assemble_G!(G::GPUArraysCore.AbstractGPUArray, sf, plan::NUFSHT.SpinNUSHTplan{T}) where {T}
+function NUFSHT._assemble_G_impl!(G::GPUArraysCore.AbstractGPUArray, sf,
+                                  plan::NUFSHT.SpinNUSHTplan{T}, ::Nothing) where {T}
     lmax = plan.lmax; s = plan.s; off = lmax + 1; B = plan.B
     dl = plan.dl_curr; dlp = plan.dl_prev
     backend = KernelAbstractions.get_backend(G)
     fill!(G, zero(Complex{T}))
-    _recur_seed_kern!(backend)(dl, off; ndrange = (1,)); _sync(backend)
+    _recur_seed_kern!(backend)(dl, off; ndrange = (1,))
     for ℓ in 0:lmax
         if ℓ > 0
             dl, dlp = dlp, dl
@@ -189,18 +194,21 @@ function NUFSHT._assemble_G!(G::GPUArraysCore.AbstractGPUArray, sf, plan::NUFSHT
         end
         ℓ < abs(s) && continue
         Nℓ = T(sqrt((2ℓ + 1) / (4π)))
-        _contract_kern!(backend)(G, dl, sf, ℓ, s, lmax, off, Nℓ; ndrange = (2ℓ + 1, 2ℓ + 1, B))
-        _sync(backend)
+        mp0, goff = _fold_index(G, lmax, off, ℓ)
+        _contract_kern!(backend)(G, dl, sf, ℓ, s, lmax, off, Nℓ, mp0, goff;
+                                 ndrange = (ℓ - mp0 + 1, 2ℓ + 1, B))
     end
+    _sync(backend)                     # one barrier for the whole sweep, before any host read
     return G
 end
 
-function NUFSHT._assemble_G_adjoint!(sf::GPUArraysCore.AbstractGPUArray, Ĝ, plan::NUFSHT.SpinNUSHTplan{T}) where {T}
+function NUFSHT._assemble_G_adjoint_impl!(sf::GPUArraysCore.AbstractGPUArray, Ĝ,
+                                          plan::NUFSHT.SpinNUSHTplan{T}, ::Nothing) where {T}
     lmax = plan.lmax; s = plan.s; off = lmax + 1; B = plan.B
     dl = plan.dl_curr; dlp = plan.dl_prev
     backend = KernelAbstractions.get_backend(sf)
     fill!(sf, zero(Complex{T}))
-    _recur_seed_kern!(backend)(dl, off; ndrange = (1,)); _sync(backend)
+    _recur_seed_kern!(backend)(dl, off; ndrange = (1,))
     for ℓ in 0:lmax
         if ℓ > 0
             dl, dlp = dlp, dl
@@ -208,9 +216,11 @@ function NUFSHT._assemble_G_adjoint!(sf::GPUArraysCore.AbstractGPUArray, Ĝ, pla
         end
         ℓ < abs(s) && continue
         Nℓ = T(sqrt((2ℓ + 1) / (4π)))
-        _contract_adj_kern!(backend)(sf, dl, Ĝ, ℓ, s, lmax, off, Nℓ; ndrange = (2ℓ + 1, B))
-        _sync(backend)
+        mp0, goff = _fold_index(Ĝ, lmax, off, ℓ)
+        _contract_adj_kern!(backend)(sf, dl, Ĝ, ℓ, s, lmax, off, Nℓ, mp0, goff;
+                                     ndrange = (2ℓ + 1, B))
     end
+    _sync(backend)                     # one barrier for the whole sweep, before any host read
     return sf
 end
 
@@ -264,11 +274,34 @@ end
 # ── Device spectral filter (× H(ℓ)) ─────────────────────────────────────────────
 # `C` is `(lmax+1, 2lmax+1, B)`; build the host transfer matrix once, move it to `C`'s backend, and
 # broadcast-multiply across the batch (the `src` version is a scalar mode loop).
+# `nusht_filter!` applies this once per field, and the transfer matrix depends only on
+# (filter, lmax, element type, array type) — so build it, upload it and reshape it once rather than
+# allocating a host matrix plus a device copy on every call.
+const _TRANSFER_CACHE = Dict{Tuple{Any,Int,DataType,DataType},Any}()
+const _TRANSFER_LOCK = ReentrantLock()
+
+function _device_transfer(C, filter, lmax)
+    RT = real(eltype(C))
+    key = (filter, lmax, RT, typeof(C))
+    return Base.lock(_TRANSFER_LOCK) do
+        get!(_TRANSFER_CACHE, key) do
+            H = NUFSHT._transfer_matrix(filter, lmax, RT)
+            reshape(NUFSHT._to_like(C, H), size(H, 1), size(H, 2), 1)
+        end
+    end
+end
+
 function NUFSHT.apply_transfer!(C::GPUArraysCore.AbstractGPUArray, filter, lmax)
-    H = NUFSHT._transfer_matrix(filter, lmax, real(eltype(C)))
-    Hd = NUFSHT._to_like(C, H)
-    C .*= reshape(Hd, size(Hd, 1), size(Hd, 2), 1)
+    C .*= _device_transfer(C, filter, lmax)
     return C
 end
+
+# A precomputed WignerTable is a host array read elementwise; contracting against it from a device
+# array would fall back to scalar indexing. Refuse explicitly rather than silently crawling.
+_no_device_table() = throw(ArgumentError(
+    "a device spin plan cannot use a precomputed WignerTable; build it with wigner_table = nothing " *
+    "so the Δ planes are generated on device by the recurrence kernels."))
+NUFSHT._assemble_G_impl!(::GPUArraysCore.AbstractGPUArray, sf, plan, ::NUFSHT.WignerTable) = _no_device_table()
+NUFSHT._assemble_G_adjoint_impl!(::GPUArraysCore.AbstractGPUArray, Ĝ, plan, ::NUFSHT.WignerTable) = _no_device_table()
 
 end # module NUFSHTKernelAbstractionsExt

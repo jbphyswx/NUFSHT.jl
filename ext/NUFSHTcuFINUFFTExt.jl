@@ -1,5 +1,5 @@
 """
-    NUFSHTCUDAExt
+    NUFSHTcuFINUFFTExt
 
 The single CUDA-specific piece of the device path: the **cuFINUFFT** NUFFT binding. Everything else
 that runs on device is vendor-agnostic — the DFS kernels are KernelAbstractions `@kernel`s dispatched
@@ -12,7 +12,7 @@ A `CuArray` node set selects cuFINUFFT via the creation seam (`_nufft_makeplan`)
 teardown dispatch on the returned plan handle. `dtype`/`modeord` forward to cuFINUFFT unchanged;
 `nthreads` is dropped here because `cufinufft_opts` has no such field. Loaded by `using CUDA`.
 """
-module NUFSHTCUDAExt
+module NUFSHTcuFINUFFTExt
 
 using NUFSHT: NUFSHT
 using FINUFFT: FINUFFT
@@ -34,11 +34,12 @@ end
 # underlying cuFINUFFT plan (a foreign handle whose printer is not safe to call from Julia).
 Base.show(io::IO, ::CuNUFFTPlan) = print(io, "CuNUFFTPlan(cuFINUFFT)")
 
-NUFSHT._nufft_makeplan(::CUDA.CuArray, type, n_modes, iflag, ntrans, tol; nthreads = nothing, kwargs...) =
+NUFSHT._nufft_makeplan(::NUFSHT.FINUFFTBackend, ::CUDA.CuArray, type, n_modes, iflag, ntrans, tol;
+                       nthreads = nothing, kwargs...) =
     CuNUFFTPlan(FINUFFT.cufinufft_makeplan(type, n_modes, iflag, ntrans, tol; kwargs...))
 NUFSHT._nufft_setpts!(p::CuNUFFTPlan, x, y) = (FINUFFT.cufinufft_setpts!(p.plan, x, y); p)
 NUFSHT._nufft_exec!(p::CuNUFFTPlan, input, output) = (FINUFFT.cufinufft_exec!(p.plan, input, output); output)
 NUFSHT._nufft_destroy!(p::CuNUFFTPlan) = FINUFFT.cufinufft_destroy!(p.plan)
 NUFSHT._nufft_finalize!(p::CuNUFFTPlan) = (finalizer(q -> FINUFFT.cufinufft_destroy!(q), p.plan); p)
 
-end # module NUFSHTCUDAExt
+end # module NUFSHTcuFINUFFTExt

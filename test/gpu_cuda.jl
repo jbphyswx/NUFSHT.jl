@@ -68,7 +68,7 @@ else
 
             pc = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-9, ntrans = B)
             pg = NUFSHT.make_plan(CuArray(θ), CuArray(φ), lmax; tol = 1e-9, ntrans = B)
-            @test pg.F isa CuArray && pg.fbuf isa CuArray   # device-resident buffers
+            @test pg.F isa CuArray && pg.nodes.fbuf isa CuArray   # device-resident buffers
 
             # type 2 (synthesis)
             fc = zeros(M, B); NUFSHT.nusht_type2!(fc, C, pc)

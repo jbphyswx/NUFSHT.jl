@@ -51,10 +51,12 @@ Test.@testset "KernelAbstractions extension: device spin assembly (recurrence) o
             sf[NUFSHT.spin_coeff_index(ℓ, m, lmax), b] = randn(ComplexF64)
         end
         # Device plan: same scalar fields, JLArray recurrence/mode buffers (NUFFT plans are unused here).
-        pj = NUFSHT.SpinNUSHTplan(lmax, s, B, pc.tol, JLArrays.JLArray(pc.θ_nodes), JLArrays.JLArray(pc.φ_nodes),
+        ndj = NUFSHT.FixedCountNodes(JLArrays.JLArray(pc.nodes.θ_nodes), JLArrays.JLArray(pc.nodes.φ_nodes),
+                                     JLArrays.JLArray(pc.nodes.θ_nufft), nothing, JLArrays.JLArray(pc.nodes.fbuf),
+                                     pc.nodes.nufft_type2, pc.nodes.nufft_type1)
+        pj = NUFSHT.SpinNUSHTplan(lmax, s, B, pc.tol, ndj,
                                   JLArrays.JLArray(pc.dl_curr), JLArrays.JLArray(pc.dl_prev),
-                                  JLArrays.JLArray(zeros(ComplexF64, size(pc.G))), JLArrays.JLArray(pc.fbuf),
-                                  pc.nufft_type2, pc.nufft_type1)
+                                  JLArrays.JLArray(zeros(ComplexF64, size(pc.G))), pc.wigner)
 
         Gc = copy(pc.G); NUFSHT._assemble_G!(Gc, sf, pc)                     # CPU forward
         NUFSHT._assemble_G!(pj.G, JLArrays.JLArray(sf), pj)                  # device forward
@@ -91,9 +93,11 @@ Test.@testset "KernelAbstractions extension: device spin CG reductions (JLArray)
     Test.@test Array(pj) ≈ pc
 end
 
-# A plan (and its CG workspace) built from device node arrays must have ALL buffers device-resident.
-# An FFT plan on a JLArray falls back to host FFTW (JLArrays are CPU-backed strided memory), so the
-# device FFT itself is only validated on real CUDA (test/gpu_cuda.jl); here we assert buffer array types.
+# A plan built from device node arrays must have ALL buffers device-resident. Only the spin path can
+# be checked here: the scalar path needs an FFT for the array type, and nothing implements
+# AbstractFFTs for `JLArray` (cuFFT covers `CuArray` only) — host FFTW's method matches anyway,
+# because JLArrays are `<: StridedArray`, and then fails on the pointer conversion. The scalar device
+# path is exercised on real hardware in test/gpu_cuda.jl.
 Test.@testset "KernelAbstractions extension: device plan buffers are device-resident (JLArray)" begin
     isdev(x) = x isa GPUArraysCore.AbstractGPUArray
     Random.seed!(404)
@@ -101,26 +105,19 @@ Test.@testset "KernelAbstractions extension: device plan buffers are device-resi
     θ = JLArrays.JLArray(clamp.(π .* rand(M), 1e-9, π - 1e-9))
     φ = JLArrays.JLArray(2π .* rand(M))
 
-    plan = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-8, ntrans = B)
-    for f in (:θ_nodes, :φ_nodes, :C, :F, :F̃, :Fhat, :fbuf)
-        Test.@test isdev(getfield(plan, f))
-    end
-    ws = NUFSHT.CGWorkspace(plan)
-    for f in (:x, :r, :p, :Ap, :rhs, :f, :rsold, :α)
-        Test.@test isdev(getfield(ws, f))
-    end
-    NUFSHT.close!(plan)
-
     splan = NUFSHT.make_spin_plan(θ, φ, lmax, 2; tol = 1e-8, ntrans = B)
-    for f in (:θ_nodes, :φ_nodes, :dl_curr, :dl_prev, :G, :fbuf)
+    for f in (:dl_curr, :dl_prev, :G)
         Test.@test isdev(getfield(splan, f))
+    end
+    for f in (:θ_nodes, :φ_nodes, :θ_nufft, :fbuf)
+        Test.@test isdev(getfield(splan.nodes, f))
     end
     sws = NUFSHT.SpinCGWorkspace(splan)
     for f in (:x, :r, :p, :Ap, :rhs, :f)
         Test.@test isdev(getfield(sws, f))
     end
     NUFSHT.close!(splan)
-    @info "KernelAbstractions ext: scalar+spin device plans/workspaces are device-resident"
+    @info "KernelAbstractions ext: spin device plan/workspace are device-resident"
 end
 
 # Device-generic scalar CG reductions + real↔complex field copy (so the *scalar* nusht_solve!/type-2/1

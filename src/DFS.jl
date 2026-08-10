@@ -103,7 +103,7 @@ function dfs_fold!(F::AbstractArray, F̃::AbstractArray)
             j_shifted = mod1(j - half, Nφ)
             for i in 1:Nθ
                 i_mirror = 2Nθ + 1 - i
-                F[i, j, b] = real(F̃[i, j, b] + F̃[i_mirror, j_shifted, b])
+                F[i, j, b] = F̃[i, j, b] + F̃[i_mirror, j_shifted, b]
             end
         end
     end

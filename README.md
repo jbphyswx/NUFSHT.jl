@@ -38,7 +38,7 @@ scattered spherical data.
 using NUFSHT
 lmax, s = 32, 1
 θ = π .* rand(5000); φ = 2π .* rand(5000)          # scattered colatitude/longitude
-plan = make_spin_plan(θ, φ, lmax, s)                # add ntrans=B for batches; T=Float32 for f32
+plan = make_spin_plan(θ, φ, lmax, s)                # add ntrans=B for batches; ComplexF32 first arg for f32
 
 # synthesis: spin-s coefficients -> complex field values at the points
 sf = zeros(ComplexF64, lmax+1, 2lmax+1)             # spin-s coefficients (set some modes)
@@ -75,8 +75,14 @@ only when you load their trigger package, so a plain `using NUFSHT` never pulls 
   `make_plan(θ, φ, lmax; ntrans = B)`, coefficients/fields carry a trailing batch axis. FFTW and
   FINUFFT parallelize *across the batch* internally (measured ~4.5× / ~2.8× on small transforms), which
   is the recommended way to use many cores on one node.
-- **Mixed precision.** `T = Float32` is supported on the spin/recurrence path (the scalar DFS path is
-  Float64-only, a FastTransforms limitation).
+- **Real and complex fields.** The field element type is the first (optional) positional argument, as
+  it is for `zeros`: `make_plan(Float64, θ, φ, lmax)` for a real field, `make_plan(ComplexF64, …)` for
+  a complex one; likewise `make_spin_plan(FE, θ, φ, lmax, s)`. Both compute the same transform — the
+  real one additionally exploits the Hermitian symmetry a real field gives its spectrum, folding one
+  mode axis in half. The keyword spelling `T = ComplexF64` forwards to the positional form.
+- **Mixed precision.** `Float32` and `ComplexF32` are supported. The sphere plans FastTransforms
+  provides are `Float64`/`ComplexF64` only, so single-precision plans run their S-step through a
+  double-precision slice buffer and everything else at the requested precision.
 - **Parallel extensions** (each keyed on its trigger package):
   - `using OhMyThreads` — thread-parallel over independent problems (one plan per task).
   - `using Distributed` — farm independent problems across worker **processes** (`addprocs`); falls
@@ -107,7 +113,7 @@ Type 1 (adjoint):     A† = S† · D† · F† · N†
 |------|-----------|---------|---------|
 | **S** | Iso-latitude rSHT: SH coefficients ↔ CC grid | `sph_evaluate!` (PS·P) | `sph_transform!` (S⁻¹, exact on CC) |
 | **D** | DFS doubling: extend [0,π] → [0,2π) torus | `dfs_double!` | `dfs_fold!` |
-| **F** | 2D FFT + fused half-pixel CC phase (in-place, `modeord=1`) | stored FFTW plan + phase broadcast | conj-phase + inverse FFT |
+| **F** | 2D FFT + fused half-pixel CC phase | stored FFTW plan + phase broadcast (`rfft` for a real field) | conj-phase + inverse FFT (`brfft`) |
 | **N** | NUFFT: evaluate Fourier series at scattered points | guru type-2 plan | guru type-1 plan |
 
 (The scalar path above uses FastTransforms for **S**; the **spin** path replaces **S** with an
@@ -239,7 +245,7 @@ nusht_filter_renorm!(f_out, mask, filt, plan)   # divide by filtered mask
 
 | Function | Description |
 |----------|-------------|
-| `make_plan(θ, φ, lmax; tol, T)` | Construct pre-allocated plan for M scattered points |
+| `make_plan([FE,] θ, φ, lmax; tol)` | Construct pre-allocated plan for M scattered points; `FE` real or complex |
 | `nusht_type2!(f, C, plan)` | Synthesis: SH coefficients → scattered field values |
 | `nusht_type1!(C, f, plan)` | Adjoint analysis (exact inverse on CC grid; adjoint elsewhere) |
 | `nusht_solve!(C, f, plan; maxiter, rtol, verbose)` | Exact CG inversion at any scattered points |

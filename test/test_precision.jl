@@ -7,7 +7,7 @@ Test.@testset "mixed precision (Float32) — spin/recurrence path" begin
     for (T, tol, synth_tol, adj_tol) in ((Float64, 1e-11, 1e-9, 1e-12), (Float32, 1.0f-5, 1e-4, 1e-4))
         θ = T.(clamp.(π .* rand(M), 1.0f-5, Float32(π) - 1.0f-5))
         φ = T.(2π .* rand(M))
-        sp = NUFSHT.make_spin_plan(θ, φ, lmax, 1; tol = tol, T = T)
+        sp = NUFSHT.make_spin_plan(Complex{T}, θ, φ, lmax, 1; tol = tol)
         Test.@test eltype(sp.dl_curr) === T                       # recurrence runs at T
         Test.@test eltype(sp.G) === Complex{T}
 
