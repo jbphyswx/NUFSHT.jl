@@ -46,12 +46,12 @@ function _farm(work, on_worker, n::Integer)
 end
 
 function NUFSHT.nusht_type2(θs, φs, Cs, lmax, ::ComputationalBackends.AbstractDistributedBackend;
-                            tol = 1e-8, T::Type{<:AbstractFloat} = Float64, nthreads = 1, kwargs...)
+                            tol = 1e-8, nthreads = 1, kwargs...)
     @assert length(θs) == length(φs) == length(Cs) "θs, φs and Cs must have equal length"
     return _farm(NUFSHT._fasttransforms_single!, length(θs)) do i
-        plan = NUFSHT.make_plan(θs[i], φs[i], lmax; tol = tol, T = T, nthreads = nthreads, kwargs...)
+        plan = NUFSHT.make_plan(θs[i], φs[i], lmax; tol = tol, nthreads = nthreads, kwargs...)
         try
-            f = zeros(T, length(θs[i]))
+            f = zeros(eltype(plan.F), length(θs[i]))
             NUFSHT.nusht_type2!(f, Cs[i], plan)
             return f
         finally
@@ -61,13 +61,13 @@ function NUFSHT.nusht_type2(θs, φs, Cs, lmax, ::ComputationalBackends.Abstract
 end
 
 function NUFSHT.nusht_solve(θs, φs, fs, lmax, ::ComputationalBackends.AbstractDistributedBackend;
-                            tol = 1e-8, T::Type{<:AbstractFloat} = Float64, nthreads = 1,
+                            tol = 1e-8, nthreads = 1,
                             rtol = 1e-6, maxiter = 500, kwargs...)
     @assert length(θs) == length(φs) == length(fs) "θs, φs and fs must have equal length"
     return _farm(NUFSHT._fasttransforms_single!, length(fs)) do i
-        plan = NUFSHT.make_plan(θs[i], φs[i], lmax; tol = tol, T = T, nthreads = nthreads, kwargs...)
+        plan = NUFSHT.make_plan(θs[i], φs[i], lmax; tol = tol, nthreads = nthreads, kwargs...)
         try
-            C = zeros(T, lmax + 1, 2lmax + 1)
+            C = zeros(eltype(plan.C), lmax + 1, 2lmax + 1)
             NUFSHT.nusht_solve!(C, fs[i], plan; rtol = rtol, maxiter = maxiter)
             return C
         finally

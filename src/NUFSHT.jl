@@ -692,7 +692,7 @@ function nusht_type2(θs, φs, Cs, lmax, ::ComputationalBackends.AbstractLocalBa
     return map(eachindex(θs)) do i
         plan = make_plan(θs[i], φs[i], lmax; kwargs...)
         try
-            f = zeros(T, length(θs[i]))
+            f = zeros(eltype(plan.F), length(θs[i]))
             nusht_type2!(f, Cs[i], plan)
             return f
         finally
@@ -719,7 +719,7 @@ function nusht_solve(θs, φs, fs, lmax, ::ComputationalBackends.AbstractLocalBa
     return map(eachindex(fs)) do i
         plan = make_plan(θs[i], φs[i], lmax; kwargs...)
         try
-            C = zeros(T, lmax + 1, 2lmax + 1)
+            C = zeros(eltype(plan.C), lmax + 1, 2lmax + 1)
             nusht_solve!(C, fs[i], plan; rtol = rtol, maxiter = maxiter)
             return C
         finally
