@@ -1,5 +1,9 @@
 # NUFSHT.jl
 
+[![Build Status](https://github.com/jbphyswx/NUFSHT.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/jbphyswx/NUFSHT.jl/actions/workflows/CI.yml)
+[![Dev Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://jbphyswx.github.io/NUFSHT.jl/dev/)
+[![Coverage](https://codecov.io/gh/jbphyswx/NUFSHT.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/jbphyswx/NUFSHT.jl)
+
 **Non-Uniform Fast Spherical Harmonic Transforms** — native Julia implementation of the
 Double Fourier Sphere (DFS) + NUFFT algorithm for computing spherical harmonic transforms
 at arbitrary scattered (colatitude, longitude) points on the sphere.
