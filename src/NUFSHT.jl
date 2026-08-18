@@ -36,7 +36,7 @@ include("Kernels.jl")
 include("Spin.jl")
 
 export make_plan, NUSHTplan, close!, CGWorkspace
-export nusht_type1!, nusht_type2!, nusht_filter!, nusht_filter_renorm!, nusht_solve!
+export nusht_type1!, nusht_type2!, nusht_synthesize!, nusht_filter!, nusht_filter_renorm!, nusht_solve!
 export TopHatTransfer, GaussianTransfer, SharpSpectralTransfer
 export kernel_transfer, cutoff_degree, gaussian_from_scale
 export nusht_type2_spin!, nusht_type1_spin!, nusht_solve_spin!
@@ -383,6 +383,29 @@ scratch, allocation-free.
 """
 function nusht_filter!(f_out, f_in, filter, plan::NUSHTplan)
     nusht_type1!(plan.C, f_in, plan)
+    nusht_synthesize!(f_out, plan.C, filter, plan)
+    return f_out
+end
+
+"""
+    nusht_synthesize!(f_out, C, filter, plan) -> f_out
+
+Scale coefficients `C` by `filter`'s transfer function and synthesize at the plan's points. `C` is not
+modified — the scaling runs in the plan's own scratch — so one analysis feeds any number of filters:
+
+```julia
+nusht_type1!(C, f, plan)
+for (out, filt) in zip(outs, filters)
+    nusht_synthesize!(out, C, filt, plan)
+end
+```
+
+[`nusht_filter!`](@ref) is `nusht_type1!` followed by this, and so re-analyses per filter; use the pair
+when filtering one field at several scales.
+"""
+function nusht_synthesize!(f_out, C, filter, plan::NUSHTplan)
+    _assert_coeffs(C, plan)
+    C === plan.C || copyto!(plan.C, C)
     apply_transfer!(plan.C, filter, plan.lmax)
     nusht_type2!(f_out, plan.C, plan)
     return f_out
@@ -396,8 +419,17 @@ filtered mask (the fraction of kernel weight over ocean). `f_out` must have been
 `nusht_filter!(f_out, f .* mask, filter, plan)`. Points where the filtered mask is below `0.01`
 are set to 0. Pass a reusable `mask_filt` scratch (shaped like `f_out`) to run allocation-free.
 """
-function nusht_filter_renorm!(f_out, mask, filter, plan::NUSHTplan{T}; mask_filt = similar(f_out)) where {T}
-    nusht_filter!(mask_filt, mask, filter, plan)   # `mask` is read straight into the strengths buffer
+function nusht_filter_renorm!(f_out, mask, filter, plan::NUSHTplan{T};
+                              mask_filt = similar(f_out),
+                              C_mask = nothing) where {T}
+    # `C_mask` lets a multi-scale caller analyse the scale-independent mask once and pass its
+    # coefficients to every call; without it the mask is analysed here, as before.
+    if C_mask === nothing
+        nusht_type1!(plan.C, mask, plan)
+        nusht_synthesize!(mask_filt, plan.C, filter, plan)
+    else
+        nusht_synthesize!(mask_filt, C_mask, filter, plan)
+    end
     threshold = T(0.01)
     # `mask_filt` is shaped like `f_out` → a single fused broadcast, zero-alloc + device-safe.
     f_out .= ifelse.(abs.(mask_filt) .>= threshold, f_out ./ mask_filt, zero(T))
