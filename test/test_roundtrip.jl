@@ -13,10 +13,11 @@ Test.@testset "Round-trip: type1 then type2 recovers field" begin
     M = length(θ_nodes)
     plan = NUFSHT.make_plan(θ_nodes, φ_nodes, lmax; tol=1e-10)
 
-    C_true = zeros(lmax+1, 2lmax+1)
-    for ℓ in 1:min(5, lmax), m in -ℓ:ℓ
-        C_true[FastSphericalHarmonics.sph_mode(ℓ, m)] = randn()
-    end
+    # A GENERIC coefficient array, not a band-limited one. The array is a square, invertible
+    # representation: every slot carries a real degree, those past `ℓ = lmax` included. Seeding only
+    # low valid modes would leave the supernumerary half at zero and so would not notice a transform
+    # that silently dropped it — the round-trip has to stay exact on the full space.
+    C_true = randn(lmax+1, 2lmax+1)
     f_in = vec(FastSphericalHarmonics.sph_evaluate(C_true))
 
     C_out = similar(plan.C)

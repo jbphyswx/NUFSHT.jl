@@ -1,3 +1,29 @@
+# The spin coefficient array is rectangular with triangular content (`ℓ ≥ max(|m|,|s|)`), but unlike
+# the scalar path the assembly reads and writes only that triangle, so the remaining slots really are
+# a null space and the solver never enters them. Pin that, since it is what keeps the spin solve
+# frame-independent for free.
+Test.@testset "spin solve stays in the ℓ ≥ max(|m|,|s|) triangle" begin
+    Random.seed!(6)
+    lmax, s, M = 8, 2, 500
+    θ = acos.(2 .* rand(M) .- 1); φ = 2π .* rand(M)
+    plan = NUFSHT.make_spin_plan(θ, φ, lmax, s)
+    valid = falses(lmax + 1, 2lmax + 1)
+    for l in abs(s):lmax, m in -l:l
+        valid[NUFSHT.spin_coeff_index(l, m, lmax)] = true
+    end
+
+    # Forward operator annihilates the complement exactly — the scalar path does not.
+    bad = zeros(ComplexF64, lmax + 1, 2lmax + 1)
+    bad[.!valid] .= randn(ComplexF64, sum(.!valid))
+    fb = zeros(ComplexF64, M); NUFSHT.nusht_type2_spin!(fb, bad, plan)
+    Test.@test sum(abs2, fb) == 0
+
+    sf = zeros(ComplexF64, lmax + 1, 2lmax + 1)
+    NUFSHT.nusht_solve_spin!(sf, randn(ComplexF64, M), plan; rtol = 1e-10, maxiter = 400)
+    Test.@test sum(abs2, sf[.!valid]) == 0
+    NUFSHT.close!(plan)
+end
+
 Test.@testset "spin-weighted scattered transforms" begin
     Random.seed!(202)
 

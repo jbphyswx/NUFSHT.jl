@@ -96,31 +96,34 @@ Multiply a FastSphericalHarmonics coefficient array `C` — size `(lmax+1, 2lmax
 `(lmax+1, 2lmax+1, B)` — in-place by the transfer function `H(ℓ)` for each degree `ℓ` (broadcast
 across the batch dimension).
 """
+# Degree held by scalar slot `(i, j)`. Inverting `sph_mode(ℓ,m) = (ℓ-|m|+1, 2|m|+(m≥0))` gives
+# `|m| = j÷2`, `ℓ = i + |m| - 1`. Every slot carries a real mode — the array is square and invertible,
+# so rows past `ℓ = lmax` hold degrees `lmax < ℓ ≤ lmax+|m|` rather than padding.
+@inline _slot_degree(i::Int, j::Int) = i + (j ÷ 2) - 1
+
 function apply_transfer!(C, filter, lmax)
     RT = real(eltype(C))
-    for ℓ in 0:lmax
-        h = RT(kernel_transfer(filter, ℓ))
-        for m in -ℓ:ℓ
-            idx = FastSphericalHarmonics.sph_mode(ℓ, m)
-            @inbounds for b in axes(C, 3)
-                C[idx, b] *= h
+    n1, n2 = size(C, 1), size(C, 2)
+    @inbounds for j in 1:n2
+        mabs = j ÷ 2
+        for i in 1:n1
+            h = RT(kernel_transfer(filter, i + mabs - 1))
+            for b in axes(C, 3)
+                C[i, j, b] *= h
             end
         end
     end
     return C
 end
 
-# Host-built `(lmax+1, 2lmax+1)` transfer matrix (element type `RT`): `H(ℓ)` at each valid mode slot,
-# `1` at the unused corners (so `C .*= H` is the exact identity there, matching the scalar loop, which
-# leaves those entries untouched). Used by the device `apply_transfer!` (one broadcast); the CPU path
-# uses the zero-alloc loop above.
+# Host-built `(lmax+1, 2lmax+1)` transfer matrix (element type `RT`): `H(ℓ)` at every slot, at that
+# slot's own degree. Used by the device `apply_transfer!` (one broadcast); the CPU path uses the
+# zero-alloc loop above, and the two must agree everywhere.
 function _transfer_matrix(filter, lmax, ::Type{RT}) where {RT}
-    H = ones(RT, lmax + 1, 2lmax + 1)
-    for ℓ in 0:lmax
-        h = RT(kernel_transfer(filter, ℓ))
-        for m in -ℓ:ℓ
-            H[FastSphericalHarmonics.sph_mode(ℓ, m)] = h
-        end
+    n1, n2 = lmax + 1, 2lmax + 1
+    H = Matrix{RT}(undef, n1, n2)
+    for j in 1:n2, i in 1:n1
+        H[i, j] = RT(kernel_transfer(filter, _slot_degree(i, j)))
     end
     return H
 end

@@ -447,13 +447,18 @@ Reusable scratch for [`nusht_solve!`](@ref). Holding one across solves makes CG 
 Per-column scalars are length-`B` vectors so the `B` columns run as `B` independent single-column
 CGs (batched result == looping single transforms).
 """
-struct CGWorkspace{AT3<:AbstractArray, FT2<:AbstractMatrix, VT<:AbstractVector}
+struct CGWorkspace{AT3<:AbstractArray, FT2<:AbstractMatrix, VT<:AbstractVector, VM<:AbstractArray}
     x::AT3
     r::AT3
     p::AT3
     Ap::AT3
     rhs::AT3
     f::FT2
+    # `1` on the (lmax+1)^2 slots holding degrees l ≤ lmax, `0` on the supernumerary ones. The array is
+    # a square, invertible representation carrying degrees up to `lmax+|m|`, so the transform needs all
+    # of it — but a least-squares fit must name its space, and only `l ≤ lmax` is SO(3)-invariant.
+    # Fitting the ragged set instead makes the answer depend on the coordinate frame.
+    valid::VM
     rsold::VT
     rsnew::VT
     pAp::VT
@@ -470,6 +475,7 @@ function CGWorkspace(plan::NUSHTplan{T}) where {T}
     z3() = _zeros_like(plan.F, T, Nθ, Nφ, B)
     vB() = _zeros_like(_θnodes(plan), T, B)
     return CGWorkspace(z3(), z3(), z3(), z3(), z3(), _zeros_like(_fbuf(plan), T, M, B),
+                       _valid_mask(plan.F, T, plan.lmax),
                        vB(), vB(), vB(), vB(), vB(), vB(), vB())
 end
 
@@ -505,7 +511,10 @@ function _col_pbp!(p, r, β)       # p[:,:,k] = r[:,:,k] + β[k]·p[:,:,k]
     return p
 end
 
-_AtA!(Ap, p, ws::CGWorkspace, plan::NUSHTplan) = (nusht_type2!(ws.f, p, plan); _nusht_true_adjoint!(Ap, ws.f, plan))
+# `P A†A P`. Projecting after the adjoint is enough: `p` is already in the valid subspace by induction
+# (x₀ = 0, r₀ = P A†f, and every later direction is a combination of projected vectors), so `A P p = A p`.
+_AtA!(Ap, p, ws::CGWorkspace, plan::NUSHTplan) =
+    (nusht_type2!(ws.f, p, plan); _nusht_true_adjoint!(Ap, ws.f, plan); Ap .*= ws.valid; Ap)
 
 """
     nusht_solve!(C, f, plan; ws=CGWorkspace(plan), maxiter=500, rtol=1e-6, verbose=false)
@@ -525,6 +534,7 @@ function nusht_solve!(
     _assert_coeffs(C, plan)
     _assert_field(f, plan)
     _nusht_true_adjoint!(ws.rhs, f, plan)
+    ws.rhs .*= ws.valid
     _col_dot!(ws.rhsnorm, ws.rhs, ws.rhs)
     ws.rhsnorm .= sqrt.(ws.rhsnorm)
 

@@ -75,8 +75,14 @@ function NUFSHT.nusht_solve!(C, f_local, plan::NUFSHT.NUSHTplan, backend::Comput
     rhs = ws.rhs; r = ws.r; p = ws.p; Ap = ws.Ap; x = ws.x; fbuf = ws.fbuf
     isroot = MPI.Comm_rank(comm) == 0        # hoisted: was an MPI call per iteration
 
+    # Restrict the fit to degrees `l ≤ lmax`, as the serial solver does: the coefficient array is a
+    # square representation carrying degrees up to `lmax+|m|`, and that ragged set is not
+    # SO(3)-invariant, so fitting it gives a frame-dependent answer.
+    valid = NUFSHT._valid_mask(C, T, plan.lmax)
+
     NUFSHT._nusht_true_adjoint!(rhs, f_local, plan)
     MPI.Allreduce!(rhs, +, comm)                    # rhs = A†f (replicated)
+    rhs .*= valid
     rhsnorm = sqrt(_global_dot(rhs, rhs, comm))
 
     fill!(x, zero(T)); copyto!(r, rhs); copyto!(p, r)
@@ -89,6 +95,7 @@ function NUFSHT.nusht_solve!(C, f_local, plan::NUFSHT.NUSHTplan, backend::Comput
         NUFSHT.nusht_type2!(fbuf, p, plan)          # A_local p (no communication)
         NUFSHT._nusht_true_adjoint!(Ap, fbuf, plan) # A†_local (A_local p)
         MPI.Allreduce!(Ap, +, comm)                 # Ap = A†A p (replicated)
+        Ap .*= valid                                # P A†A P; `p` is already in the subspace
         α = rsold / _global_dot(p, Ap, comm)
         x .+= α .* p
         r .-= α .* Ap

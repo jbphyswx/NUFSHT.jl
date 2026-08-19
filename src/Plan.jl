@@ -572,6 +572,28 @@ end
 @inline _sync_θshift!(::Nothing, _θ, _N0) = nothing
 @inline _sync_θshift!(s::AbstractVector, θ, N0) = (s .= cis.(N0 .* θ); s)
 
+"""
+    _valid_mask(proto, T, lmax)
+
+`1` at the `(lmax+1)^2` slots holding degrees `l ≤ lmax`, `0` at the `lmax(lmax+1)` supernumerary ones
+holding `lmax < l ≤ lmax+|m|`. The index rule is FastTransforms' own (`sphones`): column 1 carries
+`m = 0` for every degree, and the column pair `2j, 2j+1` carries `m = ∓j` for `l = j … lmax`, so it
+occupies only its first `lmax+1-j` rows.
+
+Shaped `(Nθ, Nφ, 1)` to broadcast over the batch, and built in the plan's array type so applying it is
+device-resident and allocation-free.
+"""
+function _valid_mask(proto, ::Type{T}, lmax::Integer) where {T}
+    Nθ, Nφ = lmax + 1, 2lmax + 1
+    H = zeros(T, Nθ, Nφ, 1)
+    H[:, 1, 1] .= one(T)
+    for j in 1:lmax
+        H[1:(Nθ - j), 2j, 1] .= one(T)
+        H[1:(Nθ - j), 2j + 1, 1] .= one(T)
+    end
+    return _to_like(proto, H)
+end
+
 # Centered order labels a length-`n` axis from `-(n÷2)`, so that is the offset to undo. Read off the
 # mode buffer rather than recomputed from the bandlimit, so the two can never drift apart.
 @inline _shift_offset(plan::NUSHTplan{T}) where {T} = T(size(plan.Fhat, 1) ÷ 2)
