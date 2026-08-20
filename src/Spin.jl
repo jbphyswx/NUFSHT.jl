@@ -36,8 +36,12 @@ export spin_coeff_index, sYlm
 """
     wigner_d(ℓ, m, n, β)
 
-Wigner small-d matrix element `d^ℓ_{mn}(β)` (Wikipedia/Varshalovich convention), via the explicit
-alternating sum with log-gamma factorials for stability.
+Wigner small-d matrix element `d^ℓ_{mn}(β) = ⟨ℓm|exp(-iβ Jy)|ℓn⟩` in the Condon–Shortley basis, via
+the explicit alternating sum with log-gamma factorials for stability.
+
+The sum's sign is `(-1)^(k+m-n)`, not `(-1)^k`: the latter gives every element an extra `(-1)^(m-n)`,
+which is a rephasing `|ℓm⟩ → (-1)^m|ℓm⟩` and not this matrix. Accuracy degrades above `ℓ ≈ 40` — use
+[`_wigner_d_halfpi_step!`](@ref) for `β = π/2` at large `ℓ`.
 """
 function wigner_d(ℓ::Integer, m::Integer, n::Integer, β::Real)
     (abs(m) > ℓ || abs(n) > ℓ) && return 0.0
@@ -47,7 +51,7 @@ function wigner_d(ℓ::Integer, m::Integer, n::Integer, β::Real)
     tot = 0.0
     for k in kmin:kmax
         den = loggamma(ℓ + n - k + 1) + loggamma(k + 1) + loggamma(ℓ - m - k + 1) + loggamma(k + m - n + 1)
-        tot += ((-1)^k) * exp(pref - den) * (c^(2ℓ + n - m - 2k)) * (s^(2k + m - n))
+        tot += ((-1)^(k + m - n)) * exp(pref - den) * (c^(2ℓ + n - m - 2k)) * (s^(2k + m - n))
     end
     return tot
 end
@@ -65,8 +69,12 @@ end
 """
     sYlm(s, ℓ, m, θ, φ) -> Complex
 
-Spin-weighted spherical harmonic `ₛY_{ℓm}(θ,φ) = N_ℓ d^ℓ_{m,−s}(θ) e^{imφ}` (this package's
-convention). Provided for validation / direct evaluation.
+Spin-weighted spherical harmonic `ₛY_{ℓm}(θ,φ) = N_ℓ d^ℓ_{m,−s}(θ) e^{imφ}` in the
+Goldberg / Newman–Penrose convention, with `d` the rotation matrix of [`wigner_d`](@ref). Provided for
+direct evaluation.
+
+Not a valid oracle for the transform on its own: both are built from the same `d`, so a sign error in
+`d` cancels in the comparison. `test/test_spin.jl` checks it against `exp(-iβ Jy)` instead.
 """
 sYlm(s::Integer, ℓ::Integer, m::Integer, θ::Real, φ::Real) = _Nℓ(ℓ) * wigner_d(ℓ, m, -s, θ) * cis(m * φ)
 
@@ -292,8 +300,12 @@ the **Trapani–Navaza** recurrence (Trapani & Navaza 2006; ssht `ssht_dl.c`; s2
 **Layout is `n`-major: `dl[n+off, m+off] = d^ℓ_{m,n}(π/2)`** (McEwen–Wiaux/ssht convention,
 transposed). The recurrence runs downward in `m`, so storing `n` first makes every inner loop
 contiguous and independent — Stage A, Stage B and the `n → −n` fill all vectorize — and it is also
-the order the contraction reads, since `Δ^ℓ_{m',m} = dl[m'+off, m+off]`. Relation to this package's
-`wigner_d`: `wigner_d(ℓ, a, b, π/2) == dl[a+off, b+off]`.
+the order the contraction reads, since `Δ^ℓ_{m',m} = dl[m'+off, m+off]`. So the relation to
+[`wigner_d`](@ref) is transposed: `wigner_d(ℓ, m, n, π/2) == dl[n+off, m+off]`.
+
+The recurrence is verified directly against `exp(-i(π/2)Jy)` built from the angular-momentum matrices
+(`test/test_spin.jl`), not against `wigner_d` — the two agreed for a long time only because both
+carried the same `(-1)^(m-n)` error.
 
 Only the eighth `0 ≤ n ≤ m ≤ ℓ` is recurred; the rest is filled by the d(π/2) symmetries (transpose,
 m→−m, n→−n).
@@ -369,7 +381,7 @@ function _assemble_G_impl!(G, sf, plan::SpinNUSHTplan{T}, tbl::WignerTable) wher
     Q = tbl.Q; qoff = tbl.offsets
     fill!(G, zero(Complex{T}))
     @inbounds for m in -lmax:lmax
-        ph0 = _im_pow(Complex{T}, m + s)
+        ph0 = _im_pow(Complex{T}, -(m + s))
         for b in 1:plan.B
             for ℓ in max(abs(m), abs(s)):lmax
                 val = sf[ℓ + 1, m + lmax + 1, b]
@@ -402,7 +414,7 @@ function _assemble_G_impl!(G, sf, plan::SpinNUSHTplan{T}, ::Nothing) where {T}
         # `m` outermost so the i^{m+s}·N_ℓ phase is formed once per order rather than once per
         # (batch, order); `mp` innermost so both Δ reads and the G write run down contiguous columns.
         for m in -ℓ:ℓ
-            ph0 = _im_pow(Complex{T}, m + s) * Nℓ
+            ph0 = _im_pow(Complex{T}, -(m + s)) * Nℓ
             for b in 1:plan.B
                 val = sf[ℓ + 1, m + lmax + 1, b]
                 iszero(val) && continue
@@ -429,7 +441,7 @@ function _assemble_G_adjoint_impl!(sf, Ĝ, plan::SpinNUSHTplan{T}, tbl::WignerTa
     Q = tbl.Q; qoff = tbl.offsets
     fill!(sf, zero(Complex{T}))
     @inbounds for m in -lmax:lmax
-        phc = conj(_im_pow(Complex{T}, m + s))
+        phc = conj(_im_pow(Complex{T}, -(m + s)))
         for b in 1:plan.B
             for ℓ in max(abs(m), abs(s)):lmax
                 nl = 2ℓ + 1; col = qoff[ℓ + 1] + (m + ℓ) * nl + ℓ
@@ -457,7 +469,7 @@ function _assemble_G_adjoint_impl!(sf, Ĝ, plan::SpinNUSHTplan{T}, ::Nothing) wh
         ℓ < abs(s) && continue
         Nℓ = T(_Nℓ(ℓ))
         for m in -ℓ:ℓ
-            phc = conj(_im_pow(Complex{T}, m + s)) * Nℓ
+            phc = conj(_im_pow(Complex{T}, -(m + s))) * Nℓ
             for b in 1:plan.B
                 acc = zero(Complex{T})
                 @simd for mp in _mprange(plan, ℓ)

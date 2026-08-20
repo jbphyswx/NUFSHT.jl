@@ -1,3 +1,77 @@
+# `exp(-iβ Jy)` in the |ℓm⟩ basis, built from the angular-momentum ladder operators. This is the
+# definition of the Wigner small-d matrix, independent of any explicit sum, recurrence, or convention
+# choice in this package — which is what makes it a usable oracle. `sYlm` is NOT: it and the transform
+# share the same `d`, so a sign error in `d` cancels in that comparison and stays invisible.
+function _jy_rotation(ℓ::Int, β::Float64)
+    ms = collect(-ℓ:ℓ); n = length(ms)
+    Jp = zeros(ComplexF64, n, n); Jm = zeros(ComplexF64, n, n)
+    for (j, m) in enumerate(ms), (i, mp) in enumerate(ms)
+        mp == m + 1 && (Jp[i, j] = sqrt(ℓ * (ℓ + 1) - m * (m + 1)))
+        mp == m - 1 && (Jm[i, j] = sqrt(ℓ * (ℓ + 1) - m * (m - 1)))
+    end
+    return exp(-im * β * (Jp .- Jm) ./ (2im))
+end
+_true_d(ℓ, m, n, β) = real(_jy_rotation(ℓ, β)[m + ℓ + 1, n + ℓ + 1])
+# Goldberg / Newman–Penrose: ₛY_ℓm = N_ℓ d^ℓ_{m,−s}(θ) e^{imφ}
+_goldberg(s, ℓ, m, θ, φ) = sqrt((2ℓ + 1) / (4π)) * _true_d(ℓ, m, -s, θ) * cis(m * φ)
+
+Test.@testset "wigner_d is the rotation matrix ⟨ℓm|exp(-iβ Jy)|ℓn⟩" begin
+    for β in (0.37, 1.1, π / 2), ℓ in 1:4
+        R = _jy_rotation(ℓ, β)
+        for m in -ℓ:ℓ, n in -ℓ:ℓ
+            # Odd `m-n` is the discriminating case: a `(-1)^k` sum flips exactly those.
+            Test.@test NUFSHT.wigner_d(ℓ, m, n, β) ≈ real(R[m + ℓ + 1, n + ℓ + 1]) atol = 1e-12
+        end
+    end
+
+    # ℓ=1 closed forms, written out so a regression names itself.
+    β = 0.37
+    Test.@test NUFSHT.wigner_d(1, 0, 0, β) ≈ cos(β)
+    Test.@test NUFSHT.wigner_d(1, 1, 1, β) ≈ (1 + cos(β)) / 2
+    Test.@test NUFSHT.wigner_d(1, 1, -1, β) ≈ (1 - cos(β)) / 2
+    Test.@test NUFSHT.wigner_d(1, 1, 0, β) ≈ -sin(β) / sqrt(2)
+    Test.@test NUFSHT.wigner_d(1, 0, 1, β) ≈ +sin(β) / sqrt(2)
+    Test.@test NUFSHT.wigner_d(1, -1, 0, β) ≈ +sin(β) / sqrt(2)
+    Test.@test NUFSHT.wigner_d(1, 0, -1, β) ≈ -sin(β) / sqrt(2)
+end
+
+# The Trapani recurrence and `wigner_d` are separate implementations of the same object, so each must
+# be checked against `Jy` rather than against the other — they agreed for a long time only because
+# both carried the same `(-1)^(m-n)` error. Also pins the transposed storage relation.
+Test.@testset "Trapani Δ is d(π/2)" begin
+    lmax = 5; off = lmax + 1; L = 2lmax + 1
+    dl = zeros(Float64, L, L); dlp = zeros(Float64, L, L)
+    NUFSHT._wigner_d_halfpi_step!(dl, dlp, 0, off)
+    for ℓ in 1:lmax
+        dl, dlp = dlp, dl
+        NUFSHT._wigner_d_halfpi_step!(dl, dlp, ℓ, off)
+    end
+    R = _jy_rotation(lmax, π / 2)
+    for m in -lmax:lmax, n in -lmax:lmax
+        Test.@test dl[n + off, m + off] ≈ real(R[m + lmax + 1, n + lmax + 1]) atol = 1e-12
+        Test.@test dl[n + off, m + off] ≈ NUFSHT.wigner_d(lmax, m, n, π / 2) atol = 1e-12
+    end
+end
+
+# Synthesis against Goldberg ₛY_ℓm computed from `Jy` — the check `sYlm` cannot provide. Odd `m+s` is
+# the discriminating case: the `i^(m+s)` prefactor error flipped exactly those.
+Test.@testset "spin synthesis matches Goldberg ₛY_ℓm" begin
+    Random.seed!(4)
+    lmax, s, M = 6, 1, 400
+    θ = π .* rand(M) .* 0.9 .+ 0.05; φ = 2π .* rand(M)
+    plan = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, s)
+    for (ℓ, m) in ((1, 0), (2, 1), (3, 2), (4, 0), (5, 3), (6, -2))
+        sf = zeros(ComplexF64, lmax + 1, 2lmax + 1)
+        sf[NUFSHT.spin_coeff_index(ℓ, m, lmax)] = 1.0
+        f = zeros(ComplexF64, M); NUFSHT.nusht_type2_spin!(f, sf, plan)
+        g = [_goldberg(s, ℓ, m, θ[j], φ[j]) for j in 1:M]
+        Test.@test sqrt(sum(abs2, f .- g) / sum(abs2, g)) < 1e-9
+    end
+    # The single value quoted in the issue, spelled out.
+    Test.@test NUFSHT.sYlm(1, 1, 0, 0.4, 0.0) ≈ sqrt(3 / (4π)) * (-sin(0.4) / sqrt(2))
+    NUFSHT.close!(plan)
+end
+
 # The spin coefficient array is rectangular with triangular content (`ℓ ≥ max(|m|,|s|)`), but unlike
 # the scalar path the assembly reads and writes only that triangle, so the remaining slots really are
 # a null space and the solver never enters them. Pin that, since it is what keeps the spin solve

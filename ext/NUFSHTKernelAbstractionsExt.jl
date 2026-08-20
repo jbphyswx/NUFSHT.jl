@@ -145,7 +145,7 @@ end
     mp = i - 1 + mp0; m = j - 1 - ℓ
     CT = eltype(G)
     @inbounds begin
-        ph = NUFSHT._im_pow(CT, m + s) * sf[ℓ + 1, m + lmax + 1, b] * Nℓ
+        ph = NUFSHT._im_pow(CT, -(m + s)) * sf[ℓ + 1, m + lmax + 1, b] * Nℓ
         G[mp + goff, m + off, b] += ph * dl[mp + off, m + off] * dl[mp + off, (-s) + off]
     end
 end
@@ -156,7 +156,7 @@ end
     m = j - 1 - ℓ
     CT = eltype(sf)
     @inbounds begin
-        phc = conj(NUFSHT._im_pow(CT, m + s)) * Nℓ
+        phc = conj(NUFSHT._im_pow(CT, -(m + s))) * Nℓ
         acc = zero(CT)
         for mp in mp0:ℓ
             acc += dl[mp + off, m + off] * dl[mp + off, (-s) + off] * Ĝ[mp + goff, m + off, b]
