@@ -143,3 +143,48 @@ Test.@testset "nusht_solve! is rotation equivariant" begin
     @info "degree-spectrum change under rotation: $rel"
     Test.@test rel < 0.02
 end
+
+# Batched CG retires each column at its own tolerance and skips it in the sphere-operator loops. The
+# columns are independent, so the batched answer must equal solving them one at a time. Iteration
+# counts are NOT comparable across runs — multithreaded FINUFFT spreading is not bit-deterministic and
+# CG amplifies it — so this asserts the mechanism's invariants, not a count.
+Test.@testset "batched solve retires columns independently" begin
+    Random.seed!(11)
+    lmax, M, B = 12, 676, 4
+    N, Nf = lmax + 1, 2lmax + 1
+    θ = acos.(2 .* rand(M) .- 1); φ = 2π .* rand(M)
+
+    # Heterogeneous columns: differing bandlimit and amplitude ⇒ differing convergence rates.
+    Ct = zeros(N, Nf, B)
+    for (b, (L, a)) in enumerate(((2, 1.0), (5, 1e2), (9, 1e-2), (12, 3.0)))
+        for l in 1:L, m in -l:l
+            Ct[FastSphericalHarmonics.sph_mode(l, m), b] = a * randn()
+        end
+    end
+
+    pB = NUFSHT.make_plan(Float64, θ, φ, lmax; ntrans = B)
+    fB = zeros(M, B); NUFSHT.nusht_type2!(fB, Ct, pB)
+    ws = NUFSHT.CGWorkspace(pB)
+    CB = zeros(N, Nf, B)
+    _, _, relB = NUFSHT.nusht_solve!(CB, fB, pB; ws = ws, rtol = 1e-6, maxiter = 500)
+
+    p1 = NUFSHT.make_plan(Float64, θ, φ, lmax)
+    C1 = zeros(N, Nf, B)
+    for b in 1:B
+        c = zeros(N, Nf)
+        NUFSHT.nusht_solve!(c, fB[:, b], p1; rtol = 1e-6, maxiter = 500)
+        C1[:, :, b] = c
+    end
+
+    Test.@test sqrt(sum(abs2, CB .- C1)) / sqrt(sum(abs2, C1)) < 1e-9
+    Test.@test relB < 1e-6
+
+    # Retired columns must hold `p` at exactly zero. `_AtA!` skips them in the sphere loops, so their
+    # `Ap` slices go stale; `pAp = ⟨p, Ap⟩` is only harmless because `p` is zero there.
+    for b in 1:B
+        ws.active[b] && continue
+        Test.@test all(iszero, @view ws.p[:, :, b])
+    end
+    @info "retired $(count(!, ws.active)) of $B columns before the batch finished"
+    NUFSHT.close!(pB); NUFSHT.close!(p1)
+end

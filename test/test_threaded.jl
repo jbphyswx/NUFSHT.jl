@@ -64,3 +64,36 @@ Test.@testset "OhMyThreads extension: threaded == serial, main task intact" begi
 
     @info "OhMyThreads ext validated with $(Threads.nthreads()) thread(s), P=$P problems (incl. solve)"
 end
+
+# The per-column sphere loops are threaded across a per-task pool of slice buffers and plans. This is
+# the failure mode that matters: FastTransforms returns silently WRONG results from a non-root task
+# while its OpenMP regions are live, so the threaded path must agree with the serial one, not merely
+# run. A `ntrans = 1` plan always has an empty pool, so it is the serial reference at any thread count.
+Test.@testset "threaded sphere loops agree with serial" begin
+    Random.seed!(404)
+    lmax, M, B = 24, 900, 4
+    N, Nf = lmax + 1, 2lmax + 1
+    θ = acos.(2 .* rand(M) .- 1); φ = 2π .* rand(M)
+
+    pB = NUFSHT.make_plan(Float64, θ, φ, lmax; ntrans = B)
+    p1 = NUFSHT.make_plan(Float64, θ, φ, lmax)
+    Test.@test isempty(p1.sph_pool)                              # serial reference
+    if Threads.nthreads() > 1
+        Test.@test !isempty(pB.sph_pool)                         # threaded path really is exercised
+    end
+
+    C = randn(N, Nf, B)
+    fB = zeros(M, B); NUFSHT.nusht_type2!(fB, C, pB)
+    CaB = zeros(N, Nf, B); NUFSHT._nusht_true_adjoint!(CaB, fB, pB)
+
+    for b in 1:B
+        f1 = zeros(M); NUFSHT.nusht_type2!(f1, C[:, :, b], p1)
+        Test.@test maximum(abs, fB[:, b] .- f1) / maximum(abs, f1) < 1e-13
+
+        Ca1 = zeros(N, Nf); NUFSHT._nusht_true_adjoint!(Ca1, f1, p1)
+        Test.@test maximum(abs, CaB[:, :, b] .- Ca1) / maximum(abs, Ca1) < 1e-13
+    end
+
+    @info "sphere loops: pool=$(length(pB.sph_pool)) at $(Threads.nthreads()) thread(s), matches serial"
+    NUFSHT.close!(pB); NUFSHT.close!(p1)
+end

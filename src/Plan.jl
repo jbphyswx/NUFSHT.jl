@@ -136,6 +136,23 @@ function _build_sph_plans(Fslice, nt::Integer, flags::Integer)
     end
 end
 
+"""
+    _sph_pool(Fslice, ntasks, nt, flags)
+
+One `Fslice` and one set of sphere plans per task, for threading the per-column sphere loops. A
+FastTransforms plan is not safe to apply concurrently, and the loop's slice buffer is shared, so both
+have to be replicated. Empty when there is nothing to thread, so a single-threaded plan pays nothing.
+
+Index the result **per task, never by `Threads.threadid()`**: tasks migrate between threads, so a
+`threadid()` read at one point need not hold later and two tasks can end up sharing one entry — a data
+race, not merely a bad index (it can also exceed `nthreads()` outright when an interactive pool
+exists). A spawned task owns its chunk index for its whole lifetime, so that is the safe key.
+"""
+function _sph_pool(Fslice, ntasks::Integer, nt::Integer, flags::Integer)
+    ntasks <= 1 && return typeof((similar(Fslice), _build_sph_plans(Fslice, nt, flags)...))[]
+    return [(similar(Fslice), _build_sph_plans(Fslice, nt, flags)...) for _ in 1:ntasks]
+end
+
 # Time a candidate, abandoning it after one sample once it cannot beat `bound` — bad candidates run
 # 10-100x slower, so without this the search is dominated by settings it is about to reject.
 function _time_candidate(f, bound::Float64, reps::Int = 3)
@@ -359,7 +376,8 @@ single axis. `nodes.θ_shift` holds the `cis(N0·θ)` removing that offset, `not
 struct NUSHTplan{T<:AbstractFloat, FE<:Number, AT3<:AbstractArray{FE,3}, DT3<:AbstractArray{FE,3},
                  AT2<:AbstractMatrix, HT, CT3<:AbstractArray{Complex{T},3},
                  CV<:AbstractVector{Complex{T}},
-                 ND<:AbstractNodeSet, FP, IP, SP, SPS, SPA, SPADJ, SPSADJ, FT} <: AbstractNUSHTplan
+                 ND<:AbstractNodeSet, FP, IP, SP, SPS, SPA, SPADJ, SPSADJ, SPL,
+                 FT} <: AbstractNUSHTplan
     lmax::Int
     Nθ::Int
     Nφ::Int
@@ -381,6 +399,7 @@ struct NUSHTplan{T<:AbstractFloat, FE<:Number, AT3<:AbstractArray{FE,3}, DT3<:Ab
     sph_plan_analysis::SPA
     sph_plan_adj::SPADJ           # sph_plan' (P'), stored to keep _nusht_true_adjoint! alloc-free
     sph_plan_synth_adj::SPSADJ    # sph_plan_synth' (PS')
+    sph_pool::SPL                 # per-task slice + plans for the threaded column loops; see _sph_pool
 end
 
 """
@@ -501,6 +520,9 @@ function make_plan(
     isnothing(ft_fftw_flags) || (sph_flags = UInt32(ft_fftw_flags))
     sph_plan, sph_plan_synth, sph_plan_analysis, sph_plan_adj, sph_plan_synth_adj =
         _build_sph_plans(Fslice, sph_nt, sph_flags)
+    # Replicated only when there is something to thread, so a single-threaded plan pays no build cost
+    # and no memory. Capped at `B`: more tasks than columns cannot help.
+    sph_pool = _sph_pool(Fslice, min(Threads.nthreads(), B), sph_nt, sph_flags)
 
     # iflag +1 for synthesis (type 2): reconstruction uses the +i (inverse-DFT) sign, so the raw
     # FFT modes need no conjugation — an axis swap takes the place of a conjugate-transpose
@@ -527,10 +549,10 @@ function make_plan(
                      typeof(phase_scaled), typeof(nodes),
                      typeof(fft_plan), typeof(ifft_plan), typeof(sph_plan), typeof(sph_plan_synth),
                      typeof(sph_plan_analysis), typeof(sph_plan_adj), typeof(sph_plan_synth_adj),
-                     typeof(tol64)}(
+                     typeof(sph_pool), typeof(tol64)}(
         lmax, Nθ, Nφ, B, tol64, nodes, C, F, F̃, Fhalf, Fhat, Fslice,
         phase_scaled, phase_conj, fft_plan, ifft_plan, sph_plan, sph_plan_synth, sph_plan_analysis,
-        sph_plan_adj, sph_plan_synth_adj,
+        sph_plan_adj, sph_plan_synth_adj, sph_pool,
     )
 end
 

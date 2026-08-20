@@ -183,13 +183,48 @@ _copy_out!(f, fbuf, ::NUSHTplan{T,FE}) where {T,FE<:Complex} = _copy_field!(f, f
 # Internal S / D·F·N cores (operate entirely on plan buffers).
 # ─────────────────────────────────────────────────────────────────────────────
 
-# S (forward): sph_evaluate! = PS·P, applied per batch slice through the dense `Fslice`.
-function _sph_evaluate!(plan::NUSHTplan)
-    @inbounds for b in 1:plan.B
-        _load_slice!(plan.Fslice, plan.F, plan, b)
-        LinearAlgebra.lmul!(plan.sph_plan, plan.Fslice)
-        LinearAlgebra.lmul!(plan.sph_plan_synth, plan.Fslice)
-        _store_slice!(plan.F, plan.Fslice, plan, b)
+# Which batch columns a per-column sphere loop should visit. `nothing` means all of them, which is
+# what every caller outside the solver wants; the solver passes its active set.
+@inline _is_active(::Nothing, _b) = true
+@inline _is_active(active::AbstractVector{Bool}, b) = @inbounds active[b]
+
+# Walk the active columns applying a per-column sphere operation. FastTransforms has no batched `lmul!`
+# for these, so the column loop is the only parallelism available; each spawned task takes its own
+# slice buffer and its own plans from the pool, keyed by chunk (see `_sph_pool`). The whole region runs
+# under `_with_fasttransforms_single` — FastTransforms returns WRONG RESULTS from a non-root task while
+# its OpenMP regions are live, so that pin is a correctness requirement, not a tuning choice.
+function _sph_columns!(op!, plan::NUSHTplan, active)
+    pool = plan.sph_pool
+    nt = length(pool)
+    if nt <= 1
+        @inbounds for b in 1:plan.B
+            _is_active(active, b) || continue
+            op!(plan.Fslice, plan.sph_plan, plan.sph_plan_synth,
+                plan.sph_plan_adj, plan.sph_plan_synth_adj, b)
+        end
+        return plan
+    end
+    _with_fasttransforms_single() do
+        @sync for c in 1:nt
+            Threads.@spawn begin
+                sl, P, PS, _PA, Padj, PSadj = pool[c]
+                for b in c:nt:plan.B
+                    _is_active(active, b) || continue
+                    op!(sl, P, PS, Padj, PSadj, b)
+                end
+            end
+        end
+    end
+    return plan
+end
+
+# S (forward): sph_evaluate! = PS·P, applied per batch slice through a dense slice buffer.
+function _sph_evaluate!(plan::NUSHTplan, active = nothing)
+    _sph_columns!(plan, active) do sl, P, PS, _Padj, _PSadj, b
+        _load_slice!(sl, plan.F, plan, b)
+        LinearAlgebra.lmul!(P, sl)
+        LinearAlgebra.lmul!(PS, sl)
+        _store_slice!(plan.F, sl, plan, b)
     end
     return plan
 end
@@ -309,11 +344,11 @@ length-`M` / `(M, B)`.
 Algorithm `A = N·F·D·S`: forward rSHT (S) → DFS double (D) → torus FFT + half-pixel phase (F) →
 FINUFFT type 2 (N).
 """
-function nusht_type2!(f, C, plan::NUSHTplan{T}) where {T}
+function nusht_type2!(f, C, plan::NUSHTplan{T}, active = nothing) where {T}
     _assert_coeffs(C, plan)
     _assert_field(f, plan)
     copyto!(plan.F, C)
-    _sph_evaluate!(plan)
+    _sph_evaluate!(plan, active)
     _dfn_synthesis!(plan)
     _copy_out!(f, _fbuf(plan), plan)
     return f
@@ -356,16 +391,16 @@ Internal: the **exact Euclidean adjoint** of `nusht_type2!`. Identical to `nusht
 S† step applies `PS'·P'` (the matrix transpose of `PS·P`) via the conjugate FastTransforms plans,
 making `A†A` symmetric positive definite for CG. At CC-grid points it coincides with `nusht_type1!`.
 """
-function _nusht_true_adjoint!(C, f, plan::NUSHTplan{T}) where {T}
+function _nusht_true_adjoint!(C, f, plan::NUSHTplan{T}, active = nothing) where {T}
     _assert_field(f, plan)
     _assert_coeffs(C, plan)
     _copy_field!(_fbuf(plan), f)
     _dfn_analysis!(plan)
-    @inbounds for b in 1:plan.B
-        _load_slice!(plan.Fslice, plan.F, plan, b)
-        LinearAlgebra.lmul!(plan.sph_plan_synth_adj, plan.Fslice)
-        LinearAlgebra.lmul!(plan.sph_plan_adj, plan.Fslice)
-        _store_slice!(C, plan.Fslice, plan, b)
+    _sph_columns!(plan, active) do sl, _P, _PS, Padj, PSadj, b
+        _load_slice!(sl, plan.F, plan, b)
+        LinearAlgebra.lmul!(PSadj, sl)
+        LinearAlgebra.lmul!(Padj, sl)
+        _store_slice!(C, sl, plan, b)
     end
     return C
 end
@@ -447,7 +482,8 @@ Reusable scratch for [`nusht_solve!`](@ref). Holding one across solves makes CG 
 Per-column scalars are length-`B` vectors so the `B` columns run as `B` independent single-column
 CGs (batched result == looping single transforms).
 """
-struct CGWorkspace{AT3<:AbstractArray, FT2<:AbstractMatrix, VT<:AbstractVector, VM<:AbstractArray}
+struct CGWorkspace{AT3<:AbstractArray, FT2<:AbstractMatrix, VT<:AbstractVector, VM<:AbstractArray,
+                   BV<:AbstractVector{Bool}}
     x::AT3
     r::AT3
     p::AT3
@@ -459,6 +495,9 @@ struct CGWorkspace{AT3<:AbstractArray, FT2<:AbstractMatrix, VT<:AbstractVector, 
     # of it — but a least-squares fit must name its space, and only `l ≤ lmax` is SO(3)-invariant.
     # Fitting the ragged set instead makes the answer depend on the coordinate frame.
     valid::VM
+    # Columns still above `rtol`. The sphere-operator loops skip the rest, which is where the
+    # recoverable work is — a guru NUFFT plan's `ntrans` is fixed at build, so that half cannot shrink.
+    active::BV
     rsold::VT
     rsnew::VT
     pAp::VT
@@ -476,6 +515,7 @@ function CGWorkspace(plan::NUSHTplan{T}) where {T}
     vB() = _zeros_like(_θnodes(plan), T, B)
     return CGWorkspace(z3(), z3(), z3(), z3(), z3(), _zeros_like(_fbuf(plan), T, M, B),
                        _valid_mask(plan.F, T, plan.lmax),
+                       fill!(_zeros_like(_θnodes(plan), Bool, B), true),
                        vB(), vB(), vB(), vB(), vB(), vB(), vB())
 end
 
@@ -513,8 +553,26 @@ end
 
 # `P A†A P`. Projecting after the adjoint is enough: `p` is already in the valid subspace by induction
 # (x₀ = 0, r₀ = P A†f, and every later direction is a combination of projected vectors), so `A P p = A p`.
+# Converged columns are skipped in the sphere loops, so their `Ap` slices go stale. That is safe
+# because `pAp` contracts `Ap` against `p`, and `nusht_solve!` holds `p` at zero for exactly those
+# columns — nothing stale ever reaches `x`. Asserted in the solve tests.
+function _retire_converged!(ws::CGWorkspace, rtol)
+    n1, n2 = size(ws.p, 1), size(ws.p, 2)
+    @inbounds for b in eachindex(ws.active)
+        (ws.active[b] && ws.rel[b] < rtol) || continue
+        ws.active[b] = false
+        off = (b - 1) * n1 * n2
+        z = zero(eltype(ws.p))
+        @simd for i in 1:(n1 * n2)
+            ws.p[off + i] = z
+        end
+    end
+    return ws
+end
+
 _AtA!(Ap, p, ws::CGWorkspace, plan::NUSHTplan) =
-    (nusht_type2!(ws.f, p, plan); _nusht_true_adjoint!(Ap, ws.f, plan); Ap .*= ws.valid; Ap)
+    (nusht_type2!(ws.f, p, plan, ws.active);
+     _nusht_true_adjoint!(Ap, ws.f, plan, ws.active); Ap .*= ws.valid; Ap)
 
 """
     nusht_solve!(C, f, plan; ws=CGWorkspace(plan), maxiter=500, rtol=1e-6, verbose=false)
@@ -543,6 +601,7 @@ function nusht_solve!(
     copyto!(ws.p, ws.r)
     _col_dot!(ws.rsold, ws.r, ws.r)
     fill!(ws.rel, one(T))
+    fill!(ws.active, true)
 
     iters = 0
     for i in 1:maxiter
@@ -558,6 +617,10 @@ function nusht_solve!(
         maximum(ws.rel) < rtol && break
         @. ws.β = ifelse(ws.rsold == 0, zero(T), ws.rsnew / ws.rsold)
         _col_pbp!(ws.p, ws.r, ws.β)
+        # Retire converged columns. Zeroing `p` AFTER `_col_pbp!` is what makes the rest no-op: next
+        # iteration `pAp = ⟨0, Ap⟩ = 0`, so the `pAp == 0` guard above sets `α = 0` and `x`, `r` hold.
+        # Doing it before would be undone by `p = r + β·0 = r`.
+        _retire_converged!(ws, rtol)
         copyto!(ws.rsold, ws.rsnew)
     end
 
