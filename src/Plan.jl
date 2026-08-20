@@ -137,6 +137,76 @@ function _build_sph_plans(Fslice, nt::Integer, flags::Integer)
 end
 
 """
+    _pool_sizes(B) -> Vector{Int}
+
+Working batch sizes a solve may shrink to: powers of two up to `B`, plus `B` itself. Powers of two
+bound the number of plan sets at `log2(B)+1` while never wasting more than a factor of two of transform
+width, so a column retiring early costs at most one halving of unused work.
+"""
+function _pool_sizes(B::Integer)
+    B <= 1 && return Int[]
+    s = [1 << i for i in 0:floor(Int, log2(B))]
+    s[end] == B || push!(s, Int(B))
+    return s
+end
+
+"""
+    _empty_size_pool(fft_plan, ifft_plan, nufft_type2, nufft_type1) -> Vector
+
+Empty cache of size-dependent plan sets, one per working batch width, filled on demand by
+[`_build_width!`](@ref). The element type is taken from the plan's own full-width plans: neither the
+FFTW plan type nor the NUFFT plan type depends on the width or on `Array`-vs-view (measured — a plan
+for a prefix view has the identical type), so the type is known without building anything, and a
+`Vector` is already mutable so nothing about the plan struct needs to be.
+"""
+function _empty_size_pool(fft_plan, ifft_plan, nufft_type2, nufft_type1, nwidths::Integer)
+    E = @NamedTuple{k::Int, fft_plan::typeof(fft_plan), ifft_plan::typeof(ifft_plan),
+                    nufft_type2::typeof(nufft_type2), nufft_type1::typeof(nufft_type1)}
+    pool = E[]
+    sizehint!(pool, nwidths)      # final capacity is known, so filling it never regrows
+    return pool
+end
+
+"""
+    _pool_recipe(backend, nt2, uf2, nt1, uf1)
+
+The build inputs a narrower plan set needs that cannot be recovered from a plan: the resolved NUFFT
+backend and the tuned thread/upsampling settings. Everything else — mode counts, `modeord`, tolerance,
+nodes, realness — is read back off the plan when a width is built.
+"""
+_pool_recipe(backend, nt2, uf2, nt1, uf1) =
+    (backend = backend, nt2 = Int(nt2), uf2 = Float64(uf2), nt1 = Int(nt1), uf1 = Float64(uf1))
+
+"""
+    _build_width!(plan, k) -> entry
+
+Build and cache the plan set for working width `k`, returning it. The FFT plans are built on
+contiguous prefix views of the full-width buffers, which is exact and needs no extra storage.
+
+Mutates `plan.size_pool`, so it is not safe to call concurrently on a shared plan — the same
+restriction a plan already carries, since a FINUFFT guru plan cannot be executed concurrently either.
+"""
+function _build_width!(plan, k::Integer)
+    r = plan.pool_recipe
+    realfield = eltype(plan.F̃) <: Real
+    T = real(eltype(plan.Fhat))
+    θn, φn = _θnufft(plan), _φnodes(plan)
+    n_modes = Int64[size(plan.Fhat, 1), size(plan.Fhat, 2)]
+    modeord = isnothing(_θshift(plan)) ? 1 : 0
+    F̃k = view(plan.F̃, :, :, 1:k)
+    fp = realfield ? AbstractFFTs.plan_rfft(F̃k, (1, 2)) : AbstractFFTs.plan_fft(F̃k, (1, 2))
+    ip = realfield ? AbstractFFTs.plan_brfft(view(plan.Fhalf, :, :, 1:k), 2plan.Nθ, (1, 2)) :
+                     AbstractFFTs.plan_bfft(view(plan.Fhat, :, :, 1:k), (1, 2))
+    n2 = _make_nufft(r.backend, θn, 2, n_modes, +1, k, plan.tol, T, modeord, r.nt2, r.uf2)
+    n1 = _make_nufft(r.backend, θn, 1, n_modes, -1, k, plan.tol, T, modeord, r.nt1, r.uf1)
+    _nufft_setpts!(n2, θn, φn); _nufft_setpts!(n1, θn, φn)
+    _nufft_finalize!(n2); _nufft_finalize!(n1)
+    e = (k = Int(k), fft_plan = fp, ifft_plan = ip, nufft_type2 = n2, nufft_type1 = n1)
+    push!(plan.size_pool, e)
+    return e
+end
+
+"""
     _sph_pool(Fslice, ntasks, nt, flags)
 
 One `Fslice` and one set of sphere plans per task, for threading the per-column sphere loops. A
@@ -376,7 +446,7 @@ single axis. `nodes.θ_shift` holds the `cis(N0·θ)` removing that offset, `not
 struct NUSHTplan{T<:AbstractFloat, FE<:Number, AT3<:AbstractArray{FE,3}, DT3<:AbstractArray{FE,3},
                  AT2<:AbstractMatrix, HT, CT3<:AbstractArray{Complex{T},3},
                  CV<:AbstractVector{Complex{T}},
-                 ND<:AbstractNodeSet, FP, IP, SP, SPS, SPA, SPADJ, SPSADJ, SPL,
+                 ND<:AbstractNodeSet, FP, IP, SP, SPS, SPA, SPADJ, SPSADJ, SPL, SZP, RCP,
                  FT} <: AbstractNUSHTplan
     lmax::Int
     Nθ::Int
@@ -400,6 +470,8 @@ struct NUSHTplan{T<:AbstractFloat, FE<:Number, AT3<:AbstractArray{FE,3}, DT3<:Ab
     sph_plan_adj::SPADJ           # sph_plan' (P'), stored to keep _nusht_true_adjoint! alloc-free
     sph_plan_synth_adj::SPSADJ    # sph_plan_synth' (PS')
     sph_pool::SPL                 # per-task slice + plans for the threaded column loops; see _sph_pool
+    size_pool::SZP                # narrower plan sets, cached on demand; see _empty_size_pool
+    pool_recipe::RCP              # what building one needs that the plan cannot supply
 end
 
 """
@@ -543,16 +615,22 @@ function make_plan(
     _nufft_finalize!(nufft_type1)
     # A scalar plan hands FINUFFT the colatitudes unchanged, so `θ_nufft` aliases `θ_nodes` and costs
     # no extra storage; a spin plan negates them and owns a separate array.
+    # Narrower plan sets are cached on first use, not built here: a solve whose columns converge
+    # together never needs one, and building all of them eagerly costs ~2.7 ms per width.
+    size_pool = _empty_size_pool(fft_plan, ifft_plan, nufft_type2, nufft_type1,
+                                 length(_pool_sizes(B)))
+    pool_recipe = _pool_recipe(nub, nt2, uf2, nt1, uf1)
+
     nodes = _node_set(Val(variable_npts), θ, φ, θ, θ_shift, fbuf, nufft_type2, nufft_type1)
 
     return NUSHTplan{T, FE, typeof(C), typeof(F̃), typeof(Fslice), typeof(Fhalf), typeof(Fhat),
                      typeof(phase_scaled), typeof(nodes),
                      typeof(fft_plan), typeof(ifft_plan), typeof(sph_plan), typeof(sph_plan_synth),
                      typeof(sph_plan_analysis), typeof(sph_plan_adj), typeof(sph_plan_synth_adj),
-                     typeof(sph_pool), typeof(tol64)}(
+                     typeof(sph_pool), typeof(size_pool), typeof(pool_recipe), typeof(tol64)}(
         lmax, Nθ, Nφ, B, tol64, nodes, C, F, F̃, Fhalf, Fhat, Fslice,
         phase_scaled, phase_conj, fft_plan, ifft_plan, sph_plan, sph_plan_synth, sph_plan_analysis,
-        sph_plan_adj, sph_plan_synth_adj, sph_pool,
+        sph_plan_adj, sph_plan_synth_adj, sph_pool, size_pool, pool_recipe,
     )
 end
 

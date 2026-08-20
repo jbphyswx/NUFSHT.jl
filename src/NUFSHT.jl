@@ -183,22 +183,16 @@ _copy_out!(f, fbuf, ::NUSHTplan{T,FE}) where {T,FE<:Complex} = _copy_field!(f, f
 # Internal S / D·F·N cores (operate entirely on plan buffers).
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Which batch columns a per-column sphere loop should visit. `nothing` means all of them, which is
-# what every caller outside the solver wants; the solver passes its active set.
-@inline _is_active(::Nothing, _b) = true
-@inline _is_active(active::AbstractVector{Bool}, b) = @inbounds active[b]
-
 # Walk the active columns applying a per-column sphere operation. FastTransforms has no batched `lmul!`
 # for these, so the column loop is the only parallelism available; each spawned task takes its own
 # slice buffer and its own plans from the pool, keyed by chunk (see `_sph_pool`). The whole region runs
 # under `_with_fasttransforms_single` — FastTransforms returns WRONG RESULTS from a non-root task while
 # its OpenMP regions are live, so that pin is a correctness requirement, not a tuning choice.
-function _sph_columns!(op!, plan::NUSHTplan, active)
+function _sph_columns!(op!, plan::NUSHTplan, k::Integer)
     pool = plan.sph_pool
-    nt = length(pool)
+    nt = min(length(pool), k)
     if nt <= 1
-        @inbounds for b in 1:plan.B
-            _is_active(active, b) || continue
+        @inbounds for b in 1:k
             op!(plan.Fslice, plan.sph_plan, plan.sph_plan_synth,
                 plan.sph_plan_adj, plan.sph_plan_synth_adj, b)
         end
@@ -208,8 +202,7 @@ function _sph_columns!(op!, plan::NUSHTplan, active)
         @sync for c in 1:nt
             Threads.@spawn begin
                 sl, P, PS, _PA, Padj, PSadj = pool[c]
-                for b in c:nt:plan.B
-                    _is_active(active, b) || continue
+                for b in c:nt:k
                     op!(sl, P, PS, Padj, PSadj, b)
                 end
             end
@@ -219,8 +212,8 @@ function _sph_columns!(op!, plan::NUSHTplan, active)
 end
 
 # S (forward): sph_evaluate! = PS·P, applied per batch slice through a dense slice buffer.
-function _sph_evaluate!(plan::NUSHTplan, active = nothing)
-    _sph_columns!(plan, active) do sl, P, PS, _Padj, _PSadj, b
+function _sph_evaluate!(plan::NUSHTplan, k::Integer = plan.B)
+    _sph_columns!(plan, k) do sl, P, PS, _Padj, _PSadj, b
         _load_slice!(sl, plan.F, plan, b)
         LinearAlgebra.lmul!(P, sl)
         LinearAlgebra.lmul!(PS, sl)
@@ -291,43 +284,105 @@ _rephase!(fbuf, s::AbstractVector) = (fbuf .*= s; fbuf)
 _rephase_conj!(fbuf, ::Nothing) = fbuf
 _rephase_conj!(fbuf, s::AbstractVector) = (fbuf .*= conj.(s); fbuf)
 
-function _dfn_synthesis!(plan::NUSHTplan{T,FE}) where {T,FE<:Real}
-    F̃, Fhalf, fp = plan.F̃, plan.Fhalf, plan.fft_plan
-    dfs_double!(F̃, plan.F)
-    LinearAlgebra.mul!(Fhalf, fp, F̃)
-    _pack_modes!(plan.Fhat, Fhalf, plan.phase_scaled, _θshift(plan))
-    _nufft_exec!(_nufft2(plan), plan.Fhat, _fbuf(plan))
-    _rephase!(_fbuf(plan), _θshift(plan))
+# Leading `k` columns of a batch buffer. Contiguous, so the width-`k` plans apply to it exactly.
+@inline _pfx(A::AbstractArray{<:Any,3}, k::Integer) = view(A, :, :, 1:k)
+@inline _pfx(A::AbstractMatrix, k::Integer) = view(A, :, 1:k)
+
+# Size-dependent plans for a working width. The full width uses the plan's own, so that path is
+# untouched by the pool's existence; narrower widths come from `size_pool`.
+# Both branches return the pool's element type, so this stays statically dispatched. A miss builds and
+# caches the width, which is why the full-width branch comes first: it is the common case and never
+# touches the cache.
+@inline function _width_plans(plan::NUSHTplan, k::Integer)
+    k == plan.B && return (k = Int(k), fft_plan = plan.fft_plan, ifft_plan = plan.ifft_plan,
+                           nufft_type2 = _nufft2(plan), nufft_type1 = _nufft1(plan))
+    @inbounds for e in plan.size_pool
+        e.k == k && return e
+    end
+    return _build_width!(plan, k)
+end
+
+function _dfn_synthesis!(plan::NUSHTplan{T,FE}, k::Integer = plan.B) where {T,FE<:Real}
+    e = _width_plans(plan, k)
+    if k == plan.B
+        _dfn_synth_real!(plan, plan.F, plan.F̃, plan.Fhalf, plan.Fhat, _fbuf(plan),
+                         e.fft_plan, e.nufft_type2)
+    else
+        _dfn_synth_real!(plan, _pfx(plan.F, k), _pfx(plan.F̃, k), _pfx(plan.Fhalf, k),
+                         _pfx(plan.Fhat, k), _pfx(_fbuf(plan), k), e.fft_plan, e.nufft_type2)
+    end
     return plan
 end
 
-function _dfn_synthesis!(plan::NUSHTplan{T,FE}) where {T,FE<:Complex}
-    dfs_double!(plan.F̃, plan.F)
-    LinearAlgebra.mul!(plan.Fhat, plan.fft_plan, plan.F̃)
-    plan.Fhat .*= plan.phase_scaled
-    _nufft_exec!(_nufft2(plan), plan.Fhat, _fbuf(plan))
+function _dfn_synth_real!(plan, F, F̃, Fhalf, Fhat, fbuf, fp, nu2)
+    dfs_double!(F̃, F)
+    LinearAlgebra.mul!(Fhalf, fp, F̃)
+    _pack_modes!(Fhat, Fhalf, plan.phase_scaled, _θshift(plan))
+    _nufft_exec!(nu2, Fhat, fbuf)
+    _rephase!(fbuf, _θshift(plan))
+    return nothing
+end
+
+function _dfn_synthesis!(plan::NUSHTplan{T,FE}, k::Integer = plan.B) where {T,FE<:Complex}
+    e = _width_plans(plan, k)
+    if k == plan.B
+        _dfn_synth_cplx!(plan, plan.F, plan.F̃, plan.Fhat, _fbuf(plan), e.fft_plan, e.nufft_type2)
+    else
+        _dfn_synth_cplx!(plan, _pfx(plan.F, k), _pfx(plan.F̃, k), _pfx(plan.Fhat, k),
+                         _pfx(_fbuf(plan), k), e.fft_plan, e.nufft_type2)
+    end
     return plan
+end
+
+function _dfn_synth_cplx!(plan, F, F̃, Fhat, fbuf, fp, nu2)
+    dfs_double!(F̃, F)
+    LinearAlgebra.mul!(Fhat, fp, F̃)
+    Fhat .*= plan.phase_scaled
+    _nufft_exec!(nu2, Fhat, fbuf)
+    return nothing
 end
 
 # N†·F†·D† (adjoint): type-1 NUFFT (from `fbuf`) → conj phase → inverse FFT → fold into `F`.
 # `phase_conj` carries no Hermitian weight — `brfft` already applies that doubling, and applying it on
 # both sides breaks the adjoint identity `nusht_solve!` depends on.
-function _dfn_analysis!(plan::NUSHTplan{T,FE}) where {T,FE<:Real}
-    F̃, Fhalf, ip = plan.F̃, plan.Fhalf, plan.ifft_plan
-    _rephase_conj!(_fbuf(plan), _θshift(plan))
-    _nufft_exec!(_nufft1(plan), _fbuf(plan), plan.Fhat)
-    _unpack_modes!(Fhalf, plan.Fhat, plan.phase_conj, _θshift(plan))
-    LinearAlgebra.mul!(F̃, ip, Fhalf)
-    dfs_fold!(plan.F, F̃)
+function _dfn_analysis!(plan::NUSHTplan{T,FE}, k::Integer = plan.B) where {T,FE<:Real}
+    e = _width_plans(plan, k)
+    if k == plan.B
+        _dfn_ana_real!(plan, plan.F, plan.F̃, plan.Fhalf, plan.Fhat, _fbuf(plan),
+                       e.ifft_plan, e.nufft_type1)
+    else
+        _dfn_ana_real!(plan, _pfx(plan.F, k), _pfx(plan.F̃, k), _pfx(plan.Fhalf, k),
+                       _pfx(plan.Fhat, k), _pfx(_fbuf(plan), k), e.ifft_plan, e.nufft_type1)
+    end
     return plan
 end
 
-function _dfn_analysis!(plan::NUSHTplan{T,FE}) where {T,FE<:Complex}
-    _nufft_exec!(_nufft1(plan), _fbuf(plan), plan.Fhat)
-    plan.Fhat .*= plan.phase_conj
-    LinearAlgebra.mul!(plan.F̃, plan.ifft_plan, plan.Fhat)
-    dfs_fold!(plan.F, plan.F̃)
+function _dfn_ana_real!(plan, F, F̃, Fhalf, Fhat, fbuf, ip, nu1)
+    _rephase_conj!(fbuf, _θshift(plan))
+    _nufft_exec!(nu1, fbuf, Fhat)
+    _unpack_modes!(Fhalf, Fhat, plan.phase_conj, _θshift(plan))
+    LinearAlgebra.mul!(F̃, ip, Fhalf)
+    dfs_fold!(F, F̃)
+    return nothing
+end
+
+function _dfn_analysis!(plan::NUSHTplan{T,FE}, k::Integer = plan.B) where {T,FE<:Complex}
+    e = _width_plans(plan, k)
+    if k == plan.B
+        _dfn_ana_cplx!(plan, plan.F, plan.F̃, plan.Fhat, _fbuf(plan), e.ifft_plan, e.nufft_type1)
+    else
+        _dfn_ana_cplx!(plan, _pfx(plan.F, k), _pfx(plan.F̃, k), _pfx(plan.Fhat, k),
+                       _pfx(_fbuf(plan), k), e.ifft_plan, e.nufft_type1)
+    end
     return plan
+end
+
+function _dfn_ana_cplx!(plan, F, F̃, Fhat, fbuf, ip, nu1)
+    _nufft_exec!(nu1, fbuf, Fhat)
+    Fhat .*= plan.phase_conj
+    LinearAlgebra.mul!(F̃, ip, Fhat)
+    dfs_fold!(F, F̃)
+    return nothing
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -344,12 +399,12 @@ length-`M` / `(M, B)`.
 Algorithm `A = N·F·D·S`: forward rSHT (S) → DFS double (D) → torus FFT + half-pixel phase (F) →
 FINUFFT type 2 (N).
 """
-function nusht_type2!(f, C, plan::NUSHTplan{T}, active = nothing) where {T}
+function nusht_type2!(f, C, plan::NUSHTplan{T}, k::Integer = plan.B) where {T}
     _assert_coeffs(C, plan)
     _assert_field(f, plan)
     copyto!(plan.F, C)
-    _sph_evaluate!(plan, active)
-    _dfn_synthesis!(plan)
+    _sph_evaluate!(plan, k)
+    _dfn_synthesis!(plan, k)
     _copy_out!(f, _fbuf(plan), plan)
     return f
 end
@@ -391,12 +446,12 @@ Internal: the **exact Euclidean adjoint** of `nusht_type2!`. Identical to `nusht
 S† step applies `PS'·P'` (the matrix transpose of `PS·P`) via the conjugate FastTransforms plans,
 making `A†A` symmetric positive definite for CG. At CC-grid points it coincides with `nusht_type1!`.
 """
-function _nusht_true_adjoint!(C, f, plan::NUSHTplan{T}, active = nothing) where {T}
+function _nusht_true_adjoint!(C, f, plan::NUSHTplan{T}, k::Integer = plan.B) where {T}
     _assert_field(f, plan)
     _assert_coeffs(C, plan)
     _copy_field!(_fbuf(plan), f)
-    _dfn_analysis!(plan)
-    _sph_columns!(plan, active) do sl, _P, _PS, Padj, PSadj, b
+    _dfn_analysis!(plan, k)
+    _sph_columns!(plan, k) do sl, _P, _PS, Padj, PSadj, b
         _load_slice!(sl, plan.F, plan, b)
         LinearAlgebra.lmul!(PSadj, sl)
         LinearAlgebra.lmul!(Padj, sl)
@@ -483,7 +538,7 @@ Per-column scalars are length-`B` vectors so the `B` columns run as `B` independ
 CGs (batched result == looping single transforms).
 """
 struct CGWorkspace{AT3<:AbstractArray, FT2<:AbstractMatrix, VT<:AbstractVector, VM<:AbstractArray,
-                   BV<:AbstractVector{Bool}}
+                   PV<:AbstractVector{<:Integer}}
     x::AT3
     r::AT3
     p::AT3
@@ -495,9 +550,9 @@ struct CGWorkspace{AT3<:AbstractArray, FT2<:AbstractMatrix, VT<:AbstractVector, 
     # of it — but a least-squares fit must name its space, and only `l ≤ lmax` is SO(3)-invariant.
     # Fitting the ragged set instead makes the answer depend on the coordinate frame.
     valid::VM
-    # Columns still above `rtol`. The sphere-operator loops skip the rest, which is where the
-    # recoverable work is — a guru NUFFT plan's `ntrans` is fixed at build, so that half cannot shrink.
-    active::BV
+    # Slot -> original column. Compaction moves live columns to the front, so a slot's identity is
+    # only recoverable through this; it is what keeps a result from being written to the wrong column.
+    perm::PV
     rsold::VT
     rsnew::VT
     pAp::VT
@@ -515,13 +570,15 @@ function CGWorkspace(plan::NUSHTplan{T}) where {T}
     vB() = _zeros_like(_θnodes(plan), T, B)
     return CGWorkspace(z3(), z3(), z3(), z3(), z3(), _zeros_like(_fbuf(plan), T, M, B),
                        _valid_mask(plan.F, T, plan.lmax),
-                       fill!(_zeros_like(_θnodes(plan), Bool, B), true),
+                       collect(1:B),
                        vB(), vB(), vB(), vB(), vB(), vB(), vB())
 end
 
 # Per-column reductions / updates over a (Nθ, Nφ, B) array — zero-allocation.
-function _col_dot!(dst, a, b)
-    @inbounds for k in axes(a, 3)
+# `n` bounds the columns visited, so a compacted solve reduces only over its live prefix. Taken as a
+# count rather than a view: a `SubArray` per call would put allocation back on the CG hot path.
+function _col_dot!(dst, a, b, n::Integer = size(a, 3))
+    @inbounds for k in 1:n
         s = zero(eltype(a))
         for j in axes(a, 2), i in axes(a, 1)
             s += a[i, j, k] * b[i, j, k]
@@ -531,8 +588,8 @@ function _col_dot!(dst, a, b)
     return dst
 end
 
-function _col_axpy!(y, α, x, σ)   # y[:,:,k] += σ·α[k]·x[:,:,k]
-    @inbounds for k in axes(y, 3)
+function _col_axpy!(y, α, x, σ, n::Integer = size(y, 3))   # y[:,:,k] += σ·α[k]·x[:,:,k]
+    @inbounds for k in 1:n
         c = σ * α[k]
         for j in axes(y, 2), i in axes(y, 1)
             y[i, j, k] += c * x[i, j, k]
@@ -541,8 +598,8 @@ function _col_axpy!(y, α, x, σ)   # y[:,:,k] += σ·α[k]·x[:,:,k]
     return y
 end
 
-function _col_pbp!(p, r, β)       # p[:,:,k] = r[:,:,k] + β[k]·p[:,:,k]
-    @inbounds for k in axes(p, 3)
+function _col_pbp!(p, r, β, n::Integer = size(p, 3))       # p[:,:,k] = r[:,:,k] + β[k]·p[:,:,k]
+    @inbounds for k in 1:n
         c = β[k]
         for j in axes(p, 2), i in axes(p, 1)
             p[i, j, k] = r[i, j, k] + c * p[i, j, k]
@@ -556,27 +613,65 @@ end
 # Converged columns are skipped in the sphere loops, so their `Ap` slices go stale. That is safe
 # because `pAp` contracts `Ap` against `p`, and `nusht_solve!` holds `p` at zero for exactly those
 # columns — nothing stale ever reaches `x`. Asserted in the solve tests.
-function _retire_converged!(ws::CGWorkspace, rtol)
-    n1, n2 = size(ws.p, 1), size(ws.p, 2)
-    z = zero(eltype(ws.p))
-    @inbounds for b in eachindex(ws.active)
-        ws.active[b] && ws.rel[b] < rtol && (ws.active[b] = false)
-        # Every inactive column, not just the newly retired one: `_col_pbp!` rebuilds
-        # `p[b] = r[b] + β·p[b]` each iteration, so zeroing once lets it come back. A revived `p[b]`
-        # contracts against the stale `Ap[b]` that skipping the sphere loops leaves behind, which puts
-        # arbitrary values into `α[b]` and diverges `x[b]`.
-        ws.active[b] && continue
-        off = (b - 1) * n1 * n2
-        @simd for i in 1:(n1 * n2)
-            ws.p[off + i] = z
-        end
+# Largest of the first `n` entries, without a view (which would allocate on the CG hot path).
+@inline function _max_prefix(v, n::Integer)
+    m = zero(eltype(v))
+    @inbounds for i in 1:n
+        v[i] > m && (m = v[i])
     end
-    return ws
+    return m
 end
 
-_AtA!(Ap, p, ws::CGWorkspace, plan::NUSHTplan) =
-    (nusht_type2!(ws.f, p, plan, ws.active);
-     _nusht_true_adjoint!(Ap, ws.f, plan, ws.active); Ap .*= ws.valid; Ap)
+# Working width for `n` live columns: the next power of two, capped at `B`. Computed rather than looked
+# up in a ladder, so it allocates nothing on the CG hot path — `_build_width!` builds any width on
+# demand, so the powers of two exist only to bound how many distinct plan sets a solve can create.
+@inline _fit_width(n::Integer, B::Integer) = min(Int(B), Int(nextpow(2, max(n, 1))))
+
+@inline function _copy_col!(dst, dsl::Integer, src, ssl::Integer, len::Integer)
+    d0 = (dsl - 1) * len; s0 = (ssl - 1) * len
+    @inbounds @simd for i in 1:len
+        dst[d0 + i] = src[s0 + i]
+    end
+    return dst
+end
+
+"""
+    _retire_and_compact!(C, ws, rtol, nlive, len) -> nlive′
+
+Write out any live column that has reached `rtol` — into `C` at its *original* index, taken from
+`ws.perm`, since its answer is final and must not be carried further — then close the gaps so the
+remaining live columns occupy slots `1:nlive′`. Every per-column quantity that survives an iteration
+moves with its column; `pAp`, `rsnew`, `α` and `β` are recomputed each iteration and so are not moved.
+"""
+function _retire_and_compact!(C, ws::CGWorkspace, rtol, nlive::Integer, len::Integer)
+    w = 0
+    @inbounds for s in 1:nlive
+        if ws.rel[s] < rtol
+            _copy_col!(C, ws.perm[s], ws.x, s, len)      # final answer, to its own column
+            continue
+        end
+        w += 1
+        if w != s
+            _copy_col!(ws.x, w, ws.x, s, len)
+            _copy_col!(ws.r, w, ws.r, s, len)
+            _copy_col!(ws.p, w, ws.p, s, len)
+            _copy_col!(ws.rhs, w, ws.rhs, s, len)
+            ws.rsold[w] = ws.rsold[s]
+            ws.rel[w] = ws.rel[s]
+            ws.rhsnorm[w] = ws.rhsnorm[s]
+            # Swap, not assign: the retired originals stay somewhere in the tail, so `perm` remains a
+            # bijection over 1:B and can be asserted as one. Assigning leaves duplicates behind, which
+            # still scatters correctly today (only the live prefix is read) but is one refactor away
+            # from writing two columns to the same destination.
+            ws.perm[w], ws.perm[s] = ws.perm[s], ws.perm[w]
+        end
+    end
+    return w
+end
+
+_AtA!(Ap, p, ws::CGWorkspace, plan::NUSHTplan, k::Integer = plan.B) =
+    (nusht_type2!(ws.f, p, plan, k);
+     _nusht_true_adjoint!(Ap, ws.f, plan, k); Ap .*= ws.valid; Ap)
 
 """
     nusht_solve!(C, f, plan; ws=CGWorkspace(plan), maxiter=500, rtol=1e-6, verbose=false)
@@ -605,31 +700,46 @@ function nusht_solve!(
     copyto!(ws.p, ws.r)
     _col_dot!(ws.rsold, ws.r, ws.r)
     fill!(ws.rel, one(T))
-    fill!(ws.active, true)
-
-    iters = 0
-    for i in 1:maxiter
-        iters = i
-        _AtA!(ws.Ap, ws.p, ws, plan)
-        _col_dot!(ws.pAp, ws.p, ws.Ap)
-        @. ws.α = ifelse(ws.pAp == 0, zero(T), ws.rsold / ws.pAp)
-        _col_axpy!(ws.x, ws.α, ws.p, one(T))
-        _col_axpy!(ws.r, ws.α, ws.Ap, -one(T))
-        _col_dot!(ws.rsnew, ws.r, ws.r)
-        @. ws.rel = ifelse(ws.rhsnorm == 0, zero(T), sqrt(ws.rsnew) / ws.rhsnorm)
-        verbose && @info "nusht_solve! iter $i: rel_res=$(maximum(ws.rel))"
-        maximum(ws.rel) < rtol && break
-        @. ws.β = ifelse(ws.rsold == 0, zero(T), ws.rsnew / ws.rsold)
-        _col_pbp!(ws.p, ws.r, ws.β)
-        # Retire converged columns. Zeroing `p` AFTER `_col_pbp!` is what makes the rest no-op: next
-        # iteration `pAp = ⟨0, Ap⟩ = 0`, so the `pAp == 0` guard above sets `α = 0` and `x`, `r` hold.
-        # Doing it before would be undone by `p = r + β·0 = r`.
-        _retire_converged!(ws, rtol)
-        copyto!(ws.rsold, ws.rsnew)
+    @inbounds for b in 1:plan.B
+        ws.perm[b] = b
     end
 
-    copyto!(C, ws.x)
-    return C, iters, maximum(ws.rel)
+    # A column that reaches `rtol` is written out and dropped, and the survivors are packed into the
+    # front slots, so every transform runs at the live width rather than at `B`. `sizes` is the ladder
+    # of widths a plan set exists (or can be built) for.
+    len = _slicelen(plan)
+    nlive = plan.B
+    width = plan.B
+    iters = 0
+    worst = one(T)
+    for i in 1:maxiter
+        iters = i
+        _AtA!(ws.Ap, ws.p, ws, plan, width)
+        _col_dot!(ws.pAp, ws.p, ws.Ap, nlive)
+        @. ws.α = ifelse(ws.pAp == 0, zero(T), ws.rsold / ws.pAp)
+        _col_axpy!(ws.x, ws.α, ws.p, one(T), nlive)
+        _col_axpy!(ws.r, ws.α, ws.Ap, -one(T), nlive)
+        _col_dot!(ws.rsnew, ws.r, ws.r, nlive)
+        @. ws.rel = ifelse(ws.rhsnorm == 0, zero(T), sqrt(ws.rsnew) / ws.rhsnorm)
+        worst = _max_prefix(ws.rel, nlive)
+        verbose && @info "nusht_solve! iter $i: rel_res=$worst live=$nlive"
+        worst < rtol && break
+        @. ws.β = ifelse(ws.rsold == 0, zero(T), ws.rsnew / ws.rsold)
+        _col_pbp!(ws.p, ws.r, ws.β, nlive)
+        copyto!(ws.rsold, ws.rsnew)
+        n2 = _retire_and_compact!(C, ws, rtol, nlive, len)
+        if n2 != nlive
+            nlive = n2
+            nlive == 0 && break
+            width = _fit_width(nlive, plan.B)
+        end
+    end
+
+    # Whatever is still live at exit has not been written out yet.
+    @inbounds for s in 1:nlive
+        _copy_col!(C, ws.perm[s], ws.x, s, len)
+    end
+    return C, iters, worst
 end
 
 # ─────────────────────────────────────────────────────────────────────────────

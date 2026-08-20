@@ -179,14 +179,47 @@ Test.@testset "batched solve retires columns independently" begin
     Test.@test sqrt(sum(abs2, CB .- C1)) / sqrt(sum(abs2, C1)) < 1e-9
     Test.@test relB < 1e-6
 
-    # Retired columns must hold `p` at exactly zero. `_AtA!` skips them in the sphere loops, so their
-    # `Ap` slices go stale; `pAp = ⟨p, Ap⟩` is only harmless because `p` is zero there.
-    for b in 1:B
-        ws.active[b] && continue
-        Test.@test all(iszero, @view ws.p[:, :, b])
-    end
-    @info "retired $(count(!, ws.active)) of $B columns before the batch finished"
+    # `perm` maps slot -> original column. Compaction permutes it, and a retired column's answer is
+    # written out through it, so it must remain a permutation of 1:B — if it ever repeats an entry, two
+    # columns share a destination and one result is silently lost.
+    Test.@test sort(collect(ws.perm)) == collect(1:B)
     NUFSHT.close!(pB); NUFSHT.close!(p1)
+end
+
+# Column identity. Norm-based assertions cannot see a permutation: if column b's answer is written to
+# slot b', every magnitude still looks right. Each column here carries a distinct signature mode and is
+# checked to come back in its own slot, with the other columns' signatures absent from it.
+Test.@testset "batched solve keeps columns in their own slots" begin
+    Random.seed!(99)
+    lmax, M, B = 10, 900, 5
+    N, Nf = lmax + 1, 2lmax + 1
+    θ = acos.(2 .* rand(M) .- 1); φ = 2π .* rand(M)
+
+    # Column b is a single harmonic of degree `deg[b]` — a signature no other column carries. Distinct
+    # degrees also make the columns converge at different rates, so retirement is exercised.
+    deg = (2, 4, 6, 8, 10)
+    sig = [FastSphericalHarmonics.sph_mode(deg[b], deg[b] - 1) for b in 1:B]
+    Ct = zeros(N, Nf, B)
+    for b in 1:B
+        Ct[sig[b], b] = 1.0 + b            # distinct amplitude too, so a swap is unambiguous
+    end
+
+    p = NUFSHT.make_plan(Float64, θ, φ, lmax; ntrans = B)
+    f = zeros(M, B); NUFSHT.nusht_type2!(f, Ct, p)
+    C = zeros(N, Nf, B)
+    NUFSHT.nusht_solve!(C, f, p; rtol = 1e-10, maxiter = 600)
+
+    for b in 1:B
+        own = C[sig[b], b]
+        Test.@test isapprox(own, 1.0 + b; rtol = 1e-6)          # its own signature, right amplitude
+        for b2 in 1:B
+            b2 == b && continue
+            # No other column's signature may appear in slot b, at its amplitude or any other.
+            Test.@test abs(C[sig[b2], b]) < 1e-6 * (1.0 + b2)
+        end
+    end
+    @info "column identity held for $B columns with distinct signature degrees $deg"
+    NUFSHT.close!(p)
 end
 
 # Batching must not change the answer at ANY tolerance. A retired column is frozen by holding its `p`
