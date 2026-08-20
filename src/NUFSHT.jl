@@ -399,12 +399,13 @@ length-`M` / `(M, B)`.
 Algorithm `A = N·F·D·S`: forward rSHT (S) → DFS double (D) → torus FFT + half-pixel phase (F) →
 FINUFFT type 2 (N).
 """
-function nusht_type2!(f, C, plan::NUSHTplan{T}, k::Integer = plan.B) where {T}
+function nusht_type2!(f, C, plan::NUSHTplan{T}, k::Integer = plan.B,
+                      kdfn::Integer = k) where {T}
     _assert_coeffs(C, plan)
     _assert_field(f, plan)
     copyto!(plan.F, C)
     _sph_evaluate!(plan, k)
-    _dfn_synthesis!(plan, k)
+    _dfn_synthesis!(plan, kdfn)
     _copy_out!(f, _fbuf(plan), plan)
     return f
 end
@@ -446,11 +447,12 @@ Internal: the **exact Euclidean adjoint** of `nusht_type2!`. Identical to `nusht
 S† step applies `PS'·P'` (the matrix transpose of `PS·P`) via the conjugate FastTransforms plans,
 making `A†A` symmetric positive definite for CG. At CC-grid points it coincides with `nusht_type1!`.
 """
-function _nusht_true_adjoint!(C, f, plan::NUSHTplan{T}, k::Integer = plan.B) where {T}
+function _nusht_true_adjoint!(C, f, plan::NUSHTplan{T}, k::Integer = plan.B,
+                             kdfn::Integer = k) where {T}
     _assert_field(f, plan)
     _assert_coeffs(C, plan)
     _copy_field!(_fbuf(plan), f)
-    _dfn_analysis!(plan, k)
+    _dfn_analysis!(plan, kdfn)
     _sph_columns!(plan, k) do sl, _P, _PS, Padj, PSadj, b
         _load_slice!(sl, plan.F, plan, b)
         LinearAlgebra.lmul!(PSadj, sl)
@@ -669,9 +671,12 @@ function _retire_and_compact!(C, ws::CGWorkspace, rtol, nlive::Integer, len::Int
     return w
 end
 
-_AtA!(Ap, p, ws::CGWorkspace, plan::NUSHTplan, k::Integer = plan.B) =
-    (nusht_type2!(ws.f, p, plan, k);
-     _nusht_true_adjoint!(Ap, ws.f, plan, k); Ap .*= ws.valid; Ap)
+# `k` is the live column count, which the per-column sphere loops always narrow to. `kdfn` is the
+# width of the FFT/NUFFT plan set, which can only narrow where the backend's plans are
+# width-polymorphic (`_width_polymorphic`); elsewhere it stays at `B` and those transforms run wide.
+_AtA!(Ap, p, ws::CGWorkspace, plan::NUSHTplan, k::Integer = plan.B, kdfn::Integer = k) =
+    (nusht_type2!(ws.f, p, plan, k, kdfn);
+     _nusht_true_adjoint!(Ap, ws.f, plan, k, kdfn); Ap .*= ws.valid; Ap)
 
 """
     nusht_solve!(C, f, plan; ws=CGWorkspace(plan), maxiter=500, rtol=1e-6, verbose=false)
@@ -714,7 +719,7 @@ function nusht_solve!(
     worst = one(T)
     for i in 1:maxiter
         iters = i
-        _AtA!(ws.Ap, ws.p, ws, plan, width)
+        _AtA!(ws.Ap, ws.p, ws, plan, nlive, width)
         _col_dot!(ws.pAp, ws.p, ws.Ap, nlive)
         @. ws.α = ifelse(ws.pAp == 0, zero(T), ws.rsold / ws.pAp)
         _col_axpy!(ws.x, ws.α, ws.p, one(T), nlive)
@@ -731,7 +736,7 @@ function nusht_solve!(
         if n2 != nlive
             nlive = n2
             nlive == 0 && break
-            width = _fit_width(nlive, plan.B)
+            width = plan.pool_recipe.narrowable ? _fit_width(nlive, plan.B) : plan.B
         end
     end
 

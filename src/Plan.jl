@@ -154,10 +154,11 @@ end
     _empty_size_pool(fft_plan, ifft_plan, nufft_type2, nufft_type1) -> Vector
 
 Empty cache of size-dependent plan sets, one per working batch width, filled on demand by
-[`_build_width!`](@ref). The element type is taken from the plan's own full-width plans: neither the
-FFTW plan type nor the NUFFT plan type depends on the width or on `Array`-vs-view (measured — a plan
-for a prefix view has the identical type), so the type is known without building anything, and a
-`Vector` is already mutable so nothing about the plan struct needs to be.
+[`_build_width!`](@ref). The element type comes from the plan's own full-width plans, which is only
+valid where a narrower plan has the same type — true of FFTW (the width is not a plan type parameter,
+nor is `Array`-vs-view) and of FINUFFT, but **not** of every NUFFT backend. Pass `nwidths = 0` when
+[`_width_polymorphic`](@ref) is `false` for the backend; narrowing is then disabled and nothing is ever
+pushed. A `Vector` is already mutable, so nothing about the plan struct needs to be.
 """
 function _empty_size_pool(fft_plan, ifft_plan, nufft_type2, nufft_type1, nwidths::Integer)
     E = @NamedTuple{k::Int, fft_plan::typeof(fft_plan), ifft_plan::typeof(ifft_plan),
@@ -175,7 +176,8 @@ backend and the tuned thread/upsampling settings. Everything else — mode count
 nodes, realness — is read back off the plan when a width is built.
 """
 _pool_recipe(backend, nt2, uf2, nt1, uf1) =
-    (backend = backend, nt2 = Int(nt2), uf2 = Float64(uf2), nt1 = Int(nt1), uf1 = Float64(uf1))
+    (backend = backend, nt2 = Int(nt2), uf2 = Float64(uf2), nt1 = Int(nt1), uf1 = Float64(uf1),
+     narrowable = _width_polymorphic(backend))
 
 """
     _build_width!(plan, k) -> entry
@@ -617,9 +619,9 @@ function make_plan(
     # no extra storage; a spin plan negates them and owns a separate array.
     # Narrower plan sets are cached on first use, not built here: a solve whose columns converge
     # together never needs one, and building all of them eagerly costs ~2.7 ms per width.
-    size_pool = _empty_size_pool(fft_plan, ifft_plan, nufft_type2, nufft_type1,
-                                 length(_pool_sizes(B)))
     pool_recipe = _pool_recipe(nub, nt2, uf2, nt1, uf1)
+    size_pool = _empty_size_pool(fft_plan, ifft_plan, nufft_type2, nufft_type1,
+                                 pool_recipe.narrowable ? length(_pool_sizes(B)) : 0)
 
     nodes = _node_set(Val(variable_npts), θ, φ, θ, θ_shift, fbuf, nufft_type2, nufft_type1)
 

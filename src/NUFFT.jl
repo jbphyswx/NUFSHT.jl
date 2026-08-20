@@ -42,6 +42,20 @@ struct NonuniformFFTsBackend <: SpectralBackends.AbstractNUFFTSpectralBackend en
 @inline _ext_loaded(name::Symbol) = Base.get_extension(@__MODULE__, name) !== nothing
 
 """
+    _width_polymorphic(backend) -> Bool
+
+Whether plans for different transform counts share one concrete type. `false` by default, because a
+backend is free to carry the count in its plan's type parameters — `NonuniformFFTs.PlanNUFFT{Z,N,Nc,…}`
+does, while `FINUFFT.finufft_plan{T}` keeps it as a runtime field.
+
+A batched solve narrows its transforms as columns retire, which needs a cache of plan sets at several
+widths. That cache can only stay concretely typed where this is `true`; where it is `false`, narrowing
+is disabled and the solve runs at full width throughout. Correctness never depends on it.
+"""
+_width_polymorphic(::SpectralBackends.AbstractSpectralBackend) = false
+_width_polymorphic(::FINUFFTBackend) = true
+
+"""
     _resolve_nufft(backend) -> backend
 
 Concrete backends pass through. `AutoSpectralBackend` prefers a loaded fast backend — FINUFFT first,
