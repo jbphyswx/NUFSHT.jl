@@ -166,6 +166,8 @@ struct SpinNUSHTplan{T<:AbstractFloat, MT<:AbstractMatrix{T}, CT3<:AbstractArray
     wigner::W              # precomputed Δ-product table, or `nothing` for the on-the-fly recurrence
 end
 
+# Same convention as `make_plan`, except the field is complex when omitted: a spin field is complex in
+# general, and the folded real layout asserts something about the data that only the caller can state.
 """
     make_spin_plan([FE = ComplexF64,] θ_nodes, φ_nodes, lmax, s; tol=1e-10, ntrans=1, …)
 
@@ -180,8 +182,6 @@ coefficients satisfy the reality condition.
 [`make_plan`](@ref); there are no FastTransforms plans here, so only the FINUFFT settings are
 searched.
 """
-# Same convention as `make_plan`, except the field is complex when omitted: a spin field is complex in
-# general, and the folded real layout asserts something about the data that only the caller can state.
 make_spin_plan(θ_nodes, φ_nodes, lmax::Integer, s::Integer; kwargs...) =
     make_spin_plan(Complex{float(eltype(θ_nodes))}, θ_nodes, φ_nodes, lmax, s; kwargs...)
 

@@ -6,6 +6,29 @@
 make_plan
 NUSHTplan
 close!
+set_nodes!
+```
+
+### Node sets
+
+A plan's points can be moved without rebuilding it. The node set fixes whether the point *count* may
+change too.
+
+```@docs
+NUFSHT.AbstractNodeSet
+NUFSHT.FixedCountNodes
+NUFSHT.VariableCountNodes
+```
+
+### Plan tuning
+
+How hard plan construction searches for the library settings the problem does not fix.
+
+```@docs
+NUFSHT.AbstractPlanTuning
+NUFSHT.NoTuning
+NUFSHT.AutoTuning
+NUFSHT.ThoroughTuning
 ```
 
 ## Core transforms
@@ -29,6 +52,7 @@ SpinNUSHTplan
 nusht_type2_spin!
 nusht_type1_spin!
 nusht_solve_spin!
+WignerTable
 sYlm
 spin_coeff_index
 ```

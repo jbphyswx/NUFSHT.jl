@@ -89,6 +89,11 @@ function kernel_transfer(f::GaussianTransfer, ℓ)
     return exp(-ℓ * (ℓ + 1) * f.σ² / 2)
 end
 
+# Degree held by scalar slot `(i, j)`. Inverting `sph_mode(ℓ,m) = (ℓ-|m|+1, 2|m|+(m≥0))` gives
+# `|m| = j÷2`, `ℓ = i + |m| - 1`. Every slot carries a real mode — the array is square and invertible,
+# so rows past `ℓ = lmax` hold degrees `lmax < ℓ ≤ lmax+|m|` rather than padding.
+@inline _slot_degree(i::Int, j::Int) = i + (j ÷ 2) - 1
+
 """
     apply_transfer!(C, filter, lmax)
 
@@ -96,11 +101,6 @@ Multiply a FastSphericalHarmonics coefficient array `C` — size `(lmax+1, 2lmax
 `(lmax+1, 2lmax+1, B)` — in-place by the transfer function `H(ℓ)` for each degree `ℓ` (broadcast
 across the batch dimension).
 """
-# Degree held by scalar slot `(i, j)`. Inverting `sph_mode(ℓ,m) = (ℓ-|m|+1, 2|m|+(m≥0))` gives
-# `|m| = j÷2`, `ℓ = i + |m| - 1`. Every slot carries a real mode — the array is square and invertible,
-# so rows past `ℓ = lmax` hold degrees `lmax < ℓ ≤ lmax+|m|` rather than padding.
-@inline _slot_degree(i::Int, j::Int) = i + (j ÷ 2) - 1
-
 function apply_transfer!(C, filter, lmax)
     RT = real(eltype(C))
     n1, n2 = size(C, 1), size(C, 2)
