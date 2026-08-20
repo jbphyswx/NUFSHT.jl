@@ -104,10 +104,14 @@ across the batch dimension).
 function apply_transfer!(C, filter, lmax)
     RT = real(eltype(C))
     n1, n2 = size(C, 1), size(C, 2)
-    @inbounds for j in 1:n2
-        mabs = j ÷ 2
-        for i in 1:n1
-            h = RT(kernel_transfer(filter, i + mabs - 1))
+    # Sweep by degree, not by slot: `_slot_degree(i,j) = ℓ` inverts to `i = ℓ - j÷2 + 1`, so each
+    # degree is one diagonal and `kernel_transfer` is evaluated `2lmax+1` times rather than once per
+    # slot. `2lmax` is the largest degree the array holds. No table, so no allocation.
+    @inbounds for ℓ in 0:(2lmax)
+        h = RT(kernel_transfer(filter, ℓ))
+        for j in 1:n2
+            i = ℓ - (j ÷ 2) + 1
+            (1 <= i <= n1) || continue
             for b in axes(C, 3)
                 C[i, j, b] *= h
             end
@@ -122,8 +126,12 @@ end
 function _transfer_matrix(filter, lmax, ::Type{RT}) where {RT}
     n1, n2 = lmax + 1, 2lmax + 1
     H = Matrix{RT}(undef, n1, n2)
-    for j in 1:n2, i in 1:n1
-        H[i, j] = RT(kernel_transfer(filter, _slot_degree(i, j)))
+    for ℓ in 0:(2lmax)                      # every slot has exactly one degree here, so `undef` is filled
+        h = RT(kernel_transfer(filter, ℓ))
+        for j in 1:n2
+            i = ℓ - (j ÷ 2) + 1
+            1 <= i <= n1 && (H[i, j] = h)
+        end
     end
     return H
 end

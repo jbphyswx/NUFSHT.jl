@@ -41,3 +41,27 @@ Test.@testset "Kernel transfer functions" begin
         Test.@test NUFSHT._transfer_matrix(filt, lmax, Float64) == C
     end
 end
+
+# `kernel_transfer` must be evaluated once per DEGREE, not once per slot — the array holds
+# `(lmax+1)(2lmax+1)` slots spanning only `2lmax+1` degrees. Counted, not timed: deterministic, and it
+# pins the property rather than a wall-clock threshold.
+struct CountingTransfer
+    n::Base.RefValue{Int}
+end
+NUFSHT.kernel_transfer(f::CountingTransfer, ℓ::Integer) = (f.n[] += 1; 1.0)
+
+Test.@testset "transfer is evaluated once per degree" begin
+    for lmax in (8, 32, 64)
+        f = CountingTransfer(Ref(0))
+        NUFSHT.apply_transfer!(ones(lmax + 1, 2lmax + 1), f, lmax)
+        Test.@test f.n[] == 2lmax + 1                       # not (lmax+1)(2lmax+1)
+
+        g = CountingTransfer(Ref(0))
+        NUFSHT._transfer_matrix(g, lmax, Float64)
+        Test.@test g.n[] == 2lmax + 1
+    end
+    # Allocation-free: the degree sweep must not build a table.
+    C = ones(9, 17); filt = NUFSHT.gaussian_from_scale(200e3)
+    NUFSHT.apply_transfer!(C, filt, 8)
+    Test.@test (@allocated NUFSHT.apply_transfer!(C, filt, 8)) == 0
+end

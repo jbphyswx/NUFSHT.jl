@@ -130,7 +130,9 @@ function _build_sph_plans(Fslice, nt::Integer, flags::Integer)
         P  = FastTransforms.plan_sph2fourier(Fslice)
         PS = FastTransforms.plan_sph_synthesis(Fslice; flags = flags)
         PA = FastTransforms.plan_sph_analysis(Fslice; flags = flags)
-        return (P, PS, PA, P', PS')
+        # `P'` leaves `AdjointFTPlan.adjoint` undefined, which FastTransforms then resolves through an
+        # `UndefRefError` on every `lmul!`. Name the parent explicitly. (`PS'` already fills it in.)
+        return (P, PS, PA, FastTransforms.AdjointFTPlan(P, P), PS')
     end
 end
 
