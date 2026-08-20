@@ -188,3 +188,32 @@ Test.@testset "batched solve retires columns independently" begin
     @info "retired $(count(!, ws.active)) of $B columns before the batch finished"
     NUFSHT.close!(pB); NUFSHT.close!(p1)
 end
+
+# Batching must not change the answer at ANY tolerance. A retired column is frozen by holding its `p`
+# at zero; if that slips, `p` is rebuilt by `_col_pbp!` and contracts against the stale `Ap` left by
+# skipping the sphere loops, which puts arbitrary values into `α` and diverges the column. Sweeping
+# rtol matters: at some tolerances the loop exits before a corrupted column can grow, so a single
+# tolerance can pass while the mechanism is broken.
+Test.@testset "batched solve matches single-column at every tolerance" begin
+    Random.seed!(7)
+    lmax, M, B = 8, 150, 4                       # M/modes = 1.85, barely overdetermined
+    N, Nf = lmax + 1, 2lmax + 1
+    θ = acos.(2 .* rand(M) .- 1); φ = 2π .* rand(M)
+    F = randn(M, B)
+
+    pB = NUFSHT.make_plan(Float64, θ, φ, lmax; ntrans = B)
+    p1 = NUFSHT.make_plan(Float64, θ, φ, lmax)
+    for rtol in (1e-4, 1e-6, 1e-8)
+        CB = zeros(N, Nf, B)
+        _, itB, relB = NUFSHT.nusht_solve!(CB, F, pB; rtol = rtol, maxiter = 500)
+        Test.@test itB < 500                     # did not run away to maxiter
+        Test.@test relB < rtol
+        for b in 1:B
+            c = zeros(N, Nf)
+            NUFSHT.nusht_solve!(c, F[:, b], p1; rtol = rtol, maxiter = 500)
+            Test.@test maximum(abs, CB[:, :, b]) ≈ maximum(abs, c) rtol = 1e-6
+            Test.@test maximum(abs, CB[:, :, b] .- c) / maximum(abs, c) < 1e-4
+        end
+    end
+    NUFSHT.close!(pB); NUFSHT.close!(p1)
+end

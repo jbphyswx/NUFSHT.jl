@@ -558,11 +558,15 @@ end
 # columns — nothing stale ever reaches `x`. Asserted in the solve tests.
 function _retire_converged!(ws::CGWorkspace, rtol)
     n1, n2 = size(ws.p, 1), size(ws.p, 2)
+    z = zero(eltype(ws.p))
     @inbounds for b in eachindex(ws.active)
-        (ws.active[b] && ws.rel[b] < rtol) || continue
-        ws.active[b] = false
+        ws.active[b] && ws.rel[b] < rtol && (ws.active[b] = false)
+        # Every inactive column, not just the newly retired one: `_col_pbp!` rebuilds
+        # `p[b] = r[b] + β·p[b]` each iteration, so zeroing once lets it come back. A revived `p[b]`
+        # contracts against the stale `Ap[b]` that skipping the sphere loops leaves behind, which puts
+        # arbitrary values into `α[b]` and diverges `x[b]`.
+        ws.active[b] && continue
         off = (b - 1) * n1 * n2
-        z = zero(eltype(ws.p))
         @simd for i in 1:(n1 * n2)
             ws.p[off + i] = z
         end
