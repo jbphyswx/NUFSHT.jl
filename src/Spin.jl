@@ -39,9 +39,7 @@ export spin_coeff_index, sYlm
 Wigner small-d matrix element `d^ℓ_{mn}(β) = ⟨ℓm|exp(-iβ Jy)|ℓn⟩` in the Condon–Shortley basis, via
 the explicit alternating sum with log-gamma factorials for stability.
 
-The sum's sign is `(-1)^(k+m-n)`, not `(-1)^k`: the latter gives every element an extra `(-1)^(m-n)`,
-which is a rephasing `|ℓm⟩ → (-1)^m|ℓm⟩` and not this matrix. Accuracy degrades above `ℓ ≈ 40` — use
-[`_wigner_d_halfpi_step!`](@ref) for `β = π/2` at large `ℓ`.
+Accuracy degrades above `ℓ ≈ 40`; use [`_wigner_d_halfpi_step!`](@ref) for `β = π/2` at large `ℓ`.
 """
 function wigner_d(ℓ::Integer, m::Integer, n::Integer, β::Real)
     (abs(m) > ℓ || abs(n) > ℓ) && return 0.0
@@ -72,9 +70,6 @@ end
 Spin-weighted spherical harmonic `ₛY_{ℓm}(θ,φ) = N_ℓ d^ℓ_{m,−s}(θ) e^{imφ}` in the
 Goldberg / Newman–Penrose convention, with `d` the rotation matrix of [`wigner_d`](@ref). Provided for
 direct evaluation.
-
-Not a valid oracle for the transform on its own: both are built from the same `d`, so a sign error in
-`d` cancels in the comparison. `test/test_spin.jl` checks it against `exp(-iβ Jy)` instead.
 """
 sYlm(s::Integer, ℓ::Integer, m::Integer, θ::Real, φ::Real) = _Nℓ(ℓ) * wigner_d(ℓ, m, -s, θ) * cis(m * φ)
 
@@ -302,10 +297,6 @@ transposed). The recurrence runs downward in `m`, so storing `n` first makes eve
 contiguous and independent — Stage A, Stage B and the `n → −n` fill all vectorize — and it is also
 the order the contraction reads, since `Δ^ℓ_{m',m} = dl[m'+off, m+off]`. So the relation to
 [`wigner_d`](@ref) is transposed: `wigner_d(ℓ, m, n, π/2) == dl[n+off, m+off]`.
-
-The recurrence is verified directly against `exp(-i(π/2)Jy)` built from the angular-momentum matrices
-(`test/test_spin.jl`), not against `wigner_d` — the two agreed for a long time only because both
-carried the same `(-1)^(m-n)` error.
 
 Only the eighth `0 ≤ n ≤ m ≤ ℓ` is recurred; the rest is filled by the d(π/2) symmetries (transpose,
 m→−m, n→−n).

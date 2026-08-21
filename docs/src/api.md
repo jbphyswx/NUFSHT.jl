@@ -55,6 +55,8 @@ nusht_solve_spin!
 WignerTable
 sYlm
 spin_coeff_index
+NUFSHT.wigner_d
+NUFSHT._wigner_d_halfpi_step!
 ```
 
 ## Filtering
@@ -77,17 +79,16 @@ cutoff_degree
 
 ## Parallel execution
 
-Provided by the accelerator extensions (`using OhMyThreads` / `Distributed` / `MPI`). See the
-performance section of the README for the threads-vs-processes trade-offs.
+Parallelism is selected by a `ComputationalBackends.AbstractExecutionBackend` argument, with the
+backends themselves provided by the accelerator extensions (`using OhMyThreads` / `Distributed` /
+`MPI`). See the performance section of the README for the threads-vs-processes trade-offs.
+
+The collection entry points farm independent problems across a backend; `MPIBackend` instead
+decomposes a single transform's points across ranks.
 
 ```@docs
-nusht_type2_threaded!
-nusht_type1_threaded!
-nusht_solve_threaded!
-nusht_type2_distributed
-nusht_solve_distributed
-nusht_adjoint_mpi!
-nusht_solve_mpi!
+nusht_type2
+nusht_solve
 ```
 
 ## Plotting

@@ -661,10 +661,8 @@ function _retire_and_compact!(C, ws::CGWorkspace, rtol, nlive::Integer, len::Int
             ws.rsold[w] = ws.rsold[s]
             ws.rel[w] = ws.rel[s]
             ws.rhsnorm[w] = ws.rhsnorm[s]
-            # Swap, not assign: the retired originals stay somewhere in the tail, so `perm` remains a
-            # bijection over 1:B and can be asserted as one. Assigning leaves duplicates behind, which
-            # still scatters correctly today (only the live prefix is read) but is one refactor away
-            # from writing two columns to the same destination.
+            # Swap rather than assign: retired originals stay in the tail, keeping `perm` a bijection
+            # over 1:B. Assigning would leave duplicates, and two slots sharing a destination.
             ws.perm[w], ws.perm[s] = ws.perm[s], ws.perm[w]
         end
     end

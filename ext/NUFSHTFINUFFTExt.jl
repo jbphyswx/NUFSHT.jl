@@ -21,11 +21,10 @@ using FINUFFT: FINUFFT
      (I think this is directly analogous to what https://github.com/jipolanco/NonuniformFFTs.jl exploits for real data, e.g.
      https://jipolanco.github.io/NonuniformFFTs.jl/stable/benchmarks#Real-non-uniform-data)
 
-    STATUS: not yet done. The transform is real on both ends — `Fhat` is the FFT of a real doubled
-    field (so Hermitian) and `_copy_real!` discards the imaginary part of the output — so the θ mode
-    axis can be folded and the result taken as 2·Re(...), halving the mode count handed to FINUFFT.
-    That shrinks FINUFFT's internal upsampled FFT but not its spreading, so the payoff depends on the
-    M-vs-modes balance and must be measured per regime before it is turned on.
+    A real field's doubled map has a Hermitian spectrum, so a real-eltype plan hands this backend only
+    the non-negative θ wavenumbers, weighted `{1,2,…,2,1}`, and takes `Re` of the result. That shrinks
+    the upsampled FFT but not the spreading, so it applies only where modes dominate the point count
+    (`M < 2Nθ·Nφ`). The spin path is complex and passes the full mode array.
 =#
 
 NUFSHT._nufft_makeplan(::NUFSHT.FINUFFTBackend, ::AbstractVector, type, n_modes, iflag, ntrans, tol;
