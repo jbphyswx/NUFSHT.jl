@@ -1,3 +1,12 @@
+# `@allocated` measures the harness as well as the call. A keyword call written inline in testset
+# scope boxes its arguments on Julia 1.11 (464 B for the `nusht_filter!` line below, while the same
+# call through a function barrier in `test_allocs.jl` reports 0). Every count here therefore goes
+# through a barrier of fixed arity, so what is measured is the transform.
+_alloc_t2(f, C, p) = @allocated NUFSHT.nusht_type2!(f, C, p)
+_alloc_t1(C, f, p) = @allocated NUFSHT.nusht_type1!(C, f, p)
+_alloc_adj(C, f, p) = @allocated NUFSHT._nusht_true_adjoint!(C, f, p)
+_alloc_filt(o, f, ft, p, w) = @allocated NUFSHT.nusht_filter!(o, f, ft, p; ws = w)
+
 Test.@testset "Euclidean adjoint, zero-allocation, and batching" begin
     Random.seed!(7)
     lmax = 8
@@ -37,12 +46,12 @@ Test.@testset "Euclidean adjoint, zero-allocation, and batching" begin
         # FFTW/FINUFFT/FastTransforms internal threading (e.g. FINUFFT's FFTW-planner lock) adds small
         # external per-call allocations outside our control — there we only report the count.
         if Threads.nthreads() == 1
-            Test.@test (@allocated NUFSHT.nusht_type2!(out, C, plan)) == 0
-            Test.@test (@allocated NUFSHT.nusht_type1!(Cout, f, plan)) == 0
-            Test.@test (@allocated NUFSHT._nusht_true_adjoint!(Aty, f, plan)) == 0
-            Test.@test (@allocated NUFSHT.nusht_filter!(out, f, filt, plan; ws = ws)) == 0
+            Test.@test _alloc_t2(out, C, plan) == 0
+            Test.@test _alloc_t1(Cout, f, plan) == 0
+            Test.@test _alloc_adj(Aty, f, plan) == 0
+            Test.@test _alloc_filt(out, f, filt, plan, ws) == 0
         else
-            a = @allocated NUFSHT.nusht_filter!(out, f, filt, plan; ws = ws)
+            a = _alloc_filt(out, f, filt, plan, ws)
             @info "zero-alloc is a single-threaded guarantee. With $(Threads.nthreads()) Julia threads and nthreads=0 (all cores), nusht_filter! allocates $a B externally via FINUFFT/FFTW's thread-safe planner lock — build the plan with nthreads=1 (or run single-threaded) for zero allocation."
         end
     end
