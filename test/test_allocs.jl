@@ -55,7 +55,7 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
 
     for B in (1, 2)
         Test.@testset "scalar transform + CG (B=$B)" begin
-            plan = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-10, ntrans = B)
+            plan = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-10, ntrans = B, nthreads = 1)
             C = randn(Nθ, Nφ, B); f = zeros(M, B); Cout = zeros(Nθ, Nφ, B); out = zeros(M, B)
             NUFSHT.nusht_type2!(f, C, plan)
             mask = abs.(randn(M, B)) .+ 0.5; scratch = similar(out)
@@ -96,7 +96,7 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
 
         Test.@testset "spin transform + CG (B=$B)" begin
             s = 1
-            plan = NUFSHT.make_spin_plan(θ, φ, lmax, s; tol = 1e-10, ntrans = B)
+            plan = NUFSHT.make_spin_plan(θ, φ, lmax, s; tol = 1e-10, ntrans = B, nthreads = 1)
             sf = zeros(ComplexF64, Nθ, Nφ, B); fs = zeros(ComplexF64, M, B); sfo = zeros(ComplexF64, Nθ, Nφ, B)
             for b in 1:B, ℓ in abs(s):min(4, lmax), m in -ℓ:ℓ
                 sf[NUFSHT.spin_coeff_index(ℓ, m, lmax), b] = randn(ComplexF64)

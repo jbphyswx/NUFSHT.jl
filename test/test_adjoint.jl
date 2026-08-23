@@ -5,7 +5,10 @@ Test.@testset "Euclidean adjoint, zero-allocation, and batching" begin
     M = 400
     θ = π .* rand(M)
     φ = 2π .* rand(M)
-    plan = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-12)
+    # `nthreads = 1`: the zero-allocation guarantee is FINUFFT-single-threaded (see the alloc testset
+    # below). With the all-cores default FINUFFT takes its FFTW-planner lock per exec and allocates a
+    # little outside our control, which `nusht_filter!` multiplies since it now runs a solve.
+    plan = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-12, nthreads = 1)
 
     Test.@testset "scalar Euclidean adjoint ⟨Ax,y⟩ = ⟨x,A†y⟩ (scattered)" begin
         x = randn(Nθ, Nφ)
