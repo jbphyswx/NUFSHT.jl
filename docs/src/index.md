@@ -10,9 +10,9 @@ arbitrary scattered (colatitude, longitude) points.
 
 ![Synthesis and Accuracy](assets/synthesis_and_accuracy.png)
 
-### CG Inversion at Arbitrary Scattered Points
+### Inversion at Arbitrary Scattered Points
 
-![CG Inversion](assets/cg_inversion.png)
+![Inversion](assets/cg_inversion.png)
 
 ### Spectral Filtering
 
@@ -28,7 +28,7 @@ Given a field sampled at M arbitrary points on the sphere, NUFSHT.jl can:
 
 - **Synthesise** (Type 2): Evaluate a bandlimited field (given as SH coefficients) at any scattered point set in O(K log K + M) time.
 - **Analyse** (Type 1): Project scattered values back to SH coefficients; exact on the Clenshaw-Curtis (CC) quadrature grid.
-- **Solve** (CG): Exactly invert the synthesis operator at any scattered point set via Conjugate Gradients.
+- **Solve** (LSMR): Exactly invert the synthesis operator at any scattered point set.
 - **Filter**: Apply isotropic spectral filters (Gaussian, top-hat, custom) entirely in harmonic space.
 
 ## Quick start
@@ -52,7 +52,7 @@ C[sph_mode(2, 0)] = 1.0
 f = zeros(length(θ))
 nusht_type2!(f, C, plan)
 
-# Exact inversion via CG (for non-CC scattered points)
+# Exact inversion (for non-CC scattered points)
 C_rec = similar(plan.C)
 C_rec, iters, rel_res = nusht_solve!(C_rec, f, plan; rtol=1e-6)
 ```

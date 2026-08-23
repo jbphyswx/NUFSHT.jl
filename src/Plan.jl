@@ -123,16 +123,16 @@ end
 
 _thread_candidates() = sort!(unique!(Int[1, 2, 4, cld(Sys.CPU_THREADS, 2), Sys.CPU_THREADS]))
 
-# Every FastTransforms plan the S-step needs, under one pinned planner setting. `plan_sph2fourier` is
-# the butterfly step and takes no FFTW flags; the adjoints are built here to inherit the same setting.
+# The S-step is `plan_sph2fourier` and its adjoint — the whole of it. Its output is already the DFS
+# bivariate Fourier series, so no grid synthesis or analysis plan is needed. `plan_sph2fourier` is the
+# butterfly step and takes no FFTW flags; the planner count is pinned anyway, since FastTransforms and
+# FFTW.jl share one libfftw3 and the count is baked into a plan when it is built.
 function _build_sph_plans(Fslice, nt::Integer, flags::Integer)
     return _with_fftw_planner_nthreads(nt) do
-        P  = FastTransforms.plan_sph2fourier(Fslice)
-        PS = FastTransforms.plan_sph_synthesis(Fslice; flags = flags)
-        PA = FastTransforms.plan_sph_analysis(Fslice; flags = flags)
+        P = FastTransforms.plan_sph2fourier(Fslice)
         # `P'` leaves `AdjointFTPlan.adjoint` undefined, which FastTransforms then resolves through an
-        # `UndefRefError` on every `lmul!`. Name the parent explicitly. (`PS'` already fills it in.)
-        return (P, PS, PA, FastTransforms.AdjointFTPlan(P, P), PS')
+        # `UndefRefError` on every `lmul!`. Name the parent explicitly.
+        return (P, FastTransforms.AdjointFTPlan(P, P))
     end
 end
 
@@ -151,7 +151,7 @@ function _pool_sizes(B::Integer)
 end
 
 """
-    _empty_size_pool(fft_plan, ifft_plan, nufft_type2, nufft_type1) -> Vector
+    _empty_size_pool(nufft_type2, nufft_type1, nwidths) -> Vector
 
 Empty cache of size-dependent plan sets, one per working batch width, filled on demand by
 [`_build_width!`](@ref). The element type comes from the plan's own full-width plans, which is only
@@ -160,9 +160,8 @@ nor is `Array`-vs-view) and of FINUFFT, but **not** of every NUFFT backend. Pass
 [`_width_polymorphic`](@ref) is `false` for the backend; narrowing is then disabled and nothing is ever
 pushed. A `Vector` is already mutable, so nothing about the plan struct needs to be.
 """
-function _empty_size_pool(fft_plan, ifft_plan, nufft_type2, nufft_type1, nwidths::Integer)
-    E = @NamedTuple{k::Int, fft_plan::typeof(fft_plan), ifft_plan::typeof(ifft_plan),
-                    nufft_type2::typeof(nufft_type2), nufft_type1::typeof(nufft_type1)}
+function _empty_size_pool(nufft_type2, nufft_type1, nwidths::Integer)
+    E = @NamedTuple{k::Int, nufft_type2::typeof(nufft_type2), nufft_type1::typeof(nufft_type1)}
     pool = E[]
     sizehint!(pool, nwidths)      # final capacity is known, so filling it never regrows
     return pool
@@ -182,28 +181,21 @@ _pool_recipe(backend, nt2, uf2, nt1, uf1) =
 """
     _build_width!(plan, k) -> entry
 
-Build and cache the plan set for working width `k`, returning it. The FFT plans are built on
-contiguous prefix views of the full-width buffers, which is exact and needs no extra storage.
+Build and cache the NUFFT plan pair for working width `k`, returning it.
 
 Mutates `plan.size_pool`, so it is not safe to call concurrently on a shared plan — the same
 restriction a plan already carries, since a FINUFFT guru plan cannot be executed concurrently either.
 """
 function _build_width!(plan, k::Integer)
     r = plan.pool_recipe
-    realfield = eltype(plan.F̃) <: Real
     T = real(eltype(plan.Fhat))
     θn, φn = _θnufft(plan), _φnodes(plan)
     n_modes = Int64[size(plan.Fhat, 1), size(plan.Fhat, 2)]
-    modeord = isnothing(_θshift(plan)) ? 1 : 0
-    F̃k = view(plan.F̃, :, :, 1:k)
-    fp = realfield ? AbstractFFTs.plan_rfft(F̃k, (1, 2)) : AbstractFFTs.plan_fft(F̃k, (1, 2))
-    ip = realfield ? AbstractFFTs.plan_brfft(view(plan.Fhalf, :, :, 1:k), 2plan.Nθ, (1, 2)) :
-                     AbstractFFTs.plan_bfft(view(plan.Fhat, :, :, 1:k), (1, 2))
-    n2 = _make_nufft(r.backend, θn, 2, n_modes, +1, k, plan.tol, T, modeord, r.nt2, r.uf2)
-    n1 = _make_nufft(r.backend, θn, 1, n_modes, -1, k, plan.tol, T, modeord, r.nt1, r.uf1)
+    n2 = _make_nufft(r.backend, θn, 2, n_modes, +1, k, plan.tol, T, 0, r.nt2, r.uf2)
+    n1 = _make_nufft(r.backend, θn, 1, n_modes, -1, k, plan.tol, T, 0, r.nt1, r.uf1)
     _nufft_setpts!(n2, θn, φn); _nufft_setpts!(n1, θn, φn)
     _nufft_finalize!(n2); _nufft_finalize!(n1)
-    e = (k = Int(k), fft_plan = fp, ifft_plan = ip, nufft_type2 = n2, nufft_type1 = n1)
+    e = (k = Int(k), nufft_type2 = n2, nufft_type1 = n1)
     push!(plan.size_pool, e)
     return e
 end
@@ -236,12 +228,12 @@ function _time_candidate(f, bound::Float64, reps::Int = 3)
     return t
 end
 
-# One application of the two FFTW-planned S-step operators. The reset copy is in every candidate's
-# time, so it cannot bias the argmin, and it stops repeated application drifting the values.
-function _apply_sph!(PS, PA, src, scratch)
+# One application of the S-step and its adjoint. The reset copy is in every candidate's time, so it
+# cannot bias the argmin, and it stops repeated application drifting the values.
+function _apply_sph!(P, Padj, src, scratch)
     copyto!(scratch, src)
-    LinearAlgebra.lmul!(PS, scratch)
-    LinearAlgebra.lmul!(PA, scratch)
+    LinearAlgebra.lmul!(P, scratch)
+    LinearAlgebra.lmul!(Padj, scratch)
     return scratch
 end
 
@@ -268,9 +260,9 @@ function _tune_sph(Fslice::AbstractMatrix, tuning::AbstractPlanTuning)
     best_t = Inf
     warmed = false
     for flags in _sph_flagset(tuning), nt in _thread_candidates()
-        _, PS, PA, _, _ = _build_sph_plans(Fslice, nt, flags)
-        warmed || (_apply_sph!(PS, PA, src, scratch); warmed = true)
-        t = _time_candidate(() -> _apply_sph!(PS, PA, src, scratch), best_t)
+        P, Padj = _build_sph_plans(Fslice, nt, flags)
+        warmed || (_apply_sph!(P, Padj, src, scratch); warmed = true)
+        t = _time_candidate(() -> _apply_sph!(P, Padj, src, scratch), best_t)
         if t < best_t * _TUNING_MARGIN
             best_t = t
             best_cfg = (nt, UInt32(flags))
@@ -416,39 +408,24 @@ Fields:
 - `nodes`: the [`AbstractNodeSet`](@ref) holding `θ_nodes`, `φ_nodes` (colatitudes ∈ [0,π] and
   longitudes ∈ [0,2π) of the `M` points), the `(M, B)` strengths buffer `fbuf`, and the two FINUFFT
   guru plans. [`set_nodes!`](@ref) re-points it.
-The field element type `FE` selects the path: a real field's torus spectrum is Hermitian, so it takes
-`rfft`/`brfft` and gives the NUFFT only the `Nθ+1` non-negative θ wavenumbers; a complex field takes
-`fft`/`bfft` and the full mode array. Everything else is shared.
-
-- `C`, `F`, `F̃`: coefficient scratch / CC map `(Nθ, Nφ, B)` and doubled-torus map `(2Nθ, Nφ, B)`,
+- `C`, `F`: coefficient scratch and the bivariate Fourier coefficients `P·C`, both `(Nθ, Nφ, B)` with
   eltype `FE`
-- `Fhat`: complex modes handed to the NUFFT — `(Nθ+1, Nφ, B)` if `FE` is real, else `(2Nθ, Nφ, B)`
-- `phase_scaled`: `exp(-iπ k_θ / 2Nθ) / (2Nθ·Nφ)` — half-pixel θ correction and FFT normalization,
-  times the Hermitian fold weight `{1, 2, …, 2, 1}` in the real case
-- `phase_conj`: `conj(exp(-iπ k_θ / 2Nθ)) / (2Nθ·Nφ)`. No fold weight — `brfft` supplies that
-  doubling, and applying it twice breaks the adjoint identity.
-- `fft_plan`, `ifft_plan`: FFTW plans over dims `(1,2)`; the inverse is unnormalised, so the
-  `1/(2Nθ·Nφ)` lives in the phases.
+- `Fhat`: the `(2lmax+1, 2lmax+1, B)` complex mode array the NUFFT evaluates, assembled from `F` by
+  [`_assemble_modes!`](@ref). Both axes carry wavenumbers `-lmax…lmax`.
 - `Fslice`: `(Nθ, Nφ)` scratch `Matrix` each batch slice is `copyto!`-ed through for the S-step.
   FastTransforms has no `Float32` sphere plan, so it stays double precision and the copy converts.
-- `sph_plan`, `sph_plan_synth`, `sph_plan_analysis`: FastTransforms `plan_sph2fourier` (P),
-  `plan_sph_synthesis` (PS), `plan_sph_analysis` (PA) on a `(Nθ, Nφ)` slice. Forward S = `PS·P`
-  (`sph_evaluate!`); CC-inverse S⁻¹ = `P⁻¹·PA` (`nusht_type1!`, replicating `sph_transform!` with
-  persistent plans instead of its per-call rebuild); Euclidean adjoint S† = `P'·PS'`
-  (`_nusht_true_adjoint!`)
+- `sph_plan`, `sph_plan_adj`: FastTransforms `plan_sph2fourier` (P) and its adjoint on a `(Nθ, Nφ)`
+  slice. `P` alone is the whole S-step — its output is already the bivariate Fourier series, so
+  synthesis is `P·C` → assemble → one NUFFT, with no equiangular grid in between.
 
 `nodes.nufft_type2` is the guru type-2 plan (`iflag = +1`, synthesis N) and `nodes.nufft_type1` the
 type-1 plan (`iflag = -1`, adjoint N†). `iflag = +1` supplies the reconstruction sign directly, so the
-modes need no conjugate-transpose. The axis convention is `x = θ`, `y = φ`.
-
-Mode ordering follows the layout: a full-length θ axis uses FFTW-native order (`modeord = 1`), a
-half-length one centered order (`modeord = 0`), since no NUFFT offers non-negative wavenumbers on a
-single axis. `nodes.θ_shift` holds the `cis(N0·θ)` removing that offset, `nothing` otherwise.
+modes need no conjugate-transpose. The axis convention is `x = θ`, `y = φ`, and both mode axes are in
+centered order (`modeord = 0`), which is what `-lmax…lmax` already is.
 """
-struct NUSHTplan{T<:AbstractFloat, FE<:Number, AT3<:AbstractArray{FE,3}, DT3<:AbstractArray{FE,3},
-                 AT2<:AbstractMatrix, HT, CT3<:AbstractArray{Complex{T},3},
-                 CV<:AbstractVector{Complex{T}},
-                 ND<:AbstractNodeSet, FP, IP, SP, SPS, SPA, SPADJ, SPSADJ, SPL, SZP, RCP,
+struct NUSHTplan{T<:AbstractFloat, FE<:Number, AT3<:AbstractArray{FE,3},
+                 AT2<:AbstractMatrix, CT3<:AbstractArray{Complex{T},3},
+                 ND<:AbstractNodeSet, SP, SPADJ, SPL, SZP, RCP,
                  FT} <: AbstractNUSHTplan
     lmax::Int
     Nθ::Int
@@ -458,19 +435,10 @@ struct NUSHTplan{T<:AbstractFloat, FE<:Number, AT3<:AbstractArray{FE,3}, DT3<:Ab
     nodes::ND                     # the point-dependent half; see AbstractNodeSet
     C::AT3
     F::AT3
-    F̃::DT3
-    Fhalf::HT                     # rfft half-spectrum (Nθ+1, Nφ, B); `nothing` for a complex field
     Fhat::CT3
     Fslice::AT2
-    phase_scaled::CV
-    phase_conj::CV
-    fft_plan::FP
-    ifft_plan::IP
     sph_plan::SP
-    sph_plan_synth::SPS
-    sph_plan_analysis::SPA
-    sph_plan_adj::SPADJ           # sph_plan' (P'), stored to keep _nusht_true_adjoint! alloc-free
-    sph_plan_synth_adj::SPSADJ    # sph_plan_synth' (PS')
+    sph_plan_adj::SPADJ           # sph_plan' (P'), stored to keep the adjoint alloc-free
     sph_pool::SPL                 # per-task slice + plans for the threaded column loops; see _sph_pool
     size_pool::SZP                # narrower plan sets, cached on demand; see _empty_size_pool
     pool_recipe::RCP              # what building one needs that the plan cannot supply
@@ -535,7 +503,6 @@ function make_plan(
 
     Nθ = lmax + 1
     Nφ = 2lmax + 1
-    Nθ_dbl = 2Nθ
     M = length(θ_nodes)
 
     # Nodes keep their input array type (host `Vector` or device array), eltype coerced to `T`; every
@@ -543,48 +510,21 @@ function make_plan(
     θ = T.(θ_nodes)
     φ = T.(φ_nodes)
 
-    # A half-length mode axis shrinks the NUFFT's FFT but not its spreading, so it only pays when modes
-    # dominate. No NUFFT offers non-negative wavenumbers on one axis; centered order is a constant
-    # offset away, undone per point by `θ_shift`, which puts φ in centered order too.
-    Nθ_half = Nθ + 1
-    halfmodes = realfield && M < Nθ_dbl * Nφ
-    Nk = halfmodes ? Nθ_half : Nθ_dbl
-    C     = _zeros_like(θ, FE, Nθ, Nφ, B)
-    F     = _zeros_like(θ, FE, Nθ, Nφ, B)
-    F̃     = _zeros_like(θ, FE, Nθ_dbl, Nφ, B)
-    Fhat  = _zeros_like(θ, Complex{T}, Nk, Nφ, B)
-    Fhalf = realfield ? _zeros_like(θ, Complex{T}, Nθ_half, Nφ, B) : nothing
-    fbuf  = _zeros_like(θ, Complex{T}, M, B)
-    N0 = Nθ_half ÷ 2
-    θ_shift = halfmodes ? _to_like(θ, Complex{T}.(cis.(T(N0) .* θ))) : nothing
-
-    # FFTs act on the (θ̃, φ) plane only; the batch axis is left untransformed. Both inverses are the
-    # unnormalised ones, so the `1/(2Nθ·Nφ)` lives in `phase_conj` rather than in the plan.
-    fft_plan  = realfield ? AbstractFFTs.plan_rfft(F̃, (1, 2)) : AbstractFFTs.plan_fft(F̃, (1, 2))
-    ifft_plan = realfield ? AbstractFFTs.plan_brfft(Fhalf, Nθ_dbl, (1, 2)) :
-                            AbstractFFTs.plan_bfft(Fhat, (1, 2))
-
-    # Half-pixel θ phase for the CC cell-center offset, moved to the node backend so the
-    # `Fhat .*= phase_*` broadcast is device-resident. The real case folds `{1,2,…,2,1}` in here only:
-    # `brfft` applies the same doubling on the way back, so repeating it in `phase_conj` would break
-    # `⟨Ax,y⟩ = ⟨x,A†y⟩`. The Nyquist slot is `+Nθ` under the rephase and `-Nθ` in the padded array;
-    # its phase must be built at whichever sign the NUFFT uses, or that bin comes in negated.
-    k_θ = if halfmodes
-        collect(0:Nθ)
-    elseif realfield
-        [k < Nθ ? k : -Nθ for k in 0:Nθ]
-    else
-        [k < Nθ ? k : k - Nθ_dbl for k in 0:(Nθ_dbl - 1)]
-    end
-    herm = realfield ? [(k == 0 || k == Nθ) ? one(T) : T(2) for k in 0:Nθ] : ones(T, Nθ_dbl)
-    phase        = Complex{T}.(cis.(-π .* T.(k_θ) ./ Nθ_dbl))
-    phase_scaled = _to_like(θ, herm .* phase ./ (Nθ_dbl * Nφ))
-    phase_conj   = _to_like(θ, conj.(phase) ./ (Nθ_dbl * Nφ))
+    # `plan_sph2fourier` already yields the DFS bivariate Fourier series, so the NUFFT's mode array is
+    # assembled straight from it (`_assemble_modes!`): both axes carry wavenumbers -lmax…lmax, which is
+    # centered order (`modeord = 0`) exactly, with no offset to undo per point.
+    # θ reaches lmax+1: the supernumerary slots of the square coefficient array carry degrees up to
+    # `lmax+|m|`, and an odd-order column's last row is the sine at frequency `lmax+1`.
+    Nk = 2lmax + 3
+    C    = _zeros_like(θ, FE, Nθ, Nφ, B)
+    F    = _zeros_like(θ, FE, Nθ, Nφ, B)
+    Fhat = _zeros_like(θ, Complex{T}, Nk, Nφ, B)
+    fbuf = _zeros_like(θ, Complex{T}, M, B)
+    θ_shift = nothing
 
     # FastTransforms plans operate on a single dense (Nθ, Nφ) HOST `Matrix` (FastTransforms is CPU-only);
     # each batch slice is `copyto!`-ed through `Fslice` (host↔device for a device plan — the S-step is an
-    # inherent host bounce). Persistent P/PS/PA plans avoid `sph_transform!`'s per-call rebuild, and are
-    # built under a pinned FFTW planner thread count (see `_with_fftw_planner_nthreads`).
+    # inherent host bounce). A persistent P avoids a per-call rebuild.
     # FastTransforms has Float64 and ComplexF64 sphere plans but no Float32 ones, so this buffer is
     # always double precision; the slice copy that was already happening does the conversion, and
     # every other buffer runs at `FE`.
@@ -592,8 +532,7 @@ function make_plan(
     sph_nt, sph_flags = _tune_sph(Fslice, tuning)
     isnothing(ft_fftw_nthreads) || (sph_nt = Int(ft_fftw_nthreads))
     isnothing(ft_fftw_flags) || (sph_flags = UInt32(ft_fftw_flags))
-    sph_plan, sph_plan_synth, sph_plan_analysis, sph_plan_adj, sph_plan_synth_adj =
-        _build_sph_plans(Fslice, sph_nt, sph_flags)
+    sph_plan, sph_plan_adj = _build_sph_plans(Fslice, sph_nt, sph_flags)
     # Replicated only when there is something to thread, so a single-threaded plan pays no build cost
     # and no memory. Capped at `B`: more tasks than columns cannot help.
     sph_pool = _sph_pool(Fslice, min(Threads.nthreads(), B), sph_nt, sph_flags)
@@ -603,7 +542,7 @@ function make_plan(
     # (conj(c)·e^{-ikx} = c·e^{+ikx}). type 1 (−1) is the exact adjoint.
     tol64 = Float64(tol)
     n_modes = Int64[Nk, Nφ]
-    modeord = halfmodes ? 0 : 1
+    modeord = 0                               # centered: both axes run -lmax…lmax
     nub = _resolve_nufft(nufft)
     nt2, uf2 = _tune_nufft(nub, θ, φ, n_modes, 2, +1, B, T, tol64, modeord, tuning)
     nt1, uf1 = _tune_nufft(nub, θ, φ, n_modes, 1, -1, B, T, tol64, modeord, tuning)
@@ -620,19 +559,16 @@ function make_plan(
     # Narrower plan sets are cached on first use, not built here: a solve whose columns converge
     # together never needs one, and building all of them eagerly costs ~2.7 ms per width.
     pool_recipe = _pool_recipe(nub, nt2, uf2, nt1, uf1)
-    size_pool = _empty_size_pool(fft_plan, ifft_plan, nufft_type2, nufft_type1,
+    size_pool = _empty_size_pool(nufft_type2, nufft_type1,
                                  pool_recipe.narrowable ? length(_pool_sizes(B)) : 0)
 
     nodes = _node_set(Val(variable_npts), θ, φ, θ, θ_shift, fbuf, nufft_type2, nufft_type1)
 
-    return NUSHTplan{T, FE, typeof(C), typeof(F̃), typeof(Fslice), typeof(Fhalf), typeof(Fhat),
-                     typeof(phase_scaled), typeof(nodes),
-                     typeof(fft_plan), typeof(ifft_plan), typeof(sph_plan), typeof(sph_plan_synth),
-                     typeof(sph_plan_analysis), typeof(sph_plan_adj), typeof(sph_plan_synth_adj),
+    return NUSHTplan{T, FE, typeof(C), typeof(Fslice), typeof(Fhat), typeof(nodes),
+                     typeof(sph_plan), typeof(sph_plan_adj),
                      typeof(sph_pool), typeof(size_pool), typeof(pool_recipe), typeof(tol64)}(
-        lmax, Nθ, Nφ, B, tol64, nodes, C, F, F̃, Fhalf, Fhat, Fslice,
-        phase_scaled, phase_conj, fft_plan, ifft_plan, sph_plan, sph_plan_synth, sph_plan_analysis,
-        sph_plan_adj, sph_plan_synth_adj, sph_pool, size_pool, pool_recipe,
+        lmax, Nθ, Nφ, B, tol64, nodes, C, F, Fhat, Fslice,
+        sph_plan, sph_plan_adj, sph_pool, size_pool, pool_recipe,
     )
 end
 

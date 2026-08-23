@@ -2,7 +2,7 @@
     bench_guru.jl — M1 performance demonstration.
 
 Shows the effect of the guru-plan / zero-allocation rewrite: warmed-up transforms allocate nothing
-and never re-plan FINUFFT, so `nusht_solve!` (hundreds of CG matvecs) and `nusht_filter!` are fast,
+and never re-plan FINUFFT, so `nusht_solve!` (its solver matvecs) and `nusht_filter!` are fast,
 and a batched `ntrans = B` transform beats `B` separate single-field calls.
 
 Run from the package directory:
@@ -47,12 +47,12 @@ for (name, thunk, alloc) in (
     println(rpad(name, 16), rpad(us(t), 14), "alloc = ", alloc(), " B")
 end
 
-# CG solve (reuses the two guru plans across every matvec — no re-planning).
+# LSMR solve (reuses the two guru plans across every matvec — no re-planning).
 Csolve = zeros(Nθ, Nφ)
-ws = NUFSHT.CGWorkspace(plan)
+ws = NUFSHT.LSMRWorkspace(plan)
 tsolve = best_time(() -> NUFSHT.nusht_solve!(Csolve, f, plan; ws = ws, rtol = 1e-6, maxiter = 400), 3)
 _, iters, rel = NUFSHT.nusht_solve!(Csolve, f, plan; ws = ws, rtol = 1e-6, maxiter = 400)
-println("\nnusht_solve!  $iters CG iters, rel_res=$(round(rel; sigdigits = 2))  ->  ",
+println("\nnusht_solve!  $iters LSMR iters, rel_res=$(round(rel; sigdigits = 2))  ->  ",
         round(tsolve * 1e3; digits = 2), " ms  (", round(tsolve / (2iters) * 1e6; digits = 1), " µs / matvec)")
 
 # Batched throughput: one ntrans=B call vs B separate single-field calls.

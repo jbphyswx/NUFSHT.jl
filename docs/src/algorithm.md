@@ -2,114 +2,110 @@
 
 ## Overview
 
-NUFSHT.jl implements the **Double Fourier Sphere (DFS) + NUFFT** algorithm
-(Reinecke & Seljebotn 2013, Belkner et al. 2024). The synthesis operator
+NUFSHT.jl evaluates a spherical harmonic expansion at arbitrary scattered points by
+writing it as a **Double Fourier Sphere (DFS) bivariate Fourier series** and handing
+that series to a NUFFT. The synthesis operator
 ``A : \mathbb{R}^K \to \mathbb{R}^M`` (SH coefficients → scattered field values)
 is decomposed as:
 
 ```math
-A = N \cdot F \cdot D \cdot S
+A = N \cdot F \cdot S
 ```
-
-and evaluated efficiently by chaining four sub-operations:
 
 | Step | Name | Size in → out | Cost |
 |------|------|---------------|------|
-| **S** | Iso-latitude rSHT | ``K \to N_\theta \times N_\phi`` | ``O(K \log K)`` via FastTransforms |
-| **D** | DFS doubling | ``N_\theta \times N_\phi \to 2N_\theta \times N_\phi`` | ``O(K)`` |
-| **F** | 2D FFT + phase | ``2N_\theta \times N_\phi \to`` Fourier modes | ``O(K \log K)`` via FFTW |
+| **S** | `plan_sph2fourier` | ``K \to N_\theta \times N_\phi`` | ``O(K \log K)`` via FastTransforms |
+| **F** | `_assemble_modes!` | ``N_\theta \times N_\phi \to (2l_\text{max}+3) \times (2l_\text{max}+1)`` | ``O(K)`` |
 | **N** | NUFFT type 2 | Fourier modes ``\to \mathbb{R}^M`` | ``O(K \log K + M)`` via FINUFFT |
 
 where ``K = (l_\text{max}+1)(2l_\text{max}+1)`` is the number of SH coefficients and
 ``N_\theta = l_\text{max}+1``, ``N_\phi = 2l_\text{max}+1``.
 
-## The DFS doubling step
+## The bivariate Fourier series
 
-The Clenshaw-Curtis (CC) grid covers colatitudes ``\theta \in (0, \pi)`` on an
-open interval (no poles). The DFS method extends this to a doubly-periodic function
-on the torus ``[0, 2\pi) \times [0, 2\pi)`` by reflecting across the south pole:
+`plan_sph2fourier` already produces the DFS series — that is what the transform is
+for. There is no equiangular grid in the pipeline and nothing is doubled: forming
+grid samples and Fourier-transforming them back would be a round trip from Fourier
+coefficients to Fourier coefficients.
+
+For order ``m`` in the `sph_mode` column packing, the series `S` returns is
 
 ```math
-\tilde{F}[N_\theta + i,\, j] = F\bigl[N_\theta + 1 - i,\; \text{mod}_1(j + \lfloor N_\phi/2 \rfloor,\, N_\phi)\bigr]
-\quad i = 1,\ldots,N_\theta
+f(\theta,\varphi) = \sum_m \Phi_m(\varphi)\, N_m \sum_i G[i, c(m)]\, \Theta_{i,m}(\theta)
 ```
 
-The ``\phi + \pi`` shift ensures the reflected field is smooth across the south
-pole. The shift is implemented as `mod1(j + Nφ÷2, Nφ)` — a proper cyclic
-permutation valid for **any** ``N_\phi``, including odd values (``N_\phi = 2l_\text{max}+1``
-is always odd).
+with ``\Phi_m = \cos(|m|\varphi)`` on the ``+m`` column and ``\sin(|m|\varphi)`` on the
+``-m`` column, ``N_0 = 1/\sqrt{2\pi}``, ``N_{m \neq 0} = 1/\sqrt{\pi}``, and
 
-> **Subtle bug fixed:** The naive conditional shift ``j \leq N_\phi/2 \;?\; j + N_\phi/2 : j - N_\phi/2``
-> is **not a bijection** for odd ``N_\phi``: two columns map to the same target, silently
-> overwriting data. `mod1` fixes this.
+```math
+\Theta_{i,m}(\theta) = \begin{cases}
+\cos((i-1)\theta) & |m| \text{ even} \\
+\sin(i\theta) & |m| \text{ odd}
+\end{cases}
+```
+
+That parity is not a storage convention. The DFS extension of ``Y_{\ell m}`` in
+``\theta`` is ``\sin^{|m|}\theta \cdot Q(\cos\theta)``, which is even in ``\theta``
+for even ``m`` and odd for odd ``m`` — the same fact the glide reflection
+``f(\theta,\varphi) \mapsto f(2\pi-\theta, \varphi+\pi)`` encodes, expressed in a basis
+where it costs nothing.
+
+`_assemble_modes!` rewrites those cosines and sines as complex exponentials, giving the
+mode array the NUFFT evaluates. The ``\theta`` axis runs ``-(l_\text{max}+1) \ldots
+l_\text{max}+1``: the coefficient array is a *square, invertible* representation whose
+supernumerary slots hold degrees ``l_\text{max} < l \leq l_\text{max}+|m|``, and an
+odd-order column's last row is the sine at frequency ``l_\text{max}+1``.
 
 ## The adjoint
 
-The adjoint ``A^\dagger : \mathbb{R}^M \to \mathbb{R}^K`` reverses the chain:
+``A^\dagger : \mathbb{R}^M \to \mathbb{R}^K`` reverses the chain:
 
 ```math
-A^\dagger = S^\dagger \cdot D^\dagger \cdot F^\dagger \cdot N^\dagger
+A^\dagger = S^\dagger \cdot F^\dagger \cdot N^\dagger
 ```
-
-Each step has a corresponding adjoint:
 
 | Step | Forward | Adjoint |
 |------|---------|---------|
-| ``N`` | `nufft2d2` (type 2) | `nufft2d1` (type 1) |
-| ``F`` | FFT + phase ``e^{-i\pi k_\theta / N_\theta}`` | Conjugate phase + IFFT |
-| ``D`` | `dfs_double!` (shift ``+N_\phi/2``) | `dfs_fold!` (shift ``-N_\phi/2``, accumulate) |
-| ``S`` | `sph_evaluate!` (``PS \cdot P``) | `PS' \cdot P'`` (FastTransforms conjugate plans) |
+| ``N`` | NUFFT type 2 | NUFFT type 1 |
+| ``F`` | `_assemble_modes!` | `_assemble_modes_adjoint!` (gather, real part for a real array) |
+| ``S`` | `plan_sph2fourier` (``P``) | ``P'`` (FastTransforms conjugate plan) |
 
-### `nusht_type1!` vs `_nusht_true_adjoint!`
+`nusht_type1!` **is** ``A^\dagger`` — the transpose, not an inverse. At scattered
+points ``A^\dagger A \neq I``, and only quadrature on a grid makes the two coincide;
+for exact analysis of a field already sampled on the Clenshaw-Curtis grid use
+`FastSphericalHarmonics.sph_transform`. Inversion at scattered points is
+`nusht_solve!`.
 
-`nusht_type1!` uses `sph_transform!` for the ``S^\dagger`` step, which is the
-**exact inverse** of `sph_evaluate!` on the CC grid (not the Euclidean matrix transpose).
-On the CC grid, CC quadrature makes ``A^\dagger A = I`` so it gives machine-precision
-round-trips. Off the CC grid, it is only an approximation.
+## LSMR inversion (`nusht_solve!`)
 
-`nusht_solve!` uses `_nusht_true_adjoint!` internally, which applies
-``PS' \cdot P'`` (the exact matrix-transpose adjoint via FastTransforms conjugate plans).
-This makes ``A^\dagger A`` symmetric positive definite for **any** scattered point
-distribution, enabling guaranteed convergence of Conjugate Gradients.
-
-## The `dfs_fold!` adjoint identity
-
-Given the doubling operator ``D``, its matrix-transpose adjoint ``D^\dagger``
-satisfies:
+`nusht_solve!` solves
 
 ```math
-\langle D^\dagger \tilde{u},\, v \rangle = \langle \tilde{u},\, D v \rangle
-\quad \forall\, v \in \mathbb{R}^{N_\theta \times N_\phi},\; \tilde{u} \in \mathbb{R}^{2N_\theta \times N_\phi}
+\min_c \; \lVert A c - f \rVert
 ```
 
-In `dfs_fold!` this is:
+by **LSMR** (Fong & Saunders 2011) on the Golub–Kahan bidiagonalization of ``A``.
+One ``A`` and one ``A^\dagger`` per iteration, the same cost as conjugate gradients on
+the normal equations, but it works at ``\kappa(A)`` rather than ``\kappa(A)^2`` and
+decreases ``\lVert A^\dagger r \rVert`` — the quantity the solve reports and stops on —
+monotonically.
 
-```math
-F[i,j] = \tilde{F}[i,j] + \tilde{F}[2N_\theta + 1 - i,\; \text{mod}_1(j - \lfloor N_\phi/2 \rfloor,\, N_\phi)]
-```
+**Convergence** depends on ``\kappa(A)``, which is a property of the *point
+distribution*, not of `lmax`. Measured on the design matrix over the ``l \leq
+l_\text{max}`` modes at fourfold overdetermination:
 
-The **inverse** shift ``-N_\phi/2 \pmod{N_\phi}`` is essential: for odd ``N_\phi``,
-``+N_\phi/2`` and ``-N_\phi/2`` are different column permutations.
+| Point set | ``\kappa(A)`` | Iterations to ``10^{-10}`` |
+|-----------|---------------|---------------------------|
+| Golden-angle (Fibonacci) lattice | ``\approx 1.04`` | ``\approx 6`` |
+| i.i.d. area-uniform | ``3`` – ``7`` | ``\approx 40`` |
+| Half the points in a small polar cap | ``40`` – ``80`` | ``O(100)`` |
 
-## Conjugate Gradient inversion (`nusht_solve!`)
-
-`nusht_solve!` solves the normal equations:
-
-```math
-(A^\dagger A)\, c = A^\dagger f
-```
-
-using the standard Conjugate Gradient algorithm. Since ``A^\dagger A`` is symmetric
-positive definite (with the true Euclidean adjoint), CG converges monotonically.
-
-**Convergence** depends on the condition number ``\kappa(A^\dagger A)``, which
-scales with the point distribution. For jittered-uniform points with ``M \approx 4K``,
-typical iteration counts are ``O(100)``–``O(500)`` for ``l_\text{max} \leq 20``.
-
-**Note:** `nusht_solve!` recovers the field ``f`` to the NUFFT tolerance but does
-not necessarily recover the exact input coefficients ``c_\text{true}`` if the
-true field was generated from a narrower bandwidth than `lmax`. The CG solution
-is the minimum-norm least-squares solution.
+**Note:** the fit is over the ``(l_\text{max}+1)^2`` modes with ``l \leq l_\text{max}``,
+which is the only ``SO(3)``-invariant choice; the supernumerary slots of the coefficient
+array are excluded from the fit even though synthesis uses them. If the point set does
+not determine those coefficients (``M`` below ``(l_\text{max}+1)^2``), the solve returns
+the minimum-norm least-squares solution and reports `converged = false` when it cannot
+reach `rtol`.
 
 ## Phase convention
 

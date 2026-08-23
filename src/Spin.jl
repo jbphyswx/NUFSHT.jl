@@ -19,7 +19,7 @@ evaluated at scattered points by one 2-D NUFFT. The `e^{−im'θ}` factor is abs
 the **negated** colatitudes `−θ` with `iflag = +1`, so the mode array `G` (CMCL-centered) maps
 directly to the NUFFT modes — no per-call axis-reversal. Analysis is the exact Euclidean adjoint
 (FINUFFT type 1 at `−θ`, `iflag = −1`, + the transpose Δ-contraction); `nusht_solve_spin!` inverts by
-conjugate gradients on the normal equations. Like the scalar plan, the FINUFFT guru plans are built
+LSMR on the bidiagonalization of `A`. Like the scalar plan, the FINUFFT guru plans are built
 once (points set once) so the solver's matvecs never re-plan.
 
 Coefficients use a dense `(lmax+1) × (2lmax+1)` layout: `sf[ℓ+1, m+lmax+1]`. Spin `s = ±1` is the
@@ -29,7 +29,7 @@ tangent-vector case (`U = u_θ + i u_φ`), enabling vector/Helmholtz operations 
 using LinearAlgebra: LinearAlgebra
 using SpecialFunctions: loggamma
 
-export SpinNUSHTplan, make_spin_plan, SpinCGWorkspace, WignerTable
+export SpinNUSHTplan, make_spin_plan, WignerTable
 export nusht_type2_spin!, nusht_type1_spin!, nusht_solve_spin!
 export spin_coeff_index, sYlm
 
@@ -89,7 +89,7 @@ combination of the Wigner-d(π/2) planes that the spin contraction reads. It dep
 on any number of threads.
 
 Without a table the whole `O(lmax³)` Trapani–Navaza sweep is regenerated on every transform — twice
-per CG iteration in [`nusht_solve_spin!`](@ref), where the planes are identical every time. With one,
+per solver iteration in [`nusht_solve_spin!`](@ref), where the planes are identical every time. With one,
 that sweep is paid once and the contraction additionally runs `ℓ`-innermost, keeping each output
 column of `G` hot across the degree sum instead of re-streaming `G` once per degree.
 
@@ -507,119 +507,62 @@ function nusht_type1_spin!(sf, f, plan::SpinNUSHTplan{T}) where {T}
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Exact inversion: batched complex CG on the normal equations A†A sf = A† f
+# Exact inversion: batched LSMR, sharing the core in NUFSHT.jl
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
-    SpinCGWorkspace(plan)
+    LSMRWorkspace(plan::SpinNUSHTplan)
 
-Reusable scratch for [`nusht_solve_spin!`](@ref) (allocation-free repeated solves; per-column scalars
-so a batched solve equals `B` independent single-column solves).
+Reusable scratch for [`nusht_solve_spin!`](@ref) — the same workspace the scalar path uses, at complex
+element type and with no `valid` projection: the spin coefficient array is dense, with no
+supernumerary slots to exclude.
 """
-struct SpinCGWorkspace{CT3<:AbstractArray, CT2<:AbstractMatrix, VT<:AbstractVector}
-    x::CT3
-    r::CT3
-    p::CT3
-    Ap::CT3
-    rhs::CT3
-    f::CT2
-    rsold::VT
-    rsnew::VT
-    pAp::VT
-    α::VT
-    β::VT
-    rel::VT
-    rhsnorm::VT
-end
-
-function SpinCGWorkspace(plan::SpinNUSHTplan{T}) where {T}
-    lmax = plan.lmax; B = plan.B; M = _spin_npts(plan)
-    # Buffers shaped like the plan's (so a device plan gets a device workspace).
-    z3() = _zeros_like(plan.G, Complex{T}, lmax + 1, 2lmax + 1, B)
+function LSMRWorkspace(plan::SpinNUSHTplan{T}) where {T}
+    lmax, B, M = plan.lmax, plan.B, _spin_npts(plan)
+    CT = Complex{T}
+    z3() = _zeros_like(plan.G, CT, lmax + 1, 2lmax + 1, B)
     vB() = _zeros_like(_θnodes(plan), T, B)
-    return SpinCGWorkspace(z3(), z3(), z3(), z3(), z3(), _zeros_like(_fbuf(plan), Complex{T}, M, B),
-                           vB(), vB(), vB(), vB(), vB(), vB(), vB())
+    hB() = zeros(T, B)
+    nrm, cf = vB(), vB()
+    return LSMRWorkspace(z3(), z3(), z3(), z3(), z3(), _zeros_like(_fbuf(plan), CT, M, B),
+                         nothing, collect(1:B),
+                         nrm, cf, _host_mirror(nrm), _host_mirror(cf),
+                         hB(), hB(), hB(), hB(), hB(), hB(), hB(), hB(),
+                         hB(), hB(), hB(), hB(), hB(), hB(), hB())
 end
 
-# Per-column Hermitian reductions / updates over a (…, B) complex array — zero-allocation.
-function _col_hdot!(dst, a, b)
-    @inbounds for k in axes(a, 3)
-        s = zero(real(eltype(a)))
-        for j in axes(a, 2), i in axes(a, 1)
-            s += real(conj(a[i, j, k]) * b[i, j, k])
-        end
-        dst[k] = s
-    end
-    return dst
+@inline _coefflen(plan::SpinNUSHTplan) = (plan.lmax + 1) * (2plan.lmax + 1)
+# The spin transform has no width-narrowing machinery — `_assemble_G!` and the NUFFT are built for `B`
+# columns — so compaction here reduces the per-column vector work only.
+@inline _lsmr_widths(plan::SpinNUSHTplan, ::Integer) = (plan.B, plan.B)
+@inline _assert_solve(sf, f, plan::SpinNUSHTplan) =
+    (_assert_spin_coeffs(sf, plan); _assert_spin_field(f, plan))
+
+_add_out!(f, fbuf, plan::SpinNUSHTplan, n) = _add_out!(f, fbuf, _θshift(plan), n)
+_add_out!(f, fbuf, ::Nothing, n) = _add_field!(f, fbuf, n)
+_add_out!(f, fbuf, ::AbstractVector, n) = _add_real!(f, fbuf, n)
+
+# `u ← A v − α u`, with `A v` landing in the plan's own strengths buffer so no second point-space
+# array is needed: scale `u` first, then accumulate the synthesis onto it.
+function _lsmr_Av_axpy!(ws::LSMRWorkspace, plan::SpinNUSHTplan, ::Integer, ::Integer, n::Integer)
+    _col_scale!(ws.u, ws.cf, n)
+    _assemble_G!(plan.G, ws.v, plan)
+    _nufft_exec!(_nufft2(plan), plan.G, _fbuf(plan))
+    _rephase!(_fbuf(plan), _θshift(plan))
+    return _add_out!(ws.u, _fbuf(plan), plan, n)
 end
 
-function _col_axpy_c!(y, α, x, σ)   # y[:,:,k] += σ·α[k]·x[:,:,k], α real
-    @inbounds for k in axes(y, 3)
-        c = σ * α[k]
-        for j in axes(y, 2), i in axes(y, 1)
-            y[i, j, k] += c * x[i, j, k]
-        end
-    end
-    return y
-end
-
-function _col_pbp_c!(p, r, β)       # p[:,:,k] = r[:,:,k] + β[k]·p[:,:,k], β real
-    @inbounds for k in axes(p, 3)
-        c = β[k]
-        for j in axes(p, 2), i in axes(p, 1)
-            p[i, j, k] = r[i, j, k] + c * p[i, j, k]
-        end
-    end
-    return p
-end
-
-function _AtA_spin!(Ap, p, ws::SpinCGWorkspace, plan::SpinNUSHTplan)
-    nusht_type2_spin!(ws.f, p, plan)
-    nusht_type1_spin!(Ap, ws.f, plan)
-    return Ap
+function _lsmr_Atu!(ws::LSMRWorkspace, plan::SpinNUSHTplan, ::Integer, ::Integer)
+    nusht_type1_spin!(ws.w, ws.u, plan)
+    return ws.w
 end
 
 """
-    nusht_solve_spin!(sf, f, plan; ws=SpinCGWorkspace(plan), maxiter=500, rtol=1e-8, verbose=false)
+    nusht_solve_spin!(sf, f, plan; ws=LSMRWorkspace(plan), maxiter=500, rtol=1e-8, conlim=0, verbose=false)
 
-Exact inversion of the spin-weighted synthesis at arbitrary scattered points: solve `A sf = f` by
-conjugate gradients on the normal equations `(A†A) sf = A† f`. Batched (`B > 1`) runs the columns as
-independent single-column CGs. Returns `(sf, iters, rel_res)` with `rel_res = max_k ‖r_k‖/‖A†f_k‖`.
+Exact inversion of the spin-weighted synthesis at arbitrary scattered points: solve
+`min ‖A sf − f‖` by LSMR on the Golub–Kahan bidiagonalization of `A`. Batched (`B > 1`) runs the
+columns as independent single-column solves. Same contract and return as [`nusht_solve!`](@ref).
 """
-function nusht_solve_spin!(
-    sf, f, plan::SpinNUSHTplan{T};
-    ws::SpinCGWorkspace = SpinCGWorkspace(plan),
-    maxiter::Int = 500,
-    rtol::Real = 1e-8,
-    verbose::Bool = false,
-) where {T}
-    nusht_type1_spin!(ws.rhs, f, plan)
-    _col_hdot!(ws.rhsnorm, ws.rhs, ws.rhs)
-    ws.rhsnorm .= sqrt.(ws.rhsnorm)
-
-    fill!(ws.x, zero(Complex{T}))
-    copyto!(ws.r, ws.rhs)
-    copyto!(ws.p, ws.r)
-    _col_hdot!(ws.rsold, ws.r, ws.r)
-    fill!(ws.rel, one(T))
-
-    iters = 0
-    for i in 1:maxiter
-        iters = i
-        _AtA_spin!(ws.Ap, ws.p, ws, plan)
-        _col_hdot!(ws.pAp, ws.p, ws.Ap)
-        @. ws.α = ifelse(ws.pAp == 0, zero(T), ws.rsold / ws.pAp)
-        _col_axpy_c!(ws.x, ws.α, ws.p, one(T))
-        _col_axpy_c!(ws.r, ws.α, ws.Ap, -one(T))
-        _col_hdot!(ws.rsnew, ws.r, ws.r)
-        @. ws.rel = ifelse(ws.rhsnorm == 0, zero(T), sqrt(ws.rsnew) / ws.rhsnorm)
-        verbose && @info "nusht_solve_spin! iter $i rel_res=$(maximum(ws.rel))"
-        maximum(ws.rel) < rtol && break
-        @. ws.β = ifelse(ws.rsold == 0, zero(T), ws.rsnew / ws.rsold)
-        _col_pbp_c!(ws.p, ws.r, ws.β)
-        copyto!(ws.rsold, ws.rsnew)
-    end
-
-    copyto!(sf, ws.x)
-    return sf, iters, maximum(ws.rel)
-end
+nusht_solve_spin!(sf, f, plan::SpinNUSHTplan; ws::LSMRWorkspace = LSMRWorkspace(plan), kwargs...) =
+    _lsmr!(sf, f, plan, ws; kwargs...)

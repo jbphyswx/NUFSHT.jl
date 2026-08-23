@@ -23,10 +23,13 @@ Test.@testset "Euclidean adjoint, zero-allocation, and batching" begin
         C = randn(Nθ, Nφ); f = randn(M); out = zeros(M)
         Cout = zeros(Nθ, Nφ); Aty = zeros(Nθ, Nφ)
         filt = NUFSHT.gaussian_from_scale(2000e3)
+        # Filtering fits coefficients, so it needs a solver workspace; supplying one is what makes it
+        # allocation-free, exactly as the docstring says.
+        ws = NUFSHT.LSMRWorkspace(plan)
         NUFSHT.nusht_type2!(out, C, plan)          # warmup
         NUFSHT.nusht_type1!(Cout, f, plan)
         NUFSHT._nusht_true_adjoint!(Aty, f, plan)
-        NUFSHT.nusht_filter!(out, f, filt, plan)
+        NUFSHT.nusht_filter!(out, f, filt, plan; ws = ws)
         # The zero-alloc guarantee holds single-threaded. Under a multithreaded Julia,
         # FFTW/FINUFFT/FastTransforms internal threading (e.g. FINUFFT's FFTW-planner lock) adds small
         # external per-call allocations outside our control — there we only report the count.
@@ -34,9 +37,9 @@ Test.@testset "Euclidean adjoint, zero-allocation, and batching" begin
             Test.@test (@allocated NUFSHT.nusht_type2!(out, C, plan)) == 0
             Test.@test (@allocated NUFSHT.nusht_type1!(Cout, f, plan)) == 0
             Test.@test (@allocated NUFSHT._nusht_true_adjoint!(Aty, f, plan)) == 0
-            Test.@test (@allocated NUFSHT.nusht_filter!(out, f, filt, plan)) == 0
+            Test.@test (@allocated NUFSHT.nusht_filter!(out, f, filt, plan; ws = ws)) == 0
         else
-            a = @allocated NUFSHT.nusht_filter!(out, f, filt, plan)
+            a = @allocated NUFSHT.nusht_filter!(out, f, filt, plan; ws = ws)
             @info "zero-alloc is a single-threaded guarantee. With $(Threads.nthreads()) Julia threads and nthreads=0 (all cores), nusht_filter! allocates $a B externally via FINUFFT/FFTW's thread-safe planner lock — build the plan with nthreads=1 (or run single-threaded) for zero allocation."
         end
     end

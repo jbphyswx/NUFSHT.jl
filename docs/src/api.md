@@ -97,18 +97,11 @@ nusht_solve
 plot_field
 ```
 
-## DFS utilities (internal / advanced)
-
-```@docs
-NUFSHT.dfs_double
-NUFSHT.dfs_fold
-NUFSHT.dfs_grid_coords
-NUFSHT.dfs_doubled_grid_coords
-```
-
 ## Internal helpers
 
 ```@docs
 NUFSHT.apply_transfer!
 NUFSHT._nusht_true_adjoint!
+NUFSHT._assemble_modes!
+NUFSHT._assemble_modes_adjoint!
 ```

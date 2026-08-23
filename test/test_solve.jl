@@ -1,45 +1,28 @@
-Test.@testset "nusht_solve!: exact CG inverse at non-CC scattered points" begin
-    Random.seed!(42)
-
+# A field check alone cannot tell a good solve from a bad one: on a near-degenerate point set the
+# field is reproduced while the coefficients are meaningless. So the fixture's conditioning is
+# asserted, and the coefficients themselves are what is checked.
+Test.@testset "nusht_solve!: exact inverse at non-CC scattered points" begin
     lmax = 10
-    N = lmax + 1
-    Nφ = 2lmax + 1
-    N_modes = N^2  # = (lmax+1)^2 total modes
+    M = 4 * (lmax + 1)^2
+    θ_nodes, φ_nodes = fib_points(M)
+    plan = NUFSHT.make_plan(θ_nodes, φ_nodes, lmax; tol = 1e-12, nthreads = 1)
+    Test.@test cond_A(first(design_matrix(plan, lmax, M))) < 1.2   # the fixture really is benign
 
-    # Jittered-from-uniform scattered points on the sphere (M = 4x overdetermined).
-    # Per the FINUFFT tutorial, jittered points are well-conditioned; iid random
-    # points can have condition number ~900 and require many more CG iterations.
-    M = 4 * N_modes
-    # Generate near-equidistributed points via latitude-band jitter
-    φ_base = (2π / M) .* (0:M-1)
-    θ_base = acos.(clamp.(2 .* ((0:M-1) .+ 0.5) ./ M .- 1, -1.0, 1.0))
-    θ_nodes = θ_base .+ (rand(M) .- 0.5) .* (0.4 * π / sqrt(M))
-    φ_nodes = mod.(φ_base .+ (rand(M) .- 0.5) .* (0.4 * 2π / sqrt(M)), 2π)
-    θ_nodes = clamp.(θ_nodes, 1e-10, π - 1e-10)
+    C_true = rand_coeffs(lmax, 42)
+    f_true = zeros(M); NUFSHT.nusht_type2!(f_true, C_true, plan)
 
-    plan = NUFSHT.make_plan(θ_nodes, φ_nodes, lmax; tol=1e-10)
-
-    # True band-limited coefficients (only a few modes set)
-    C_true = zeros(N, Nφ)
-    for ℓ in 1:min(4, lmax), m in -ℓ:ℓ
-        C_true[FastSphericalHarmonics.sph_mode(ℓ, m)] = randn()
-    end
-
-    # Synthesise exact scattered field values from C_true
-    f_true = zeros(M)
-    NUFSHT.nusht_type2!(f_true, C_true, plan)
-
-    # Solve for coefficients via CG
     C_solved = similar(plan.C)
-    _, iters, rel_res = NUFSHT.nusht_solve!(C_solved, f_true, plan; rtol=1e-6, maxiter=1000)
+    _, iters, rel_res, converged = NUFSHT.nusht_solve!(C_solved, f_true, plan; rtol = 1e-10, maxiter = 200)
+    Test.@test converged
+    Test.@test converged == (rel_res < 1e-10)
+    Test.@test iters < 30                                          # cond(A) ≈ 1 ⇒ a few iterations
 
-    # Recovered field should match f_true to NUFFT tolerance
-    f_recovered = zeros(M)
-    NUFSHT.nusht_type2!(f_recovered, C_solved, plan)
-    rms_f = sqrt(Statistics.mean(abs2.(f_true)) + 1e-30)
-    rms_err = sqrt(Statistics.mean(abs2.(f_recovered .- f_true)))
-    @info "nusht_solve! (lmax=$lmax, M=$M): iters=$iters rel_res=$(round(rel_res,sigdigits=3)) field_rms_err/rms_f=$(round(rms_err/rms_f,sigdigits=3))"
-    Test.@test rms_err < 1e-3 * rms_f
+    f_recovered = zeros(M); NUFSHT.nusht_type2!(f_recovered, C_solved, plan)
+    @info "nusht_solve! (lmax=$lmax, M=$M): iters=$iters rel_res=$(round(rel_res, sigdigits = 3)) " *
+          "coeff=$(relerr(C_solved, C_true)) field=$(relerr(f_recovered, f_true))"
+    Test.@test relerr(C_solved, C_true) < 1e-8
+    Test.@test relerr(f_recovered, f_true) < 1e-9
+    NUFSHT.close!(plan)
 end
 
 Test.@testset "nusht_type2! accuracy: synthesis from true coefficients" begin
@@ -144,10 +127,11 @@ Test.@testset "nusht_solve! is rotation equivariant" begin
     Test.@test rel < 0.02
 end
 
-# Batched CG retires each column at its own tolerance and skips it in the sphere-operator loops. The
-# columns are independent, so the batched answer must equal solving them one at a time. Iteration
-# counts are NOT comparable across runs — multithreaded FINUFFT spreading is not bit-deterministic and
-# CG amplifies it — so this asserts the mechanism's invariants, not a count.
+# The batched solve retires each column at its own tolerance, dropping it from the live prefix and
+# packing the survivors forward so the transforms narrow. The columns are independent, so the batched
+# answer must equal solving them one at a time. Iteration counts are NOT comparable across runs —
+# multithreaded FINUFFT spreading is not bit-deterministic and the iteration amplifies it — so this
+# asserts the mechanism's invariants, not a count.
 Test.@testset "batched solve retires columns independently" begin
     Random.seed!(11)
     lmax, M, B = 12, 676, 4
@@ -164,9 +148,10 @@ Test.@testset "batched solve retires columns independently" begin
 
     pB = NUFSHT.make_plan(Float64, θ, φ, lmax; ntrans = B)
     fB = zeros(M, B); NUFSHT.nusht_type2!(fB, Ct, pB)
-    ws = NUFSHT.CGWorkspace(pB)
+    ws = NUFSHT.LSMRWorkspace(pB)
     CB = zeros(N, Nf, B)
-    _, _, relB = NUFSHT.nusht_solve!(CB, fB, pB; ws = ws, rtol = 1e-6, maxiter = 500)
+    _, _, relB, convB = NUFSHT.nusht_solve!(CB, fB, pB; ws = ws, rtol = 1e-6, maxiter = 500)
+    Test.@test convB
 
     p1 = NUFSHT.make_plan(Float64, θ, φ, lmax)
     C1 = zeros(N, Nf, B)
@@ -179,10 +164,13 @@ Test.@testset "batched solve retires columns independently" begin
     Test.@test sqrt(sum(abs2, CB .- C1)) / sqrt(sum(abs2, C1)) < 1e-9
     Test.@test relB < 1e-6
 
-    # `perm` maps slot -> original column. Compaction permutes it, and a retired column's answer is
+    # `perm` maps slot -> original column. Compaction permutes it, and a column's best iterate is
     # written out through it, so it must remain a permutation of 1:B — if it ever repeats an entry, two
     # columns share a destination and one result is silently lost.
     Test.@test sort(collect(ws.perm)) == collect(1:B)
+    # `colres` is per column, in the caller's order — the scalar return is its worst entry.
+    Test.@test relB == maximum(ws.colres)
+    Test.@test all(<(1e-6), ws.colres)
     NUFSHT.close!(pB); NUFSHT.close!(p1)
 end
 
@@ -222,31 +210,129 @@ Test.@testset "batched solve keeps columns in their own slots" begin
     NUFSHT.close!(p)
 end
 
-# Batching must not change the answer at ANY tolerance. A retired column is frozen by holding its `p`
-# at zero; if that slips, `p` is rebuilt by `_col_pbp!` and contracts against the stale `Ap` left by
-# skipping the sphere loops, which puts arbitrary values into `α` and diverges the column. Sweeping
-# rtol matters: at some tolerances the loop exits before a corrupted column can grow, so a single
-# tolerance can pass while the mechanism is broken.
+# Batching must not change the answer at ANY tolerance. A retired column leaves the live prefix and the
+# survivors are packed forward; every piece of per-slot state has to move with its column, or a
+# survivor resumes from another column's residual and search direction. Sweeping rtol matters: at some
+# tolerances the loop exits before a mismatched column can grow, so a single tolerance can pass while
+# the mechanism is broken.
 Test.@testset "batched solve matches single-column at every tolerance" begin
     Random.seed!(7)
     lmax, M, B = 8, 150, 4                       # M/modes = 1.85, barely overdetermined
     N, Nf = lmax + 1, 2lmax + 1
-    θ = acos.(2 .* rand(M) .- 1); φ = 2π .* rand(M)
+    θ, φ = iid_points(M, 7)
     F = randn(M, B)
 
-    pB = NUFSHT.make_plan(Float64, θ, φ, lmax; ntrans = B)
-    p1 = NUFSHT.make_plan(Float64, θ, φ, lmax)
+    pB = NUFSHT.make_plan(Float64, θ, φ, lmax; ntrans = B, nthreads = 1)
+    p1 = NUFSHT.make_plan(Float64, θ, φ, lmax; nthreads = 1)
+    # The two runs use different FINUFFT `ntrans`, so they are not bit-identical, and a solve
+    # propagates that difference by `cond(A)`: two iterates both at residual `rtol` can differ in the
+    # coefficients by `~rtol·cond(A)`. Bound the comparison by what the conditioning actually allows
+    # rather than by a fixed constant.
+    κ = cond_A(first(design_matrix(p1, lmax, M)))
+    @info "batched-vs-single fixture: cond(A) = $κ"
     for rtol in (1e-4, 1e-6, 1e-8)
+        tol = 20 * rtol * κ
         CB = zeros(N, Nf, B)
-        _, itB, relB = NUFSHT.nusht_solve!(CB, F, pB; rtol = rtol, maxiter = 500)
+        _, itB, relB, convB = NUFSHT.nusht_solve!(CB, F, pB; rtol = rtol, maxiter = 500)
         Test.@test itB < 500                     # did not run away to maxiter
+        Test.@test convB
         Test.@test relB < rtol
         for b in 1:B
             c = zeros(N, Nf)
             NUFSHT.nusht_solve!(c, F[:, b], p1; rtol = rtol, maxiter = 500)
-            Test.@test maximum(abs, CB[:, :, b]) ≈ maximum(abs, c) rtol = 1e-6
-            Test.@test maximum(abs, CB[:, :, b] .- c) / maximum(abs, c) < 1e-4
+            Test.@test maximum(abs, CB[:, :, b] .- c) / maximum(abs, c) < tol
         end
+    end
+    NUFSHT.close!(pB); NUFSHT.close!(p1)
+end
+
+# On a point set that does not determine the coefficients (`M` below `(lmax+1)^2`) `A†A` is singular and
+# CG is semiconvergent: the residual falls to a minimum, then rounding in the near-null directions
+# amplifies without bound. So the delivered coefficients must be the least-residual iterate, not the
+# last one, and the run must stop once the curvature setting the step length is no longer resolvable —
+# otherwise a more generous `maxiter` returns a worse answer than a smaller one.
+Test.@testset "nusht_solve! does not degrade with a larger iteration budget" begin
+    for T in (Float64, Float32)
+        M, lmax = 60, 12
+        Test.@test M < (lmax + 1)^2                       # rank deficient by construction
+        Random.seed!(4)
+        θ = T.(acos.(2 .* rand(M) .- 1)); φ = T.(rand(M) .* 2π)
+        f = T[abs(sin(3θ[k])) + T(0.1) for k in 1:M]
+
+        # Single-threaded FINUFFT so the runs are bit-reproducible: a longer run then shares its whole
+        # prefix with a shorter one, and the two can be compared exactly rather than approximately.
+        res = map((50, 200, 1000)) do mi
+            p = NUFSHT.make_plan(T, θ, φ, lmax; ntrans = 1, nthreads = 1)
+            C = zeros(T, lmax + 1, 2lmax + 1)
+            _, iters, rel, conv = NUFSHT.nusht_solve!(C, f, p; rtol = T(1e-12), maxiter = mi)
+            fr = zeros(T, M); NUFSHT.nusht_type2!(fr, C, p)
+            NUFSHT.close!(p)
+            (iters = iters, rel = rel, conv = conv, C = C,
+             fieldres = sqrt(sum(abs2, fr .- f) / sum(abs2, f)))
+        end
+
+        for r in res
+            Test.@test all(isfinite, r.C)
+            Test.@test r.rel ≤ 1                          # never worse than the x₀ = 0 iterate
+            Test.@test r.fieldres < 1                     # and the coefficients do fit the data
+            Test.@test r.conv == (r.rel < T(1e-12))
+        end
+        # A longer run sees a superset of the iterates a shorter one did, so what it delivers cannot be
+        # worse — and once the stopping rule has fired, the extra budget changes nothing at all.
+        Test.@test res[2].rel ≤ res[1].rel
+        Test.@test res[3].rel ≤ res[2].rel
+        Test.@test res[2].iters == res[3].iters
+        Test.@test res[2].C == res[3].C
+        Test.@test res[3].iters < 1000                    # stopped on its own, not on the budget
+        @info "semiconvergence ($T): iters=$(getfield.(res, :iters)) rel_res=$(getfield.(res, :rel))"
+    end
+end
+
+# `rel_res` describes the coefficients handed back and `converged` says whether they met `rtol`, so a
+# caller cannot mistake a stalled solve for a solved one without ignoring an explicit flag.
+Test.@testset "nusht_solve! reports whether it converged" begin
+    Random.seed!(31)
+    lmax = 8; M = 4 * (lmax + 1)^2
+    θ = acos.(2 .* rand(M) .- 1); φ = 2π .* rand(M)
+    p = NUFSHT.make_plan(Float64, θ, φ, lmax; nthreads = 1)
+    C = zeros(lmax + 1, 2lmax + 1)
+
+    _, _, rel_ok, conv_ok = NUFSHT.nusht_solve!(C, randn(M), p; rtol = 1e-6, maxiter = 500)
+    Test.@test conv_ok
+    Test.@test rel_ok < 1e-6
+
+    # Same well-conditioned points, a tolerance no Float64 CG can reach.
+    _, it_no, rel_no, conv_no = NUFSHT.nusht_solve!(C, randn(M), p; rtol = 1e-30, maxiter = 200)
+    Test.@test !conv_no
+    Test.@test conv_no == (rel_no < 1e-30)
+    Test.@test it_no ≤ 200
+    NUFSHT.close!(p)
+end
+
+# Curvature retirement through the compaction path: a stalled column has to leave the live set with its
+# own best iterate already in its own column, and the slot bookkeeping has to survive it. Batched
+# against single-column results is NOT comparable here — the widths differ, so FINUFFT rounds
+# differently, and a semiconvergent system amplifies that — so this asserts the invariants.
+Test.@testset "batched solve retires a stalled column cleanly" begin
+    Random.seed!(17)
+    lmax, M, B = 12, 60, 3
+    N, Nf = lmax + 1, 2lmax + 1
+    θ = acos.(2 .* rand(M) .- 1); φ = 2π .* rand(M)
+    F = randn(M, B)
+    pB = NUFSHT.make_plan(Float64, θ, φ, lmax; ntrans = B, nthreads = 1)
+    ws = NUFSHT.LSMRWorkspace(pB)
+    CB = zeros(N, Nf, B)
+    _, itB, relB, _ = NUFSHT.nusht_solve!(CB, F, pB; ws = ws, rtol = 1e-14, maxiter = 400)
+
+    Test.@test all(isfinite, CB)
+    Test.@test itB < 400                                  # every column stopped on its own
+    Test.@test sort(collect(ws.perm)) == collect(1:B)
+    Test.@test relB == maximum(ws.colres)
+    Test.@test all(<(1), ws.colres)                       # every column beat the x₀ = 0 iterate
+    p1 = NUFSHT.make_plan(Float64, θ, φ, lmax; nthreads = 1)
+    for b in 1:B
+        fr = zeros(M); NUFSHT.nusht_type2!(fr, CB[:, :, b], p1)
+        Test.@test sqrt(sum(abs2, fr .- F[:, b]) / sum(abs2, F[:, b])) < 1
     end
     NUFSHT.close!(pB); NUFSHT.close!(p1)
 end
