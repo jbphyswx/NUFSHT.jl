@@ -44,14 +44,19 @@ function figure_synthesis_and_accuracy()
     pts = FastSphericalHarmonics.sph_points(lmax + 1)
     θ_cc = vec([θ for θ in pts[1], φ in pts[2]])
     φ_cc = vec([φ for θ in pts[1], φ in pts[2]])
-    plan_cc = NUFSHT.make_plan(θ_cc, φ_cc, lmax; tol=1e-10)
+    plan_cc = NUFSHT.make_plan(θ_cc, φ_cc, lmax; tol=1e-12)
 
-    C_rand = randn(lmax+1, 2lmax+1)
+    # `nusht_type1!` is the adjoint `A†`, not an inverse, so the round trip is
+    # `nusht_solve!`, which fits the `l ≤ lmax` subspace seeded here.
+    C_rand = zeros(lmax+1, 2lmax+1)
+    for ℓ in 0:lmax, m in -ℓ:ℓ
+        C_rand[FastSphericalHarmonics.sph_mode(ℓ, m)] = randn() / (1 + ℓ)
+    end
     f_cc = zeros(length(θ_cc))
     NUFSHT.nusht_type2!(f_cc, C_rand, plan_cc)
 
     C_rec = similar(plan_cc.C)
-    NUFSHT.nusht_type1!(C_rec, f_cc, plan_cc)
+    NUFSHT.nusht_solve!(C_rec, f_cc, plan_cc; rtol=1e-12, maxiter=400)
 
     ell_rms_rel = Float64[]
     for ℓ in 0:lmax
@@ -168,9 +173,11 @@ function figure_spectral_filtering()
         [sqrt(Statistics.mean(abs2.(C[[FastSphericalHarmonics.sph_mode(ℓ, m) for m in -ℓ:ℓ]]))) for ℓ in 0:lmax]
     end
 
-    C_full = copy(plan_f.C);   NUFSHT.nusht_type1!(C_full, f_full, plan_f)
-    C_gauss = copy(plan_f.C);  NUFSHT.nusht_type1!(C_gauss, f_gauss, plan_f)
-    C_tophat = copy(plan_f.C); NUFSHT.nusht_type1!(C_tophat, f_tophat, plan_f)
+    # A fit, not an adjoint: `A†f` is not the coefficient vector at scattered points.
+    ws_f = NUFSHT.LSMRWorkspace(plan_f)
+    C_full = copy(plan_f.C);   NUFSHT.nusht_solve!(C_full, f_full, plan_f; ws=ws_f, rtol=1e-10)
+    C_gauss = copy(plan_f.C);  NUFSHT.nusht_solve!(C_gauss, f_gauss, plan_f; ws=ws_f, rtol=1e-10)
+    C_tophat = copy(plan_f.C); NUFSHT.nusht_solve!(C_tophat, f_tophat, plan_f; ws=ws_f, rtol=1e-10)
 
     pow_full = per_degree_power(C_full, lmax_f)
     pow_gauss = per_degree_power(C_gauss, lmax_f)

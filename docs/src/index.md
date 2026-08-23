@@ -62,7 +62,7 @@ C_rec, iters, rel_res = nusht_solve!(C_rec, f, plan; rtol=1e-6)
 | Scenario | Function |
 |----------|----------|
 | Evaluate SH expansion at scattered points | `nusht_type2!` |
-| Invert / analyse on Clenshaw-Curtis grid | `nusht_type1!` |
+| Apply the adjoint `A†` | `nusht_type1!` |
 | Invert at arbitrary scattered points | `nusht_solve!` |
 | Apply spectral filter at scattered points | `nusht_filter!` |
 | Filter with land/ocean mask | `nusht_filter!` + `nusht_filter_renorm!` |

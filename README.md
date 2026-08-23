@@ -198,8 +198,8 @@ f = zeros(length(θ))
 nusht_type2!(f, C_true, plan)     # synthesise
 
 C_rec = similar(plan.C)
-nusht_type1!(C_rec, f, plan)      # analyse (exact inverse on CC grid)
-# maximum(abs.(C_rec .- C_true)) ≈ 7e-11
+nusht_solve!(C_rec, f, plan; rtol=1e-12)   # fit the l ≤ lmax coefficients
+# maximum(abs.(C_rec .- C_true)) ≈ 1e-11
 ```
 
 ### Exact inversion at arbitrary scattered points
@@ -256,9 +256,9 @@ nusht_filter_renorm!(f_out, mask, filt, plan)   # divide by filtered mask
 |----------|-------------|
 | `make_plan([FE,] θ, φ, lmax; tol)` | Construct pre-allocated plan for M scattered points; `FE` real or complex |
 | `nusht_type2!(f, C, plan)` | Synthesis: SH coefficients → scattered field values |
-| `nusht_type1!(C, f, plan)` | Adjoint analysis (exact inverse on CC grid; adjoint elsewhere) |
+| `nusht_type1!(C, f, plan)` | Adjoint `A†` (the transpose, not an inverse) |
 | `nusht_solve!(C, f, plan; maxiter, rtol, verbose)` | Exact LSMR inversion at any scattered points |
-| `nusht_filter!(f_out, f_in, filter, plan)` | Spectral filter: type1 → multiply → type2 |
+| `nusht_filter!(f_out, f_in, filter, plan; ws)` | Spectral filter: solve → multiply → type2 |
 | `nusht_filter_renorm!(f_out, mask, filter, plan)` | Correct land-mask bias after `nusht_filter!` |
 | `GaussianTransfer(σ²)` | Gaussian filter `H(ℓ) = exp(-ℓ(ℓ+1)σ²/2)` |
 | `gaussian_from_scale(scale_m)` | `GaussianTransfer` from physical scale in metres |
