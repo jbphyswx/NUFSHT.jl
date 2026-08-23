@@ -7,7 +7,7 @@ Demonstrates all major features, producing a multi-panel figure saved to
 Features shown:
 1. Synthesis (type2): evaluate Y_2^0 + Y_3^1 at 2000 scattered points
 2. CC-grid round-trip accuracy: coefficient recovery error vs ℓ
-3. CG inversion (nusht_solve!): observed vs recovered field at scattered points
+3. Inversion (nusht_solve!): observed vs recovered field at scattered points
 4. Spectral filtering: full / Gaussian / top-hat on CC grid
 5. Ocean-mask filter + renorm: constant-field recovery with 50% random mask
 
@@ -45,21 +45,27 @@ f_sc = zeros(M)
 NUFSHT.nusht_type2!(f_sc, C1, plan_sc)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. CC-grid round-trip: error per degree ℓ
+# 2. Round-trip: error per degree ℓ
 # ─────────────────────────────────────────────────────────────────────────────
+# `nusht_type1!` is the adjoint `A†`, not an inverse, so the round trip is
+# `nusht_solve!`. It fits the `l ≤ lmax` subspace, which is what the coefficients
+# are seeded on here.
 println("Running example 2: round-trip accuracy...")
 
 pts = FastSphericalHarmonics.sph_points(lmax + 1)
 θ_cc = vec([θ for θ in pts[1], φ in pts[2]])
 φ_cc = vec([φ for θ in pts[1], φ in pts[2]])
-plan_cc = NUFSHT.make_plan(θ_cc, φ_cc, lmax; tol=1e-10)
+plan_cc = NUFSHT.make_plan(θ_cc, φ_cc, lmax; tol=1e-12)
 
-C_rand = randn(lmax+1, 2lmax+1)
-f_cc   = zeros(length(θ_cc))
+C_rand = zeros(lmax+1, 2lmax+1)
+for ℓ in 0:lmax, m in -ℓ:ℓ
+    C_rand[FastSphericalHarmonics.sph_mode(ℓ, m)] = randn() / (1 + ℓ)
+end
+f_cc = zeros(length(θ_cc))
 NUFSHT.nusht_type2!(f_cc, C_rand, plan_cc)
 
 C_rec = similar(plan_cc.C)
-NUFSHT.nusht_type1!(C_rec, f_cc, plan_cc)
+NUFSHT.nusht_solve!(C_rec, f_cc, plan_cc; rtol=1e-12, maxiter=400)
 
 # Per-degree RMS error
 ell_rms_err = Float64[]
@@ -76,22 +82,24 @@ println("  Total round-trip relative RMS: $(round(rms_total, sigdigits=3))")
 @assert rms_total < 1e-8
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. CG inversion at scattered points
+# 3. Inversion at scattered points
 # ─────────────────────────────────────────────────────────────────────────────
-println("Running example 3: CG inversion...")
+println("Running example 3: inversion at scattered points...")
 
 lmax_cg = 10
 K_cg    = (lmax_cg+1) * (2lmax_cg+1)
 M_cg    = 4 * K_cg
 
-φ_jit = collect((2π / M_cg) .* (0:M_cg-1))
-θ_jit = acos.(clamp.(2 .* ((0:M_cg-1) .+ 0.5) ./ M_cg .- 1, -1.0, 1.0))
-θ_jit .+= (rand(M_cg) .- 0.5) .* (0.4π / sqrt(M_cg))
-φ_jit .+= (rand(M_cg) .- 0.5) .* (0.4 * 2π / sqrt(M_cg))
-θ_jit  = clamp.(θ_jit, 1e-10, π - 1e-10)
-φ_jit  = mod.(φ_jit, 2π)
+# Golden-angle lattice: cond(A) ≈ 1.04, so the fit is well posed and converges in a
+# handful of iterations. An index-linked spiral (φ advancing 2π/M per point while θ
+# sweeps pole to pole) winds only once and is near-degenerate — cond(A) ≈ 1e8 — which
+# reproduces the field while leaving the coefficients meaningless.
+ga    = π * (3 - sqrt(5))
+θ_jit = acos.(clamp.(1 .- 2 .* ((0:M_cg-1) .+ 0.5) ./ M_cg, -1.0, 1.0))
+θ_jit = clamp.(θ_jit, 1e-10, π - 1e-10)
+φ_jit = collect(mod.(ga .* (0:M_cg-1), 2π))
 
-plan_cg = NUFSHT.make_plan(θ_jit, φ_jit, lmax_cg; tol=1e-10)
+plan_cg = NUFSHT.make_plan(θ_jit, φ_jit, lmax_cg; tol=1e-12)
 
 C_cg_true = zeros(lmax_cg+1, 2lmax_cg+1)
 for ℓ in 1:4, m in -ℓ:ℓ
@@ -100,12 +108,17 @@ end
 f_obs = zeros(M_cg);  NUFSHT.nusht_type2!(f_obs, C_cg_true, plan_cg)
 
 C_cg_sol = similar(plan_cg.C)
-C_cg_sol, cg_iters, cg_res = NUFSHT.nusht_solve!(C_cg_sol, f_obs, plan_cg; rtol=1e-6, maxiter=1000)
+C_cg_sol, cg_iters, cg_res, cg_conv =
+    NUFSHT.nusht_solve!(C_cg_sol, f_obs, plan_cg; rtol=1e-10, maxiter=200)
 
 f_rec = zeros(M_cg);  NUFSHT.nusht_type2!(f_rec, C_cg_sol, plan_cg)
 field_err = LinearAlgebra.norm(f_rec .- f_obs) / LinearAlgebra.norm(f_obs)
-println("  CG: $(cg_iters) iters, field_err=$(round(field_err, sigdigits=3))")
-@assert field_err < 1e-3
+coeff_err = LinearAlgebra.norm(C_cg_sol .- C_cg_true) / LinearAlgebra.norm(C_cg_true)
+println("  $(cg_iters) iters, converged=$(cg_conv), field_err=$(round(field_err, sigdigits=3)), " *
+        "coeff_err=$(round(coeff_err, sigdigits=3))")
+@assert cg_conv
+@assert field_err < 1e-8
+@assert coeff_err < 1e-8
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Spectral filtering
@@ -131,10 +144,12 @@ function per_degree_power(C, lmax)
     [sqrt(Statistics.mean(abs2.(C[[FastSphericalHarmonics.sph_mode(ℓ, m) for m in -ℓ:ℓ]]))) for ℓ in 0:lmax]
 end
 
-# Get filtered coefficients for power spectra
-C_full   = copy(plan_f.C);   NUFSHT.nusht_type1!(C_full,   f_full,   plan_f)
-C_gauss  = copy(plan_f.C);   NUFSHT.nusht_type1!(C_gauss,  f_gauss,  plan_f)
-C_tophat = copy(plan_f.C);   NUFSHT.nusht_type1!(C_tophat, f_tophat, plan_f)
+# Recover the coefficients of each field for its power spectrum. This is a fit, not
+# an adjoint: `A†f` is not the coefficient vector at scattered points.
+ws_f = NUFSHT.LSMRWorkspace(plan_f)
+C_full   = copy(plan_f.C); NUFSHT.nusht_solve!(C_full,   f_full,   plan_f; ws=ws_f, rtol=1e-10)
+C_gauss  = copy(plan_f.C); NUFSHT.nusht_solve!(C_gauss,  f_gauss,  plan_f; ws=ws_f, rtol=1e-10)
+C_tophat = copy(plan_f.C); NUFSHT.nusht_solve!(C_tophat, f_tophat, plan_f; ws=ws_f, rtol=1e-10)
 
 pow_full   = per_degree_power(C_full,   lmax_f)
 pow_gauss  = per_degree_power(C_gauss,  lmax_f)
@@ -210,10 +225,10 @@ CairoMakie.barplot!(ax2, 0:lmax, max.(ell_rms_rel, 1e-16); color=:steelblue)
 CairoMakie.hlines!(ax2, [1e-10]; color=:red, linestyle=:dash, label="machine eps guide")
 CairoMakie.text!(ax2, lmax÷2, 1e-9; text="Total: $(round(rms_total, sigdigits=2))", fontsize=11)
 
-## Panel 3: CG — observed vs recovered field (first 200 points for clarity)
+## Panel 3: inversion — observed vs recovered field (first 200 points for clarity)
 n_show = min(200, M_cg)
 ax3 = CairoMakie.Axis(fig[2, 1];
-    title  = "3. CG inversion (nusht_solve!)\nlmax=$(lmax_cg), M=$(M_cg), $(cg_iters) iters",
+    title  = "3. Inversion (nusht_solve!)\nlmax=$(lmax_cg), M=$(M_cg), $(cg_iters) iters",
     xlabel = "Point index",
     ylabel = "Field value",
 )
@@ -275,6 +290,6 @@ println("Figure saved to: $outpath")
 println()
 println("All examples completed successfully.")
 println("  Round-trip relative RMS : $(round(rms_total, sigdigits=3))")
-println("  CG field error           : $(round(field_err, sigdigits=3))")
+println("  Inversion field error    : $(round(field_err, sigdigits=3))")
 println("  Naive mask error         : $(round(naive_err, sigdigits=3))")
 println("  Renorm mask error        : $(round(renorm_err, sigdigits=3))")

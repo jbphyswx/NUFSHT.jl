@@ -39,7 +39,7 @@ println("1. spin-$s synthesis vs direct ₛY: rel_err = ", relnorm(f .- ref) / r
 # 2. Exact scattered inversion
 sol = zeros(ComplexF64, shp)
 _, iters, relres = NUFSHT.nusht_solve_spin!(sol, f, plan; rtol = 1e-10)
-println("2. nusht_solve_spin!: $iters CG iters, rel_res=$relres, coeff_err=", relnorm(sol .- sf) / relnorm(sf))
+println("2. nusht_solve_spin!: $iters iters, rel_res=$relres, coeff_err=", relnorm(sol .- sf) / relnorm(sf))
 
 # 3. Spin-1 Hodge split of a pure-rotational tangent field (Rossby-like)
 n, m = 3, 2
