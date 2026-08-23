@@ -78,6 +78,15 @@ Test.@testset "batched solve retires correctly on every backend" begin
         # Only a narrowable backend may ever cache a reduced-width plan set.
         narrow || Test.@test isempty(pB.size_pool)
         @info "$(nameof(typeof(backend))): narrowable=$narrow iters=$itB widths=$([e.k for e in pB.size_pool])"
-        NUFSHT.close!(pB); NUFSHT.close!(p1)
+
+        # Those cached plans own NUFFT plans too, and `close!` must destroy them rather than leave
+        # them to their finalizers: FINUFFT's destructor re-enters Julia for its FFTW lock, and a
+        # contended acquire yields, which a GC finalizer cannot do. Guard against the assertion going
+        # vacuous — on a narrowable backend the pool has to be non-empty for it to mean anything.
+        narrow && Test.@test !isempty(pB.size_pool)
+        NUFSHT.close!(pB)
+        Test.@test isempty(pB.size_pool)
+        NUFSHT.close!(pB)                        # idempotent
+        NUFSHT.close!(p1)
     end
 end

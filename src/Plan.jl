@@ -665,15 +665,37 @@ function _set_nodes!(nd::VariableCountNodes, θ_nodes, φ_nodes)
     return _sync_θnufft!(nd)
 end
 
+# The narrower plan sets `_build_width!` caches own NUFFT plans of their own, so `close!` has to reach
+# them; a spin plan has no pool. Leaving them to their finalizers is not merely untidy: FINUFFT's
+# destructor calls back into Julia to take its FFTW lock, and acquiring a contended lock yields, which
+# a GC finalizer may not do ("task switch not allowed from inside gc finalizer"). Destroying eagerly
+# means the finalizer later finds an already-destroyed plan and returns without entering C.
+_close_pool!(::AbstractNUSHTplan) = nothing
+function _close_pool!(plan::NUSHTplan)
+    for e in plan.size_pool
+        _nufft_destroy!(e.nufft_type2)
+        _nufft_destroy!(e.nufft_type1)
+    end
+    empty!(plan.size_pool)
+    return nothing
+end
+
 """
     close!(plan::NUSHTplan)
 
-Eagerly free the FINUFFT guru plans owned by `plan` (otherwise freed by their finalizers). Safe to
-call more than once (`finufft_destroy!` is idempotent).
+Eagerly free every FINUFFT guru plan the plan owns — its own pair and any narrower pair
+[`_build_width!`](@ref) cached for a compacted solve — rather than leaving them to their finalizers.
+Safe to call more than once (`finufft_destroy!` is idempotent).
+
+Eager destruction is not just tidiness. FINUFFT's destructor re-enters Julia to take its FFTW lock,
+and acquiring that lock when contended yields; a GC finalizer cannot yield, so a pooled plan collected
+under contention raises `task switch not allowed from inside gc finalizer`. A solve supplies both
+halves of that on its own: it grows the pool as it narrows the batch width, and it allocates.
 """
 function close!(plan::AbstractNUSHTplan)
     _nufft_destroy!(_nufft2(plan))
     _nufft_destroy!(_nufft1(plan))
+    _close_pool!(plan)
     return nothing
 end
 
