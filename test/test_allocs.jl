@@ -26,22 +26,19 @@ _a_adj(C, f, p)          = (NUFSHT._nusht_true_adjoint!(C, f, p); @allocated NUF
 _a_synth(p)              = (NUFSHT._dfn_synthesis!(p); @allocated NUFSHT._dfn_synthesis!(p); @allocated NUFSHT._dfn_synthesis!(p))
 _a_analy(p)              = (NUFSHT._dfn_analysis!(p); @allocated NUFSHT._dfn_analysis!(p); @allocated NUFSHT._dfn_analysis!(p))
 _a_transfer(C, ft, l)    = (NUFSHT.apply_transfer!(C, ft, l); @allocated NUFSHT.apply_transfer!(C, ft, l); @allocated NUFSHT.apply_transfer!(C, ft, l))
-_a_filter(o, i, ft, p)   = (NUFSHT.nusht_filter!(o, i, ft, p); @allocated NUFSHT.nusht_filter!(o, i, ft, p); @allocated NUFSHT.nusht_filter!(o, i, ft, p))
-_a_renorm(o, m, ft, p, s) = (NUFSHT.nusht_filter_renorm!(o, m, ft, p; mask_filt = s); @allocated NUFSHT.nusht_filter_renorm!(o, m, ft, p; mask_filt = s); @allocated NUFSHT.nusht_filter_renorm!(o, m, ft, p; mask_filt = s))
-_a_dfsd(Ft, F)           = (NUFSHT.dfs_double!(Ft, F); @allocated NUFSHT.dfs_double!(Ft, F); @allocated NUFSHT.dfs_double!(Ft, F))
-_a_dfsf(F, Ft)           = (NUFSHT.dfs_fold!(F, Ft); @allocated NUFSHT.dfs_fold!(F, Ft); @allocated NUFSHT.dfs_fold!(F, Ft))
-_a_AtA(Ap, p, ws, pl)    = (NUFSHT._AtA!(Ap, p, ws, pl); @allocated NUFSHT._AtA!(Ap, p, ws, pl); @allocated NUFSHT._AtA!(Ap, p, ws, pl))
-_a_cdot(d, a, b)         = (NUFSHT._col_dot!(d, a, b); @allocated NUFSHT._col_dot!(d, a, b); @allocated NUFSHT._col_dot!(d, a, b))
+_a_filter(o, i, ft, p, w) = (NUFSHT.nusht_filter!(o, i, ft, p; ws = w); @allocated NUFSHT.nusht_filter!(o, i, ft, p; ws = w); @allocated NUFSHT.nusht_filter!(o, i, ft, p; ws = w))
+_a_renorm(o, m, ft, p, s, w) = (NUFSHT.nusht_filter_renorm!(o, m, ft, p; mask_filt = s, ws = w); @allocated NUFSHT.nusht_filter_renorm!(o, m, ft, p; mask_filt = s, ws = w); @allocated NUFSHT.nusht_filter_renorm!(o, m, ft, p; mask_filt = s, ws = w))
+_a_asmM(Z, G, l)         = (NUFSHT._assemble_modes!(Z, G, l); @allocated NUFSHT._assemble_modes!(Z, G, l); @allocated NUFSHT._assemble_modes!(Z, G, l))
+_a_asmMa(G, Z, l)        = (NUFSHT._assemble_modes_adjoint!(G, Z, l); @allocated NUFSHT._assemble_modes_adjoint!(G, Z, l); @allocated NUFSHT._assemble_modes_adjoint!(G, Z, l))
 _a_caxpy(y, al, x, s)    = (NUFSHT._col_axpy!(y, al, x, s); @allocated NUFSHT._col_axpy!(y, al, x, s); @allocated NUFSHT._col_axpy!(y, al, x, s))
 _a_cpbp(p, r, be)        = (NUFSHT._col_pbp!(p, r, be); @allocated NUFSHT._col_pbp!(p, r, be); @allocated NUFSHT._col_pbp!(p, r, be))
+_a_cscale(y, s)          = (NUFSHT._col_scale!(y, s); @allocated NUFSHT._col_scale!(y, s); @allocated NUFSHT._col_scale!(y, s))
 _a_solve(C, f, p, ws)    = (NUFSHT.nusht_solve!(C, f, p; ws = ws, maxiter = 60, rtol = 1e-8); @allocated NUFSHT.nusht_solve!(C, f, p; ws = ws, maxiter = 60, rtol = 1e-8); @allocated NUFSHT.nusht_solve!(C, f, p; ws = ws, maxiter = 60, rtol = 1e-8))
 _a_type2s(f, sf, p)      = (NUFSHT.nusht_type2_spin!(f, sf, p); @allocated NUFSHT.nusht_type2_spin!(f, sf, p); @allocated NUFSHT.nusht_type2_spin!(f, sf, p))
 _a_type1s(sf, f, p)      = (NUFSHT.nusht_type1_spin!(sf, f, p); @allocated NUFSHT.nusht_type1_spin!(sf, f, p); @allocated NUFSHT.nusht_type1_spin!(sf, f, p))
 _a_asmG(G, sf, p)        = (NUFSHT._assemble_G!(G, sf, p); @allocated NUFSHT._assemble_G!(G, sf, p); @allocated NUFSHT._assemble_G!(G, sf, p))
 _a_asmGa(sf, G, p)       = (NUFSHT._assemble_G_adjoint!(sf, G, p); @allocated NUFSHT._assemble_G_adjoint!(sf, G, p); @allocated NUFSHT._assemble_G_adjoint!(sf, G, p))
 _a_chdot(d, a, b)        = (NUFSHT._col_hdot!(d, a, b); @allocated NUFSHT._col_hdot!(d, a, b); @allocated NUFSHT._col_hdot!(d, a, b))
-_a_caxpyc(y, al, x, s)   = (NUFSHT._col_axpy_c!(y, al, x, s); @allocated NUFSHT._col_axpy_c!(y, al, x, s); @allocated NUFSHT._col_axpy_c!(y, al, x, s))
-_a_cpbpc(p, r, be)       = (NUFSHT._col_pbp_c!(p, r, be); @allocated NUFSHT._col_pbp_c!(p, r, be); @allocated NUFSHT._col_pbp_c!(p, r, be))
 _a_solves(sf, f, p, ws)  = (NUFSHT.nusht_solve_spin!(sf, f, p; ws = ws, maxiter = 60, rtol = 1e-8); @allocated NUFSHT.nusht_solve_spin!(sf, f, p; ws = ws, maxiter = 60, rtol = 1e-8); @allocated NUFSHT.nusht_solve_spin!(sf, f, p; ws = ws, maxiter = 60, rtol = 1e-8))
 
 Test.@testset "allocation: full hot-path surface is allocation-free" begin
@@ -52,13 +49,8 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
     Random.seed!(9)
     lmax = 8
     Nθ, Nφ = lmax + 1, 2lmax + 1
-    N_modes = (lmax + 1)^2
-    M = 4 * N_modes
-    # Jittered-from-uniform scattered points (well-conditioned CG, per the FINUFFT tutorial).
-    φ_base = (2π / M) .* (0:M-1)
-    θ_base = acos.(clamp.(2 .* ((0:M-1) .+ 0.5) ./ M .- 1, -1.0, 1.0))
-    θ = clamp.(θ_base .+ (rand(M) .- 0.5) .* (0.4 * π / sqrt(M)), 1e-10, π - 1e-10)
-    φ = mod.(φ_base .+ (rand(M) .- 0.5) .* (0.4 * 2π / sqrt(M)), 2π)
+    M = 4 * (lmax + 1)^2
+    θ, φ = fib_points(M)          # cond(A) ≈ 1.04, so the solve converges in a few iterations
     filt = NUFSHT.gaussian_from_scale(2000e3)
 
     for B in (1, 2)
@@ -72,14 +64,14 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
                 C_true[FastSphericalHarmonics.sph_mode(ℓ, m), b] = randn()
             end
             ftrue = zeros(M, B); NUFSHT.nusht_type2!(ftrue, C_true, plan)
-            Csol = similar(plan.C); ws = NUFSHT.CGWorkspace(plan)
+            Csol = similar(plan.C); ws = NUFSHT.LSMRWorkspace(plan)
             # Warm the whole pipeline on this plan: the first real use of the adjoint / solve path builds
             # FastTransforms' lazy adjoint plan (a one-time ~few-hundred-byte per-plan setup cost, not a
             # per-call allocation). After warmup, steady-state is zero.
             for _ in 1:3
                 NUFSHT.nusht_type1!(Cout, f, plan)
                 NUFSHT._nusht_true_adjoint!(Cout, f, plan)
-                NUFSHT.nusht_filter!(out, f, filt, plan)
+                NUFSHT.nusht_filter!(out, f, filt, plan; ws = ws)
                 NUFSHT.nusht_solve!(Csol, ftrue, plan; ws = ws, maxiter = 60, rtol = 1e-8)
             end
             if single
@@ -89,14 +81,14 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
                 Test.@test _a_synth(plan)                 == 0
                 Test.@test _a_analy(plan)                 == 0
                 Test.@test _a_transfer(plan.C, filt, lmax) == 0
-                Test.@test _a_filter(out, f, filt, plan)  == 0
-                Test.@test _a_renorm(out, mask, filt, plan, scratch) == 0
-                Test.@test _a_dfsd(plan.F̃, plan.F)        == 0
-                Test.@test _a_dfsf(plan.F, plan.F̃)        == 0
-                Test.@test _a_AtA(ws.Ap, ws.p, ws, plan)  == 0
-                Test.@test _a_cdot(ws.pAp, ws.p, ws.Ap)   == 0
-                Test.@test _a_caxpy(ws.x, ws.α, ws.p, 1.0) == 0
-                Test.@test _a_cpbp(ws.p, ws.r, ws.β)      == 0
+                Test.@test _a_filter(out, f, filt, plan, ws) == 0
+                Test.@test _a_renorm(out, mask, filt, plan, scratch, ws) == 0
+                Test.@test _a_asmM(plan.Fhat, plan.F, lmax) == 0
+                Test.@test _a_asmMa(plan.F, plan.Fhat, lmax) == 0
+                Test.@test _a_chdot(ws.nrm, ws.v, ws.v)   == 0
+                Test.@test _a_caxpy(ws.x, ws.cf, ws.hbar, 1.0) == 0
+                Test.@test _a_cpbp(ws.h, ws.v, ws.cf)     == 0
+                Test.@test _a_cscale(ws.u, ws.cf)         == 0
                 Test.@test _a_solve(Csol, ftrue, plan, ws) == 0
             end
             NUFSHT.close!(plan)
@@ -111,7 +103,7 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
             end
             NUFSHT.nusht_type2_spin!(fs, sf, plan)
             Ghat = randn(ComplexF64, Nφ, Nφ, B)
-            sws = NUFSHT.SpinCGWorkspace(plan)
+            sws = NUFSHT.LSMRWorkspace(plan)
             for _ in 1:3   # warm the plan's full pipeline (one-time per-plan init; see scalar block)
                 NUFSHT.nusht_type1_spin!(sfo, fs, plan)
                 NUFSHT.nusht_solve_spin!(sfo, fs, plan; ws = sws, maxiter = 60, rtol = 1e-8)
@@ -121,9 +113,10 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
                 Test.@test _a_type1s(sfo, fs, plan)         == 0
                 Test.@test _a_asmG(plan.G, sf, plan)        == 0
                 Test.@test _a_asmGa(sf, Ghat, plan)         == 0
-                Test.@test _a_chdot(sws.pAp, sws.p, sws.Ap) == 0
-                Test.@test _a_caxpyc(sws.x, sws.α, sws.p, 1.0) == 0
-                Test.@test _a_cpbpc(sws.p, sws.r, sws.β)    == 0
+                Test.@test _a_chdot(sws.nrm, sws.v, sws.v)  == 0
+                Test.@test _a_caxpy(sws.x, sws.cf, sws.hbar, 1.0) == 0
+                Test.@test _a_cpbp(sws.h, sws.v, sws.cf)    == 0
+                Test.@test _a_cscale(sws.u, sws.cf)         == 0
                 Test.@test _a_solves(sfo, fs, plan, sws)    == 0
             end
             NUFSHT.close!(plan)

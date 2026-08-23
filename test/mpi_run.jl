@@ -41,9 +41,9 @@ idx = (rank + 1):nranks:M                # disjoint strided partition
 plan_loc = NUFSHT.make_plan(θ_all[idx], φ_all[idx], lmax; tol = 1e-11, nthreads = 1)
 
 C_mpi = zeros(Nθ, Nφ)
-_, iters, rel = NUFSHT.nusht_solve!(C_mpi, f_all[idx], plan_loc,
-                                    ComputationalBackends.MPIBackend(; comm = comm);
-                                    rtol = 1e-8, maxiter = 500)
+_, iters, rel, conv = NUFSHT.nusht_solve!(C_mpi, f_all[idx], plan_loc,
+                                          ComputationalBackends.MPIBackend(; comm = comm);
+                                          rtol = 1e-8, maxiter = 500)
 
 # `Ctrue` is band-limited and the solve fits the same `l ≤ lmax` space, so the coefficients themselves
 # must be recovered — not merely a field that matches. A rank solving only its local subset would fail
@@ -52,8 +52,9 @@ relc = sqrt(sum(abs2, C_mpi .- Ctrue) / sum(abs2, Ctrue))
 f_rec = zeros(M); NUFSHT.nusht_type2!(f_rec, C_mpi, planfull)
 relf = sqrt(sum(abs2, f_rec .- f_all) / sum(abs2, f_all))
 if rank == 0
-    println("MPI point-decomposition: nranks=$nranks  iters=$iters  rel_res=$rel  " *
+    println("MPI point-decomposition: nranks=$nranks  iters=$iters  rel_res=$rel  converged=$conv  " *
             "coeff_rel_err=$relc  field_rel_err=$relf")
+    conv || error("MPI solve reported not converged (rel=$rel)")
     relc < 1e-6 || error("MPI coefficient recovery failed (relc=$relc)")
     relf < 1e-3 || error("MPI global field recovery failed (relf=$relf)")
     println("MPI OK")

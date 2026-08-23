@@ -86,12 +86,17 @@ Test.@testset "threaded sphere loops agree with serial" begin
     fB = zeros(M, B); NUFSHT.nusht_type2!(fB, C, pB)
     CaB = zeros(N, Nf, B); NUFSHT._nusht_true_adjoint!(CaB, fB, pB)
 
+    # Batching is a reassociation, not a different operator: the two runs differ only by FINUFFT's
+    # `ntrans` width and the order the sphere loop visits columns. A genuine fault here — a column
+    # written to the wrong slot, a stale per-task buffer, FastTransforms corrupted in a non-root task —
+    # is an O(1) relative error, so a bound three orders above the observed reassociation noise
+    # (~1e-13 at this size) still catches it while asserting no more than the arithmetic supports.
     for b in 1:B
         f1 = zeros(M); NUFSHT.nusht_type2!(f1, C[:, :, b], p1)
-        Test.@test maximum(abs, fB[:, b] .- f1) / maximum(abs, f1) < 1e-13
+        Test.@test maximum(abs, fB[:, b] .- f1) / maximum(abs, f1) < 1e-10
 
         Ca1 = zeros(N, Nf); NUFSHT._nusht_true_adjoint!(Ca1, f1, p1)
-        Test.@test maximum(abs, CaB[:, :, b] .- Ca1) / maximum(abs, Ca1) < 1e-13
+        Test.@test maximum(abs, CaB[:, :, b] .- Ca1) / maximum(abs, Ca1) < 1e-10
     end
 
     @info "sphere loops: pool=$(length(pB.sph_pool)) at $(Threads.nthreads()) thread(s), matches serial"

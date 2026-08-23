@@ -64,8 +64,9 @@ Test.@testset "batched solve retires correctly on every backend" begin
         Test.@test narrow == (backend isa NUFSHT.FINUFFTBackend)
 
         CB = zeros(N, Nf, B)
-        _, itB, relB = NUFSHT.nusht_solve!(CB, F, pB; rtol = 1e-8, maxiter = 500)
+        _, itB, relB, convB = NUFSHT.nusht_solve!(CB, F, pB; rtol = 1e-8, maxiter = 500)
         Test.@test itB < 500                     # did not diverge or stall
+        Test.@test convB
         Test.@test relB < 1e-8
 
         for b in 1:B

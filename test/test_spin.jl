@@ -138,10 +138,12 @@ Test.@testset "spin-weighted scattered transforms" begin
         planr = NUFSHT.make_spin_plan(θr, φr, lmax, s; tol = 1e-12)
         fr = zeros(ComplexF64, Msolve); NUFSHT.nusht_type2_spin!(fr, sf, planr)
         sol = zeros(ComplexF64, shp)
-        _, iters, relres = NUFSHT.nusht_solve_spin!(sol, fr, planr; rtol = 1e-10, maxiter = 500)
+        _, iters, relres, conv = NUFSHT.nusht_solve_spin!(sol, fr, planr; rtol = 1e-10, maxiter = 500)
         coeff_err = maximum(abs.(sol .- sf)) / maximum(abs.(sf))
         @info "spin $s solve: iters=$iters rel_res=$relres coeff_err=$coeff_err"
         Test.@test coeff_err < 1e-7
+        Test.@test conv
+        Test.@test conv == (relres < 1e-10)
     end
 end
 
@@ -196,10 +198,11 @@ Test.@testset "spin recurrence: correctness at large lmax (stable where wigner_d
     Test.@test adj_err < 1e-11
 
     sol = zeros(ComplexF64, shp)
-    _, iters, relres = NUFSHT.nusht_solve_spin!(sol, f, plan; rtol = 1e-8, maxiter = 1500)
+    _, iters, relres, conv = NUFSHT.nusht_solve_spin!(sol, f, plan; rtol = 1e-8, maxiter = 1500)
     frec = zeros(ComplexF64, Ms); NUFSHT.nusht_type2_spin!(frec, sol, plan)
     fieldrec = sqrt(sum(abs2, frec .- f) / sum(abs2, f))
-    @info "large-lmax s=$s: adj_err=$adj_err  solve iters=$iters field-recovery=$fieldrec"
+    @info "large-lmax s=$s: adj_err=$adj_err  solve iters=$iters rel_res=$relres field-recovery=$fieldrec"
     Test.@test fieldrec < 1e-3
+    Test.@test conv == (relres < 1e-8)
     NUFSHT.close!(plan)
 end

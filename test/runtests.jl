@@ -6,9 +6,11 @@ using Aqua: Aqua
 using NUFSHT: NUFSHT
 using FINUFFT: FINUFFT
 using NonuniformFFTs: NonuniformFFTs
+using LinearAlgebra: LinearAlgebra
+
+include("reference.jl")          # independent Y_lm, design matrix, conditioning, point fixtures
 
 Test.@testset "NUFSHT.jl" begin
-    include("test_dfs.jl")
     include("test_constant.jl")
     include("test_kernels.jl")
     include("test_roundtrip.jl")
