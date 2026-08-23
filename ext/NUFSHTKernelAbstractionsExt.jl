@@ -7,10 +7,10 @@ KA backend (CUDA/ROCm/Metal/oneAPI, and the reference `JLArray`/KA-CPU backend u
 without per-vendor code. The plain CPU `Array` methods in `src` are untouched; a GPU-backed array is
 `<:AbstractGPUArray` so these more-specific methods win for it.
 
-Only the genuinely scatter/gather steps need kernels — the Double-Fourier-Sphere doubling/folding.
-Everything else in the pipeline is already array-generic: the half-pixel phase is a broadcast, the
-2-D FFT goes through `AbstractFFTs` plans (→ CUFFT/rocFFT/… by array type), and the NUFFT is
-dispatched through the `_nufft_*` seam (cuFINUFFT via the CUDA extension).
+Only the genuinely scatter/gather steps need kernels — the spin Wigner recurrence and contraction,
+and the per-column solver primitives. Everything else in the pipeline is already array-generic: the
+mode assembly is an indexed loop over a small coefficient array, and the NUFFT is dispatched through
+the `_nufft_*` seam (cuFINUFFT via the CUDA extension).
 
 Loaded by `using KernelAbstractions` (with `GPUArraysCore`).
 """
@@ -31,50 +31,6 @@ using GPUArraysCore: GPUArraysCore
 @inline function _sync(backend)
     applicable(KernelAbstractions.synchronize, backend) && KernelAbstractions.synchronize(backend)
     return nothing
-end
-
-# ── Double-Fourier-Sphere doubling: F̃(2Nθ,Nφ,B) ← F(Nθ,Nφ,B) ──────────────────
-# Top half copies F; bottom half is the pole-reflected, φ+π-shifted mirror. The `mod1(j+half,Nφ)`
-# column shift is the same proper cyclic permutation the CPU method uses (correct for odd Nφ).
-@kernel function _dfs_double_kern!(F̃, @Const(F), Nθ, Nφ, half)
-    i, j, b = @index(Global, NTuple)
-    if i <= Nθ
-        @inbounds F̃[i, j, b] = F[i, j, b]
-    else
-        ii = i - Nθ
-        js = mod1(j + half, Nφ)
-        @inbounds F̃[i, j, b] = F[Nθ + 1 - ii, js, b]
-    end
-end
-
-function NUFSHT.dfs_double!(F̃::GPUArraysCore.AbstractGPUArray, F::GPUArraysCore.AbstractGPUArray)
-    Nθ, Nφ, B = size(F, 1), size(F, 2), size(F, 3)
-    @assert ndims(F̃) == 3 && ndims(F) == 3 "GPU dfs_double! requires 3-D (Nθ,Nφ,B) buffers"
-    @assert size(F̃, 1) == 2Nθ && size(F̃, 2) == Nφ && size(F̃, 3) == B
-    backend = KernelAbstractions.get_backend(F̃)
-    _dfs_double_kern!(backend)(F̃, F, Nθ, Nφ, Nφ ÷ 2; ndrange = (2Nθ, Nφ, B))
-    _sync(backend)
-    return F̃
-end
-
-# ── DFS folding (exact adjoint of doubling): F(Nθ,Nφ,B) ← real(F̃ + mirror(F̃)) ──
-# The `-half` column shift is the exact adjoint of `dfs_double!`'s `+half`; `real` is the adjoint of
-# the real→complex embedding. This keeps the composite `nusht_solve!` adjoint exact on device too.
-@kernel function _dfs_fold_kern!(F, @Const(F̃), Nθ, Nφ, half)
-    i, j, b = @index(Global, NTuple)
-    im = 2Nθ + 1 - i
-    js = mod1(j - half, Nφ)
-    @inbounds F[i, j, b] = real(F̃[i, j, b] + F̃[im, js, b])
-end
-
-function NUFSHT.dfs_fold!(F::GPUArraysCore.AbstractGPUArray, F̃::GPUArraysCore.AbstractGPUArray)
-    Nθ, Nφ, B = size(F, 1), size(F, 2), size(F, 3)
-    @assert ndims(F̃) == 3 && ndims(F) == 3 "GPU dfs_fold! requires 3-D (Nθ,Nφ,B) buffers"
-    @assert size(F̃, 1) == 2Nθ && size(F̃, 2) == Nφ && size(F̃, 3) == B
-    backend = KernelAbstractions.get_backend(F)
-    _dfs_fold_kern!(backend)(F, F̃, Nθ, Nφ, Nφ ÷ 2; ndrange = (Nθ, Nφ, B))
-    _sync(backend)
-    return F
 end
 
 # ── Device spin S-engine: on-the-fly Trapani–Navaza recurrence + G-contraction ──
@@ -224,39 +180,39 @@ function NUFSHT._assemble_G_adjoint_impl!(sf::GPUArraysCore.AbstractGPUArray, Ĝ
     return sf
 end
 
-# ── Device spin CG reductions ───────────────────────────────────────────────────
-# The per-column CG workspace ops as device-generic broadcasts/reductions (the `src` versions are CPU
-# scalar loops). Dispatched on the data array being a device array. This lets `nusht_solve_spin!` run
-# on the GPU (the scalars stay length-B device vectors; `maximum` for the convergence check syncs to
-# host). CPU stays on the zero-alloc loop methods.
-function NUFSHT._col_hdot!(dst, a::GPUArraysCore.AbstractGPUArray, b)   # dst[k] = Re Σ_ij conj(a)·b
-    dst .= real.(dropdims(sum(conj.(a) .* b; dims = (1, 2)); dims = (1, 2)))
+# ── Device solver column primitives ─────────────────────────────────────────────
+# The per-column workspace ops as device-generic broadcasts/reductions (the `src` versions are CPU
+# scalar loops), dispatched on the data array being a device array, so `nusht_solve!` and
+# `nusht_solve_spin!` run on the GPU. One set serves both paths: `_col_hdot!` degenerates to the plain
+# dot product on a real array, since `conj` and `real` are identities there.
+#
+# `_cols` flattens a batch buffer to (stride, columns) so one method serves point space and
+# coefficient space, matching the linear-column addressing the `src` versions use.
+@inline _cols(A, n) = view(reshape(A, :, size(A, ndims(A))), :, 1:n)
+#
+# The trailing `n` is the live column count a compacted solve narrows to; the solver passes it on
+# every call, so these must accept it or they are not the methods it selects. `src` takes a count
+# rather than a view to stay allocation-free; here a view costs nothing against the kernel launch.
+function NUFSHT._col_hdot!(dst, a::GPUArraysCore.AbstractGPUArray, b,      # dst[k] = Re Σ conj(a)·b
+                           n::Integer = size(a, ndims(a)))
+    av = _cols(a, n); bv = _cols(b, n)
+    view(dst, 1:n) .= dropdims(sum(real.(conj.(av) .* bv); dims = 1); dims = 1)
     return dst
 end
-function NUFSHT._col_axpy_c!(y::GPUArraysCore.AbstractGPUArray, α, x, σ)   # y[:,:,k] += σ·α[k]·x[:,:,k]
-    y .+= σ .* reshape(α, 1, 1, :) .* x
+function NUFSHT._col_axpy!(y::GPUArraysCore.AbstractGPUArray, α, x, σ,     # y[:,k] += σ·α[k]·x[:,k]
+                           n::Integer = size(y, ndims(y)))
+    _cols(y, n) .+= σ .* reshape(view(α, 1:n), 1, :) .* _cols(x, n)
     return y
 end
-function NUFSHT._col_pbp_c!(p::GPUArraysCore.AbstractGPUArray, r, β)       # p[:,:,k] = r + β[k]·p[:,:,k]
-    p .= r .+ reshape(β, 1, 1, :) .* p
+function NUFSHT._col_pbp!(p::GPUArraysCore.AbstractGPUArray, r, β,         # p[:,k] = r[:,k] + β[k]·p[:,k]
+                          n::Integer = size(p, ndims(p)))
+    _cols(p, n) .= _cols(r, n) .+ reshape(view(β, 1:n), 1, :) .* _cols(p, n)
     return p
 end
-
-# ── Device scalar CG reductions ─────────────────────────────────────────────────
-# The real-valued scalar-path analogues of the spin `_col_*_c!` above (the `src` versions are CPU
-# scalar loops over a real `(Nθ,Nφ,B)` array — no `conj`/`real`). Dispatched on the data array being a
-# device array so `nusht_solve!` runs on the GPU; CPU stays on the zero-alloc loop methods.
-function NUFSHT._col_dot!(dst, a::GPUArraysCore.AbstractGPUArray, b)       # dst[k] = Σ_ij a·b
-    dst .= dropdims(sum(a .* b; dims = (1, 2)); dims = (1, 2))
-    return dst
-end
-function NUFSHT._col_axpy!(y::GPUArraysCore.AbstractGPUArray, α, x, σ)     # y[:,:,k] += σ·α[k]·x[:,:,k]
-    y .+= σ .* reshape(α, 1, 1, :) .* x
+function NUFSHT._col_scale!(y::GPUArraysCore.AbstractGPUArray, s,          # y[:,k] *= s[k]
+                            n::Integer = size(y, ndims(y)))
+    _cols(y, n) .*= reshape(view(s, 1:n), 1, :)
     return y
-end
-function NUFSHT._col_pbp!(p::GPUArraysCore.AbstractGPUArray, r, β)         # p[:,:,k] = r + β[k]·p[:,:,k]
-    p .= r .+ reshape(β, 1, 1, :) .* p
-    return p
 end
 
 # ── Device real↔complex field copy (scalar type-2/type-1 bracket) ───────────────

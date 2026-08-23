@@ -9,7 +9,7 @@ communicator (`nothing` → `MPI.COMM_WORLD`).
 - **Synthesis** `A` (coeffs → local field) needs no communication.
 - **Adjoint** `A†` is a sum over points, so each rank computes its local contribution and the result
   is `MPI.Allreduce!`-summed — communication O(lmax²), independent of `M`.
-- **Solve** runs conjugate gradients on the global normal equations `A†A c = A†f` with the adjoint
+- **Solve** runs LSMR on the global least-squares problem `min ‖Ac − f‖` with the adjoint
   and inner products `Allreduce`d; every rank ends with the same replicated solution.
 
 Loaded by `using MPI`.
@@ -25,9 +25,12 @@ using LinearAlgebra: LinearAlgebra
 # does; `nothing` means the world communicator.
 @inline _comm(backend::ComputationalBackends.AbstractMPIBackend) = something(backend.comm, MPI.COMM_WORLD)
 
-# Global real inner product across ranks. `dot` on equal-shaped arrays needs no `vec`, which would
-# allocate a reshape header on both operands every CG iteration.
-_global_dot(a, b, comm) = MPI.Allreduce(LinearAlgebra.dot(a, b), +, comm)
+# `u` lives in POINT space and is partitioned, so its norm is a sum over ranks. The coefficient-space
+# vectors are replicated — every rank holds the same array — so their norms are already global and
+# reducing them would multiply by the rank count. Only this one collective per iteration is real.
+# `dot` on equal-shaped arrays needs no `vec`, which would allocate a reshape header on both operands.
+_global_sq(u, comm) = MPI.Allreduce(LinearAlgebra.dot(u, u), +, comm)
+_local_sq(v) = real(LinearAlgebra.dot(v, v))
 
 """
     nusht_type1!(C, f_local, plan, MPIBackend(; comm)) -> C
@@ -43,71 +46,114 @@ function NUFSHT.nusht_type1!(C, f_local, plan::NUFSHT.NUSHTplan, backend::Comput
 end
 
 """
-    MPICGWorkspace(C, f_local)
+    MPILSMRWorkspace(C, f_local)
 
-Reusable scratch for the MPI solve, mirroring `CGWorkspace` on the shared-memory path: holding one
-across solves makes the solver allocation-free instead of allocating five coefficient arrays and a
-field array per call.
+Reusable scratch for the MPI solve, mirroring [`LSMRWorkspace`](@ref) on the shared-memory path:
+holding one across solves makes the solver allocation-free instead of allocating five coefficient
+arrays and two field arrays per call.
 """
-struct MPICGWorkspace{A, F}
-    rhs::A
-    r::A
-    p::A
-    Ap::A
+struct MPILSMRWorkspace{A, F}
     x::A
-    fbuf::F
+    v::A
+    h::A
+    hbar::A
+    w::A                                        # A†u before it is folded into v
+    u::F                                        # left bidiagonalization vector, this rank's points
+    Av::F
 end
-MPICGWorkspace(C, f_local) =
-    MPICGWorkspace(similar(C), similar(C), similar(C), similar(C), similar(C), similar(f_local))
+MPILSMRWorkspace(C, f_local) =
+    MPILSMRWorkspace(similar(C), similar(C), similar(C), similar(C), similar(C),
+                     similar(f_local), similar(f_local))
 
 """
-    nusht_solve!(C, f_local, plan, MPIBackend(; comm); ws, maxiter, rtol, verbose) -> (C, iters, rel_res)
+    nusht_solve!(C, f_local, plan, MPIBackend(; comm); ws, maxiter, rtol, conlim, verbose) -> (C, iters, rel_res, converged)
 
-MPI point-decomposed **exact inversion**: conjugate gradients on `A†A c = A†f` where the points are
-partitioned across ranks. `A` (synthesis) needs no communication; `A†` and the CG inner products are
-`Allreduce`d. Solves the *global* least-squares system with `C` replicated on every rank.
+MPI point-decomposed **exact inversion**: LSMR on the Golub–Kahan bidiagonalization of `A`, where the
+points are partitioned across ranks. `A` (synthesis) needs no communication; `A†` is `Allreduce`d, as
+is `‖u‖` — the one bidiagonalization scalar that lives in the partitioned point space. Solves the
+*global* least-squares problem with `C` replicated on every rank.
+
+Same contract and return as the shared-memory [`nusht_solve!`](@ref). Every rank runs the identical
+scalar recurrence on identical reduced values, so all ranks stop on the same iteration.
 """
 function NUFSHT.nusht_solve!(C, f_local, plan::NUFSHT.NUSHTplan, backend::ComputationalBackends.AbstractMPIBackend;
-                             ws::MPICGWorkspace = MPICGWorkspace(C, f_local),
-                             maxiter::Int = 500, rtol::Real = 1e-6, verbose::Bool = false)
-    T = eltype(C)
+                             ws::MPILSMRWorkspace = MPILSMRWorkspace(C, f_local),
+                             maxiter::Int = 500, rtol::Real = 1e-6, conlim::Real = 0,
+                             verbose::Bool = false)
+    T = real(eltype(C))
     comm = _comm(backend)
-    rhs = ws.rhs; r = ws.r; p = ws.p; Ap = ws.Ap; x = ws.x; fbuf = ws.fbuf
+    x = ws.x; v = ws.v; h = ws.h; hbar = ws.hbar; w = ws.w; u = ws.u; Av = ws.Av
     isroot = MPI.Comm_rank(comm) == 0        # hoisted: was an MPI call per iteration
+    clim = conlim > 0 ? T(conlim) : one(T) / eps(T)
 
     # Restrict the fit to degrees `l ≤ lmax`, as the serial solver does: the coefficient array is a
     # square representation carrying degrees up to `lmax+|m|`, and that ragged set is not
     # SO(3)-invariant, so fitting it gives a frame-dependent answer.
     valid = NUFSHT._valid_mask(C, T, plan.lmax)
 
-    NUFSHT._nusht_true_adjoint!(rhs, f_local, plan)
-    MPI.Allreduce!(rhs, +, comm)                    # rhs = A†f (replicated)
-    rhs .*= valid
-    rhsnorm = sqrt(_global_dot(rhs, rhs, comm))
+    # A†u, summed across ranks and projected — the operator's adjoint half.
+    atu!(dst, src) = (NUFSHT._nusht_true_adjoint!(dst, src, plan);
+                      MPI.Allreduce!(dst, +, comm); dst .*= valid; dst)
 
-    fill!(x, zero(T)); copyto!(r, rhs); copyto!(p, r)
-    rsold = _global_dot(r, r, comm)
+    copyto!(u, f_local)
+    β = sqrt(_global_sq(u, comm))
+    β > 0 && (u ./= β)
+    atu!(w, u); copyto!(v, w)
+    α = sqrt(_local_sq(v))
+    α > 0 && (v ./= α)
+
+    fill!(x, zero(eltype(C))); fill!(hbar, zero(eltype(C))); copyto!(h, v)
+    αbar = α; ζbar = α * β; atb = α * β
+    ρ = one(T); ρbar = one(T); cbar = one(T); sbar = zero(T)
+    maxrbar = zero(T); minrbar = T(Inf)
+    rel = atb > 0 ? one(T) : zero(T)
     iters = 0
-    rel = one(T)
-    rhsnorm == 0 && (copyto!(C, x); return C, 0, zero(T))
+    atb == 0 && (fill!(C, zero(eltype(C))); return C, 0, zero(T), true)
+
     for i in 1:maxiter
         iters = i
-        NUFSHT.nusht_type2!(fbuf, p, plan)          # A_local p (no communication)
-        NUFSHT._nusht_true_adjoint!(Ap, fbuf, plan) # A†_local (A_local p)
-        MPI.Allreduce!(Ap, +, comm)                 # Ap = A†A p (replicated)
-        Ap .*= valid                                # P A†A P; `p` is already in the subspace
-        α = rsold / _global_dot(p, Ap, comm)
-        x .+= α .* p
-        r .-= α .* Ap
-        rsnew = _global_dot(r, r, comm)
-        rel = sqrt(rsnew) / rhsnorm
+        NUFSHT.nusht_type2!(Av, v, plan)            # A_local v (no communication)
+        @. u = Av - α * u
+        β = sqrt(_global_sq(u, comm))
+        β > 0 && (u ./= β)
+        atu!(w, u)
+        @. v = w - β * v
+        α = sqrt(_local_sq(v))
+        α > 0 && (v ./= α)
+
+        ρold = ρ; ρbarold = ρbar
+        r = hypot(αbar, β)
+        c = r > 0 ? αbar / r : one(T)
+        s = r > 0 ? β / r : zero(T)
+        θnew = s * α
+        αbar = c * α
+        ρ = r
+
+        θbar = sbar * r
+        ρtemp = cbar * r
+        rb = hypot(ρtemp, θnew)
+        cbar = rb > 0 ? ρtemp / rb : one(T)
+        sbar = rb > 0 ? θnew / rb : zero(T)
+        ρbar = rb
+        ζ = cbar * ζbar
+        ζbar = -sbar * ζbar
+
+        maxrbar = max(maxrbar, ρbarold)
+        i > 1 && (minrbar = min(minrbar, ρbarold))
+        condA = max(maxrbar, ρtemp) / max(min(minrbar, ρtemp), eps(T))
+
+        c1 = ρold * ρbarold > 0 ? -(θbar * r / (ρold * ρbarold)) : zero(T)
+        @. hbar = h + c1 * hbar
+        r * rb > 0 && (@. x += (ζ / (r * rb)) * hbar)
+        c3 = r > 0 ? -(θnew / r) : zero(T)
+        @. h = v + c3 * h
+
+        rel = abs(ζbar) / atb
         (verbose && isroot) && @info "nusht_solve! (MPI) iter $i rel_res=$rel"
-        rel < rtol && break
-        p .= r .+ (rsnew / rsold) .* p
-        rsold = rsnew
+        (rel < rtol || condA >= clim || !(r > 0) || !(rb > 0) || α == 0 || β == 0) && break
     end
     copyto!(C, x)
-    return C, iters, rel
+    return C, iters, rel, rel < rtol
 end
 
 end # module NUFSHTMPIExt
