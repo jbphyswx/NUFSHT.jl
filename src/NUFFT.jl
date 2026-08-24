@@ -42,18 +42,55 @@ struct NonuniformFFTsBackend <: SpectralBackends.AbstractNUFFTSpectralBackend en
 @inline _ext_loaded(name::Symbol) = Base.get_extension(@__MODULE__, name) !== nothing
 
 """
+    _width_narrowable(backend) -> Bool
+
+Whether the backend can build a plan at a reduced transform count at all, so that a batched solve can
+transform only its live columns once the rest have retired. `false` by default; a backend that cannot
+re-plan has nothing to narrow to.
+"""
+_width_narrowable(::SpectralBackends.AbstractSpectralBackend) = false
+_width_narrowable(::FINUFFTBackend) = true
+_width_narrowable(::NonuniformFFTsBackend) = true
+
+"""
     _width_polymorphic(backend) -> Bool
 
 Whether plans for different transform counts share one concrete type. `false` by default, because a
-backend is free to carry the count in its plan's type parameters — `NonuniformFFTs.PlanNUFFT{Z,N,Nc,…}`
-does, while `FINUFFT.finufft_plan{T}` keeps it as a runtime field.
+backend is free to carry the count in its plan's type parameters — `NonuniformFFTs.PlanNUFFT` does, in
+three of them (the count itself, and again inside its `RealNUFFTData` and `BlockDataCPU` parameters),
+while `FINUFFT.finufft_plan{T}` keeps it as a runtime field.
 
-A batched solve narrows its transforms as columns retire, which needs a cache of plan sets at several
-widths. That cache can only stay concretely typed where this is `true`; where it is `false`, narrowing
-is disabled and the solve runs at full width throughout. Correctness never depends on it.
+Narrowing needs this as well as [`_width_narrowable`](@ref), and for a stronger reason than the cache
+needing one element type: **a width that appears in the plan's type is a separate specialization**, so
+each new width recompiles that backend's whole spreading and interpolation path. Where the count is a
+runtime field, one compilation serves every width. That difference is large enough to invert the
+decision — narrowing buys a modest fraction of a solve, and only when columns retire far apart, which
+they do not often do, since every column of a batch shares the point set and therefore `A` and its
+singular values. So where this is `false`, staying at full width is the faster choice rather than a
+fallback, and the two traits together say which case a backend is in.
+
+Correctness never depends on either. The per-column sphere loop and the solver's vector reductions
+narrow on every backend regardless — that part is uniform and free.
 """
 _width_polymorphic(::SpectralBackends.AbstractSpectralBackend) = false
 _width_polymorphic(::FINUFFTBackend) = true
+
+"""
+    _real_capable(backend) -> Bool
+
+Whether the backend implements a genuine **real-data** transform: real non-uniform values, and the
+uniform side stored as the half-spectrum a real signal determines. `false` by default.
+
+A real field's mode array is exactly Hermitian (`Z[-k] = conj(Z[k])`), so half of it is redundant. A
+backend that knows this halves the FFT *and* the spreading/interpolation, since the strengths are real
+too. NonuniformFFTs does; FINUFFT has no real transform at all, and the only trick available there is
+to hand it a smaller complex mode array — which shrinks the upsampled FFT but not the spreading, and
+is measurably a loss once the point count dominates the mode count.
+
+Correctness never depends on this: the folded and full assemblies represent the same series.
+"""
+_real_capable(::SpectralBackends.AbstractSpectralBackend) = false
+_real_capable(::NonuniformFFTsBackend) = true
 
 """
     _resolve_nufft(backend) -> backend

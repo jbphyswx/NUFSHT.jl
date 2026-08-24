@@ -7,9 +7,12 @@ Double Fourier Sphere (DFS) + nuFFT spherical harmonic transforms at arbitrary s
 - **S** (`plan_sph2fourier`): the Legendre step, taking SH coefficients to the Double-Fourier-Sphere
   bivariate Fourier series. No equiangular grid is formed.
 - **F** (`_assemble_modes!`): the cos/sin bivariate Fourier basis `S` produces, rewritten as the
-  complex exponentials a NUFFT evaluates. Both mode axes carry wavenumbers `-lmax…lmax`.
-- **N** (FINUFFT guru type 2 / type 1): non-uniform FFT evaluating the 2D Fourier series at the
-  scattered points.
+  complex exponentials a NUFFT evaluates. The φ axis carries wavenumbers `-lmax…lmax`, the θ axis
+  `-(lmax+1)…lmax+1` — one further out, because the coefficient array's supernumerary slots hold
+  degrees up to `lmax+|m|` and an odd-order column reaches θ-frequency `lmax+1`.
+- **N** (NUFFT guru type 2 / type 1): non-uniform FFT evaluating the 2D Fourier series at the
+  scattered points. A real-eltype plan on a backend with a real-data transform stores only `kθ ≥ 0`
+  and lets that backend supply the Hermitian half, halving both the mode array and the spreading.
 
 A [`NUSHTplan`](@ref) owns persistent FINUFFT guru plans (built once, points set once) and every
 work buffer, so repeated transforms — filtering, or the hundreds of matvecs in [`nusht_solve!`](@ref)
@@ -251,16 +254,12 @@ _rephase_conj!(fbuf, s::AbstractVector) = (fbuf .*= conj.(s); fbuf)
 @inline _pfx(A::AbstractMatrix, k::Integer) = view(A, :, 1:k)
 
 # Size-dependent plans for a working width. The full width uses the plan's own, so that path is
-# untouched by the pool's existence; narrower widths come from `size_pool`.
-# Both branches return the pool's element type, so this stays statically dispatched. A miss builds and
-# caches the width, which is why the full-width branch comes first: it is the common case and never
-# touches the cache.
+# untouched by the pool's existence and never reads it; narrower widths come from `size_pool` through
+# `_pool_lookup!`, which builds and stores the width on a miss. The full-width branch comes first
+# because it is the common case.
 @inline function _width_plans(plan::NUSHTplan, k::Integer)
     k == plan.B && return (k = Int(k), nufft_type2 = _nufft2(plan), nufft_type1 = _nufft1(plan))
-    @inbounds for e in plan.size_pool
-        e.k == k && return e
-    end
-    return _build_width!(plan, k)
+    return _pool_lookup!(plan.size_pool, k, kk -> _build_width!(plan, kk))
 end
 
 # F·N (forward): bivariate Fourier coefficients → complex mode array → type-2 NUFFT into `fbuf`.
@@ -596,7 +595,7 @@ end
 
 # One `A` and one `A†`, at the live width. `k` is the live column count the per-column sphere loop
 # narrows to; `kdfn` is the NUFFT plan width, which can only narrow where the backend's plans are
-# width-polymorphic (`_width_polymorphic`) and otherwise stays at `B`.
+# able to re-plan at a reduced width (`_width_narrowable`) and otherwise stays at `B`.
 #
 # `A v` lands in the plan's own strengths buffer, so `u ← A v − α u` needs no second point-space array:
 # scale `u` first, then accumulate the synthesis onto it.

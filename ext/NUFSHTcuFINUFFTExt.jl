@@ -2,10 +2,10 @@
     NUFSHTcuFINUFFTExt
 
 The single CUDA-specific piece of the device path: the **cuFINUFFT** NUFFT binding. Everything else
-that runs on device is vendor-agnostic — the DFS kernels are KernelAbstractions `@kernel`s dispatched
-on `AbstractGPUArray` (NUFSHTKernelAbstractionsExt), the FFT (scalar path) goes through `AbstractFFTs`,
-and the plan buffers are allocated `similar` to the (device) node arrays. Only the NUFFT has no
-device fallback, so it is bound per-vendor here; a ROCm/Metal NUFFT would be an analogous one-method
+that runs on device is vendor-agnostic — the mode assembly and the spin S-engine are
+KernelAbstractions `@kernel`s dispatched on `AbstractGPUArray` (NUFSHTKernelAbstractionsExt), and the
+plan buffers are allocated `similar` to the (device) node arrays. Only the NUFFT has no device
+fallback, so it is bound per-vendor here; a ROCm/Metal NUFFT would be an analogous one-method
 extension.
 
 A `CuArray` node set selects cuFINUFFT via the creation seam (`_nufft_makeplan`); execution and
@@ -34,8 +34,10 @@ end
 # underlying cuFINUFFT plan (a foreign handle whose printer is not safe to call from Julia).
 Base.show(io::IO, ::CuNUFFTPlan) = print(io, "CuNUFFTPlan(cuFINUFFT)")
 
+# `strengths` is absorbed for the same reason as in the host extension: cuFINUFFT's non-uniform data
+# is always complex.
 NUFSHT._nufft_makeplan(::NUFSHT.FINUFFTBackend, ::CUDA.CuArray, type, n_modes, iflag, ntrans, tol;
-                       nthreads = nothing, kwargs...) =
+                       nthreads = nothing, strengths = nothing, kwargs...) =
     CuNUFFTPlan(FINUFFT.cufinufft_makeplan(type, n_modes, iflag, ntrans, tol; kwargs...))
 NUFSHT._nufft_setpts!(p::CuNUFFTPlan, x, y) = (FINUFFT.cufinufft_setpts!(p.plan, x, y); p)
 NUFSHT._nufft_exec!(p::CuNUFFTPlan, input, output) = (FINUFFT.cufinufft_exec!(p.plan, input, output); output)

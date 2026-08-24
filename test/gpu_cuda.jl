@@ -53,8 +53,8 @@ else
         end
     end
 
-    # Scalar path on device: the full A = N·F·D·S pipeline (FastTransforms S-step host-bounces, DFS
-    # doubling is a KA kernel, the 2-D FFT goes through AbstractFFTs ⇒ CUFFT, the NUFFT via cuFINUFFT).
+    # Scalar path on device: the full A = N·F·S pipeline (the FastTransforms S-step host-bounces
+    # through `Fslice`, the F mode assembly is a KA kernel, the NUFFT is cuFINUFFT).
     # `make_plan(CuArray)` must yield device-resident buffers and run.
     @testset "CUDA device scalar transform == CPU" begin
         Random.seed!(11)

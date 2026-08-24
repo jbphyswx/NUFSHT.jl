@@ -27,8 +27,10 @@ using FINUFFT: FINUFFT
     (`M < 2Nθ·Nφ`). The spin path is complex and passes the full mode array.
 =#
 
+# `strengths` is absorbed, not forwarded: FINUFFT has no real-data transform, so its non-uniform data
+# is always complex and the seam's request for a real one has nothing to select here.
 NUFSHT._nufft_makeplan(::NUFSHT.FINUFFTBackend, ::AbstractVector, type, n_modes, iflag, ntrans, tol;
-                       kwargs...) =
+                       strengths = nothing, kwargs...) =
     FINUFFT.finufft_makeplan(type, n_modes, iflag, ntrans, tol; kwargs...)
 
 # Host FINUFFT needs host coordinate vectors; `_host` is a no-op for an `Array`.
