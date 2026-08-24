@@ -128,6 +128,25 @@ reflection encodes: the DFS extension of `Y_lm` in θ is `sin^|m|θ · Q(cosθ)`
 Trapani–Navaza Wigner-`d` recurrence — O(lmax²) memory, numerically stable to lmax ≈ 1024, and also
 the device S-engine.)
 
+### The real fast path
+
+The field element type is positional, as in `zeros(T, …)`, and it is a statement about the data:
+`make_plan(Float64, …)` asserts the field **values** are real, which makes the mode array Hermitian in
+`kθ`. On a NUFFT backend with a genuine real-data transform — `NonuniformFFTsBackend`; FINUFFT has
+none — only the `kθ ≥ 0` half is then built and only real strengths come back, so the mode array, the
+upsampled FFT **and** the spreading/interpolation all halve:
+
+```julia
+make_plan(Float64,    θ, φ, lmax; nufft = NonuniformFFTsBackend())   # kθ ≥ 0, real strengths
+make_plan(ComplexF64, θ, φ, lmax; nufft = NonuniformFFTsBackend())   # full array
+```
+
+Forward, that is free: writing the half and letting the complex-to-real transform imply the conjugate
+is exact, no weights. Its **transpose** is not — the embedding `Z[−k] = conj(Z[k])` is `ℝ`-linear but
+not `ℂ`-linear, so `A†` carries a factor `2` on every `kθ > 0` row (`{1, 2, 2, …}`, one at `kθ = 0`
+because that row is its own partner). There is no third case at the top: the θ axis has odd length
+`2·lmax+3` and so has no self-paired Nyquist row.
+
 ### Adjoint vs inverse
 
 - **`nusht_type1!`** is `A†` — the exact Euclidean **transpose**, not an inverse. At scattered points

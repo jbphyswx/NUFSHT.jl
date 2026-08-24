@@ -16,7 +16,7 @@ A = N \cdot F \cdot S
 |------|------|---------------|------|
 | **S** | `plan_sph2fourier` | ``K \to N_\theta \times N_\phi`` | ``O(K \log K)`` via FastTransforms |
 | **F** | `_assemble_modes!` | ``N_\theta \times N_\phi \to (2l_\text{max}+3) \times (2l_\text{max}+1)`` | ``O(K)`` |
-| **N** | NUFFT type 2 | Fourier modes ``\to \mathbb{R}^M`` | ``O(K \log K + M)`` via FINUFFT |
+| **N** | NUFFT type 2 | Fourier modes ``\to \mathbb{R}^M`` | ``O(K \log K + M)``, via the chosen backend |
 
 where ``K = (l_\text{max}+1)(2l_\text{max}+1)`` is the number of SH coefficients and
 ``N_\theta = l_\text{max}+1``, ``N_\phi = 2l_\text{max}+1``.
@@ -107,15 +107,40 @@ not determine those coefficients (``M`` below ``(l_\text{max}+1)^2``), the solve
 the minimum-norm least-squares solution and reports `converged = false` when it cannot
 reach `rtol`.
 
-## Phase convention
+## The real fast path
 
-The CC grid places data at cell centres
-``\theta_i = \pi(i - 1/2)/N_\theta`` for ``i = 1,\ldots,N_\theta``, which are
-offset by half a pixel from FFTW's assumed integer-index positions.
+The field element type passed to `make_plan` is a statement about the data, not a storage
+preference: `Float64`/`Float32` assert the field **values** are real, and a real field's
+mode array is Hermitian, ``Z[-k] = \overline{Z[k]}``. On a NUFFT backend with a genuine
+real-data transform (`NonuniformFFTsBackend`; FINUFFT has none) only the ``k_\theta \geq 0``
+half is then built — ``l_\text{max}+2`` rows instead of ``2 l_\text{max}+3`` — and only real
+strengths come back, so the mode array, the upsampled FFT **and** the spreading/interpolation
+all halve. Measured against the same backend's unfolded path at the same points and modes,
+identical iteration counts, results agreeing to ``2 \times 10^{-16}``:
 
-The FFT step applies a per-mode phase correction
-``e^{-i\pi k_\theta / N_\theta}`` to compensate, so that FINUFFT evaluated at
-natural ``\theta \in [0,\pi]`` coordinates gives the correct values.
+| ``l_\text{max}``, ``M`` | synthesis | `nusht_solve!` |
+|---|---|---|
+| 64, ``10^4`` | 1.52× | 1.51× |
+| 64, ``10^5`` | 1.15× | 1.31× |
+| 128, ``2\times10^4`` | 1.96× | 1.89× |
+| 128, ``2\times10^5`` | 1.23× | 1.21× |
+
+Near 2× where modes dominate, settling to ~1.2× where the point count does.
+
+Forward, the fold is free: writing the half and letting the complex-to-real transform imply
+the conjugate is exact, with no weights. Its **transpose** is not. The embedding
+``E : Z_{1/2} \mapsto Z``, ``Z[-k] = \overline{Z[k]}``, is ``\mathbb{R}``-linear but not
+``\mathbb{C}``-linear, so
+
+```math
+E^\dagger \hat{Z} = \hat{Z}[k] + \overline{\hat{Z}[-k]} = 2\,\hat{Z}[k] \quad (k_\theta > 0),
+```
+
+using ``\overline{\hat{Z}[-k]} = \hat{Z}[k]`` for real strengths. Hence the diagonal
+``\{1, 2, 2, \ldots\}``: one at ``k_\theta = 0``, which is its own partner, two above it. There
+is no third case at the top, because the ``\theta`` axis has odd length ``2 l_\text{max}+3``
+and therefore no self-paired Nyquist row — an even axis would need one. A complex field, or a
+backend without a real transform, uses the full array and no weights in either direction.
 
 ## References
 

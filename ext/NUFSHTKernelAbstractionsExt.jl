@@ -7,10 +7,9 @@ KA backend (CUDA/ROCm/Metal/oneAPI, and the reference `JLArray`/KA-CPU backend u
 without per-vendor code. The plain CPU `Array` methods in `src` are untouched; a GPU-backed array is
 `<:AbstractGPUArray` so these more-specific methods win for it.
 
-Only the genuinely scatter/gather steps need kernels — the spin Wigner recurrence and contraction,
-and the per-column solver primitives. Everything else in the pipeline is already array-generic: the
-mode assembly is an indexed loop over a small coefficient array, and the NUFFT is dispatched through
-the `_nufft_*` seam (cuFINUFFT via the CUDA extension).
+Every array-indexed step needs a kernel — the scalar mode assembly and its adjoint, the spin Wigner
+recurrence and contraction, the solver's per-column primitives and the spectral filter. The NUFFT is
+not among them: it is dispatched through the `_nufft_*` seam (cuFINUFFT via the CUDA extension).
 
 Loaded by `using KernelAbstractions` (with `GPUArraysCore`).
 """
@@ -31,6 +30,43 @@ using GPUArraysCore: GPUArraysCore
 @inline function _sync(backend)
     applicable(KernelAbstractions.synchronize, backend) && KernelAbstractions.synchronize(backend)
     return nothing
+end
+
+# ── Device scalar mode assembly (F) ─────────────────────────────────────────────
+# Both directions of `src/Modes.jl` are per-element gathers, so each is one workitem per output
+# element with no atomics and no fill pass, calling the very same `_mode_entry`/`_mode_adjoint_entry`
+# the host loops do — the arithmetic exists once. The plan buffers are `(…, …, B)`, so `ndrange` is
+# the whole output including the batch axis.
+
+@kernel function _modes_kern!(Z, @Const(G), lmax, offθ, offφ, n0, nm, h)
+    r, c, b = @index(Global, NTuple)
+    @inbounds Z[r, c, b] = NUFSHT._mode_entry(eltype(Z), G, lmax, r, c, b, offθ, offφ, n0, nm, h)
+end
+
+@kernel function _modes_adj_kern!(G, @Const(Z), lmax, offθ, offφ, fold, n0, nm, h)
+    i, j, b = @index(Global, NTuple)
+    @inbounds G[i, j, b] = NUFSHT._modes_out(eltype(G),
+        NUFSHT._mode_adjoint_entry(eltype(Z), Z, lmax, i, j, b, offθ, offφ, fold, n0, nm, h))
+end
+
+function NUFSHT._assemble_modes!(Z::GPUArraysCore.AbstractGPUArray, G, lmax::Integer)
+    n0, nm, h = NUFSHT._mode_norms(real(eltype(Z)))
+    offθ = NUFSHT._folded(Z, lmax) ? 1 : size(Z, 1) ÷ 2 + 1
+    backend = KernelAbstractions.get_backend(Z)
+    _modes_kern!(backend)(Z, G, Int(lmax), offθ, size(Z, 2) ÷ 2 + 1, n0, nm, h;
+                          ndrange = size(Z))
+    _sync(backend)
+    return Z
+end
+
+function NUFSHT._assemble_modes_adjoint!(G::GPUArraysCore.AbstractGPUArray, Z, lmax::Integer)
+    n0, nm, h = NUFSHT._mode_norms(real(eltype(Z)))
+    fold = NUFSHT._folded(Z, lmax)
+    backend = KernelAbstractions.get_backend(G)
+    _modes_adj_kern!(backend)(G, Z, Int(lmax), fold ? 1 : size(Z, 1) ÷ 2 + 1, size(Z, 2) ÷ 2 + 1,
+                              fold, n0, nm, h; ndrange = size(G))
+    _sync(backend)
+    return G
 end
 
 # ── Device spin S-engine: on-the-fly Trapani–Navaza recurrence + G-contraction ──

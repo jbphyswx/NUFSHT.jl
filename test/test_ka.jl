@@ -10,6 +10,36 @@ Test.@testset "KernelAbstractions extension: JLArray is a device array" begin
     Test.@test JLArrays.JLArray <: GPUArraysCore.AbstractGPUArray
 end
 
+# The scalar F step (`P·C` → the complex exponential mode array) as KA kernels. Both directions are
+# per-element gathers sharing `_mode_entry`/`_mode_adjoint_entry` with the host loops, so device and
+# host must agree bit-for-bit — this is the whole scalar mode assembly, exercised in both layouts (the
+# full `2lmax+3`-row array and the folded `lmax+2`-row real one) and at both coefficient element types.
+Test.@testset "KernelAbstractions extension: device scalar mode assembly on JLArray" begin
+    Random.seed!(101)
+    for (lmax, B) in ((8, 1), (11, 3)), FE in (Float64, ComplexF64)
+        N = lmax + 1; Nφ = 2lmax + 1
+        G = FE <: Real ? randn(N, Nφ, B) : randn(ComplexF64, N, Nφ, B)
+        for rows in (2lmax + 3, lmax + 2)          # full and folded
+            Zc = zeros(ComplexF64, rows, Nφ, B)
+            NUFSHT._assemble_modes!(Zc, G, lmax)
+            Zj = JLArrays.JLArray(zeros(ComplexF64, rows, Nφ, B))
+            NUFSHT._assemble_modes!(Zj, JLArrays.JLArray(G), lmax)
+            Test.@test Array(Zj) == Zc
+            # The device method must be the one dispatch actually picks, or this compares host to host.
+            Test.@test which(NUFSHT._assemble_modes!,
+                             (typeof(Zj), typeof(JLArrays.JLArray(G)), Int)).module ===
+                       Base.get_extension(NUFSHT, :NUFSHTKernelAbstractionsExt)
+
+            Z = randn(ComplexF64, rows, Nφ, B)
+            Gc = zeros(FE, N, Nφ, B); NUFSHT._assemble_modes_adjoint!(Gc, Z, lmax)
+            Gj = JLArrays.JLArray(zeros(FE, N, Nφ, B))
+            NUFSHT._assemble_modes_adjoint!(Gj, JLArrays.JLArray(Z), lmax)
+            Test.@test Array(Gj) == Gc
+        end
+    end
+    @info "KernelAbstractions ext: device scalar mode assembly matches CPU on JLArray (full + folded, real + complex)"
+end
+
 # The spin S-engine (Trapani–Navaza recurrence + bivariate-Fourier contraction) as KA kernels — the
 # device path for the whole spin transform (only the NUFFT is vendor-specific, via cuFINUFFT). Must
 # reproduce the CPU `_assemble_G!`/`_assemble_G_adjoint!` bit-for-bit on JLArray.
@@ -71,10 +101,9 @@ Test.@testset "KernelAbstractions extension: device column primitives, complex (
 end
 
 # A plan built from device node arrays must have ALL buffers device-resident. Only the spin path can
-# be checked here: the scalar path needs an FFT for the array type, and nothing implements
-# AbstractFFTs for `JLArray` (cuFFT covers `CuArray` only) — host FFTW's method matches anyway,
-# because JLArrays are `<: StridedArray`, and then fails on the pointer conversion. The scalar device
-# path is exercised on real hardware in test/gpu_cuda.jl.
+# be checked here: building a scalar plan needs a NUFFT for the array type, and the only device NUFFT
+# is cuFINUFFT, which is `CuArray`-only. The scalar path's own device kernels are covered above
+# without a plan; end to end it is exercised on real hardware in test/gpu_cuda.jl.
 Test.@testset "KernelAbstractions extension: device plan buffers are device-resident (JLArray)" begin
     isdev(x) = x isa GPUArraysCore.AbstractGPUArray
     Random.seed!(404)
