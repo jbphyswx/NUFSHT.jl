@@ -111,12 +111,21 @@ reach `rtol`.
 
 The field element type passed to `make_plan` is a statement about the data, not a storage
 preference: `Float64`/`Float32` assert the field **values** are real, and a real field's
-mode array is Hermitian, ``Z[-k] = \overline{Z[k]}``. On a NUFFT backend with a genuine
-real-data transform (`NonuniformFFTsBackend`; FINUFFT has none) only the ``k_\theta \geq 0``
-half is then built — ``l_\text{max}+2`` rows instead of ``2 l_\text{max}+3`` — and only real
-strengths come back, so the mode array, the upsampled FFT **and** the spreading/interpolation
-all halve. Measured against the same backend's unfolded path at the same points and modes,
-identical iteration counts, results agreeing to ``2 \times 10^{-16}``:
+mode array is Hermitian, ``Z[-k] = \overline{Z[k]}``. Only the ``k_\theta \geq 0`` half is
+therefore stored — ``l_\text{max}+2`` rows instead of ``2 l_\text{max}+3`` — on **every**
+backend: halving the ``\theta`` axis halves the deconvolution and the upsampled FFT and leaves
+the interpolation untouched, so it is never more work than the full array.
+
+How the missing half is supplied splits into two cases. On a backend with a genuine real-data
+transform (`NonuniformFFTsBackend`; FINUFFT has none) the transform is built for the full
+``\theta`` axis, is handed the half-spectrum, and reconstructs the rest itself — with **real
+strengths**, so the spreading/interpolation halves too and the forward needs no weights.
+Without one, the transform itself is half-height and complex: its centered rows are labelled
+``k_\theta - \lceil\cdot\rceil``, which a per-point phase undoes, and the absent conjugate
+half is paid for by doubling every ``k_\theta > 0`` row on the way in.
+
+Measured for the real-data case against the same backend's unfolded path at the same points
+and modes, identical iteration counts, results agreeing to ``2 \times 10^{-16}``:
 
 | ``l_\text{max}``, ``M`` | synthesis | `nusht_solve!` |
 |---|---|---|
@@ -139,8 +148,8 @@ E^\dagger \hat{Z} = \hat{Z}[k] + \overline{\hat{Z}[-k]} = 2\,\hat{Z}[k] \quad (k
 using ``\overline{\hat{Z}[-k]} = \hat{Z}[k]`` for real strengths. Hence the diagonal
 ``\{1, 2, 2, \ldots\}``: one at ``k_\theta = 0``, which is its own partner, two above it. There
 is no third case at the top, because the ``\theta`` axis has odd length ``2 l_\text{max}+3``
-and therefore no self-paired Nyquist row — an even axis would need one. A complex field, or a
-backend without a real transform, uses the full array and no weights in either direction.
+and therefore no self-paired Nyquist row — an even axis would need one. A complex field is not
+Hermitian and uses the full array with no weights in either direction.
 
 ## References
 

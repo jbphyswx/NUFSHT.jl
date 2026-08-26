@@ -202,9 +202,18 @@ Test.@testset "KernelAbstractions extension: device solver bookkeeping never sca
     pc = copy(a); NUFSHT._col_pbp!(pc, b, β, n)
     qc = copy(a); NUFSHT._col_scale!(qc, s, n)
 
+    # The scalar solver's vectors are packed to the `l ≤ lmax` slots, so its iterate is `(K, B)` and
+    # retirement scatters a column back into the plan's `(Nθ, Nφ, B)` layout. Build a real plan for the
+    # index vector and the shapes — its transforms are never run here.
+    θp, φp = fib_points(64)
+    splan = NUFSHT.make_plan(Float64, θp, φp, N - 1; tol = 1e-8)
+    idx = NUFSHT._valid_indices(zeros(0), N - 1)
+    K = length(idx)
+    xp = randn(K, B)
+
     dj = J(zeros(B)); yj = J(copy(a)); pj = J(copy(a)); qj = J(copy(a)); Cj = J(zeros(N, Nf, B))
-    ws = NUFSHT.LSMRWorkspace(J(copy(x)), J(copy(a)), J(copy(a)), J(copy(a)), J(copy(a)),
-                              J(zeros(mlen, B)), J(ones(N, Nf, 1)), collect(1:B),
+    ws = NUFSHT.LSMRWorkspace(J(copy(xp)), J(zeros(K, B)), J(zeros(K, B)), J(zeros(K, B)),
+                              J(copy(a)), J(zeros(mlen, B)), J(idx), collect(1:B),
                               J(zeros(B)), J(zeros(B)),
                               ntuple(_ -> zeros(B), 17)...)
     nlive = no_scalar() do
@@ -214,16 +223,21 @@ Test.@testset "KernelAbstractions extension: device solver bookkeeping never sca
         NUFSHT._col_scale!(qj, J(s), n)
         ws.rel .= (1e-9, 0.5, 0.4, 0.3)
         ws.done .= (1.0, 1.0, 0.0, 0.0)            # slots 1 and 2 finished, 3 and 4 live
-        NUFSHT._retire_and_compact!(Cj, ws, 1e-6, B, len, mlen)
+        NUFSHT._retire_and_compact!(Cj, ws, splan, 1e-6, B, K, mlen)
     end
+    NUFSHT.close!(splan)
 
     Test.@test Array(dj)[1:n] ≈ dc[1:n]
     Test.@test all(Array(dj)[(n + 1):end] .== 0)   # the count really did bound the reduction
     Test.@test Array(yj) ≈ yc
     Test.@test Array(pj) ≈ pc
     Test.@test Array(qj) ≈ qc
-    # Retirement writes slot `s` to column `perm[s]`; before compaction that is the identity.
-    Test.@test Array(Cj)[:, :, 1] == x[:, :, 1] && Array(Cj)[:, :, 2] == x[:, :, 2]
+    # Retirement scatters slot `s` to column `perm[s]` — the identity before compaction — putting the
+    # packed values at the valid slots and zero everywhere else.
+    for c in 1:2
+        Test.@test Array(Cj)[:, :, c][idx] == xp[:, c]
+        Test.@test sum(abs, Array(Cj)[:, :, c]) == sum(abs, xp[:, c])   # nothing outside them
+    end
     Test.@test nlive == 2
     Test.@test sort(ws.perm) == collect(1:B)
     Test.@test ws.colres[1] == 1e-9 && ws.colres[2] == 0.5

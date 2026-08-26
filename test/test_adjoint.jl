@@ -14,9 +14,9 @@ Test.@testset "Euclidean adjoint, zero-allocation, and batching" begin
     M = 400
     θ = π .* rand(M)
     φ = 2π .* rand(M)
-    # `nthreads = 1`: the zero-allocation guarantee is FINUFFT-single-threaded (see the alloc testset
-    # below). With the all-cores default FINUFFT takes its FFTW-planner lock per exec and allocates a
-    # little outside our control, which `nusht_filter!` multiplies since it now runs a solve.
+    # Left on `Auto` so the adjoint identity below is checked on whatever path a real field actually
+    # takes by default — for a real `FE` that is the folded half-height mode array, whose transpose
+    # weights are the part most easily got wrong.
     plan = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-12, nthreads = 1)
 
     Test.@testset "scalar Euclidean adjoint ⟨Ax,y⟩ = ⟨x,A†y⟩ (scattered)" begin
@@ -32,33 +32,44 @@ Test.@testset "Euclidean adjoint, zero-allocation, and batching" begin
     end
 
     Test.@testset "zero-allocation on warmed-up calls" begin
+        # A whole-transform count includes the backend's own exec, so it can only be pinned to zero on a
+        # backend that is itself allocation-free — FINUFFT is, NonuniformFFTs spawns tasks in its
+        # deconvolution. NUFSHT's own stages are asserted zero on *both* in `test_allocs.jl`; here the
+        # other backends are measured and reported so a regression in their share is still visible.
+        fp = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-12, nthreads = 1, nufft = NUFSHT.FINUFFTBackend())
         C = randn(Nθ, Nφ); f = randn(M); out = zeros(M)
         Cout = zeros(Nθ, Nφ); Aty = zeros(Nθ, Nφ)
         filt = NUFSHT.gaussian_from_scale(2000e3)
         # Filtering fits coefficients, so it needs a solver workspace; supplying one is what makes it
         # allocation-free, exactly as the docstring says.
-        ws = NUFSHT.LSMRWorkspace(plan)
-        NUFSHT.nusht_type2!(out, C, plan)          # warmup
-        NUFSHT.nusht_type1!(Cout, f, plan)
-        NUFSHT._nusht_true_adjoint!(Aty, f, plan)
-        NUFSHT.nusht_filter!(out, f, filt, plan; ws = ws)
+        ws = NUFSHT.LSMRWorkspace(fp)
+        NUFSHT.nusht_type2!(out, C, fp)          # warmup
+        NUFSHT.nusht_type1!(Cout, f, fp)
+        NUFSHT._nusht_true_adjoint!(Aty, f, fp)
+        NUFSHT.nusht_filter!(out, f, filt, fp; ws = ws)
         # The zero-alloc guarantee holds single-threaded. Under a multithreaded Julia,
         # FFTW/FINUFFT/FastTransforms internal threading (e.g. FINUFFT's FFTW-planner lock) adds small
         # external per-call allocations outside our control — there we only report the count.
         if Threads.nthreads() == 1
-            Test.@test _alloc_t2(out, C, plan) == 0
-            Test.@test _alloc_t1(Cout, f, plan) == 0
-            Test.@test _alloc_adj(Aty, f, plan) == 0
-            Test.@test _alloc_filt(out, f, filt, plan, ws) == 0
+            Test.@test _alloc_t2(out, C, fp) == 0
+            Test.@test _alloc_t1(Cout, f, fp) == 0
+            Test.@test _alloc_adj(Aty, f, fp) == 0
+            Test.@test _alloc_filt(out, f, filt, fp, ws) == 0
         else
-            a = _alloc_filt(out, f, filt, plan, ws)
+            a = _alloc_filt(out, f, filt, fp, ws)
             @info "zero-alloc is a single-threaded guarantee. With $(Threads.nthreads()) Julia threads and nthreads=0 (all cores), nusht_filter! allocates $a B externally via FINUFFT/FFTW's thread-safe planner lock — build the plan with nthreads=1 (or run single-threaded) for zero allocation."
         end
+        NUFSHT.close!(fp)
+
+        aws = NUFSHT.LSMRWorkspace(plan)
+        NUFSHT.nusht_type2!(out, C, plan); NUFSHT.nusht_type1!(Cout, f, plan)
+        NUFSHT._nusht_true_adjoint!(Aty, f, plan); NUFSHT.nusht_filter!(out, f, filt, plan; ws = aws)
+        @info "default-backend per-call allocation (backend exec included): type2=$(_alloc_t2(out, C, plan)) B, type1=$(_alloc_t1(Cout, f, plan)) B, adjoint=$(_alloc_adj(Aty, f, plan)) B"
     end
 
     Test.@testset "batched ntrans == looped single transforms (scalar)" begin
-        # nthreads=1 so the batched (one B-way plan) and looped (B single plans) FINUFFT adjoints use
-        # the same deterministic reduction — a mechanism test, exact by construction.
+        # nthreads=1 so the batched (one B-way plan) and looped (B single plans) adjoints use the same
+        # deterministic reduction — a mechanism test, exact by construction.
         B = 3
         planB = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-12, ntrans = B, nthreads = 1)
         plan1 = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-12, nthreads = 1)

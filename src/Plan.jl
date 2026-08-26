@@ -12,9 +12,10 @@ using AbstractFFTs: AbstractFFTs
 using FFTW: FFTW
 using FastTransforms: FastTransforms
 
-export AbstractNUSHTplan, NUSHTplan, make_plan, close!, set_nodes!
+export AbstractNUSHTplan, NUSHTplan, make_plan, close!, set_nodes!, plan_memory
 export AbstractNodeSet, FixedCountNodes, VariableCountNodes
 export AbstractPlanTuning, NoTuning, AutoTuning, ThoroughTuning
+export AbstractPlanDirections, SynthesisOnly, SynthesisAndAnalysis
 
 # The NUFFT seam lives in NUFFT.jl. `_host` is a no-op for an `Array` and copies a device array's
 # coords to host; points are set once, so it is off the hot path.
@@ -68,6 +69,35 @@ const _PLANNER_LOCK = ReentrantLock()
 const _SPH_TUNING = Dict{Tuple{Int,Int,DataType},Tuple{Int,UInt32}}()
 const _NUFFT_TUNING =
     Dict{Tuple{Int,Int,Int,Int,DataType,Float64,Int,DataType,DataType,DataType},Tuple{Int,Float64}}()
+
+"""
+    AbstractPlanDirections
+
+Which transform directions a plan is built for, so a caller who will only synthesise need not construct
+an analysis plan at all.
+
+The saving is modest, not structural: a backend allocates most of its working memory when a transform
+*executes*, not when its plan is built, so an analysis plan that is never executed was never costing
+much. What this buys is that `nusht_type1!` on such a plan fails immediately and says which keyword to
+change, instead of silently working and quietly holding a second plan.
+"""
+abstract type AbstractPlanDirections end
+
+"""
+    SynthesisAndAnalysis <: AbstractPlanDirections
+
+Build both directions — the default. Required by [`nusht_type1!`](@ref), [`nusht_solve!`](@ref) and
+[`nusht_filter!`](@ref).
+"""
+struct SynthesisAndAnalysis <: AbstractPlanDirections end
+
+"""
+    SynthesisOnly <: AbstractPlanDirections
+
+Build the synthesis (type-2) plan only. [`nusht_type2!`](@ref) works; anything needing the adjoint
+throws and names the keyword to change.
+"""
+struct SynthesisOnly <: AbstractPlanDirections end
 
 """
     AbstractPlanTuning
@@ -217,15 +247,23 @@ function _build_width!(plan, k::Integer)
     r = plan.pool_recipe
     T = real(eltype(plan.Fhat))
     θn, φn = _θnufft(plan), _φnodes(plan)
-    # From the bandlimit, not from `Fhat`: a folded array stores only half the θ wavenumbers while the
-    # transform is still built for all of them. The strengths type comes off the plan's own buffer, so a
-    # narrower set is the same transform as the full-width one rather than always the complex one.
-    n_modes = Int64[2plan.lmax + 3, plan.Nφ]
+    # The strengths type comes off the plan's own buffer, so a narrower set is the same transform as the
+    # full-width one rather than always the complex one — and that is also what says which θ count to
+    # build: a real transform covers all `2lmax+3` wavenumbers and stores half, a complex half-height one
+    # is built at the stored size.
     Z = eltype(_fbuf(plan))
+    n_modes = Int64[Z <: Real ? 2plan.lmax + 3 : size(plan.Fhat, 1), plan.Nφ]
     n2 = _make_nufft(r.backend, θn, 2, n_modes, +1, k, plan.tol, T, 0, r.nt2, r.uf2, Z)
-    n1 = _make_nufft(r.backend, θn, 1, n_modes, -1, k, plan.tol, T, 0, r.nt1, r.uf1, Z)
-    _nufft_setpts!(n2, θn, φn); _nufft_setpts!(n1, θn, φn)
-    _nufft_finalize!(n2); _nufft_finalize!(n1)
+    _nufft_setpts!(n2, θn, φn); _nufft_finalize!(n2)
+    n1 = if plan.nodes.nufft_type1 === nothing
+        nothing                                   # mirror the plan's own directions
+    elseif _nufft_share_directions(r.backend)
+        _nufft_as_type1(n2)                       # same object, opposite direction — see the seam
+    else
+        p = _make_nufft(r.backend, θn, 1, n_modes, -1, k, plan.tol, T, 0, r.nt1, r.uf1, Z)
+        _nufft_setpts!(p, θn, φn); _nufft_finalize!(p)
+        p
+    end
     return (k = Int(k), nufft_type2 = n2, nufft_type1 = n1)
 end
 
@@ -249,18 +287,25 @@ end
 # by building anything (see the NonuniformFFTs extension). Naming a type costs nothing, so a width
 # nobody uses is never built and never specialised, while the width that is used lands in a concretely
 # typed slot and stays there for the plan's life. The walk is over a tuple, so it unrolls.
-@inline function _pool_lookup!(pool::Tuple, k::Integer, build)
+# The entry is handed to `f` rather than returned: slots of different widths hold *different* concrete
+# types, so a returned entry would be a `Union`, and a `Union` of a handle that wraps a large immutable
+# is boxed on the heap every call. Passing it in keeps each arm on one type.
+#
+# Both arms reach `f` through something that strips `Nothing` — the `=== nothing` test on a hit, and
+# `something` after a miss has filled the slot — so `f` is specialised on the slot's own entry type.
+@inline function _with_pool_entry(f::F, pool::Tuple, k::Integer, build) where {F}
     slot = first(pool)
-    if slot.k == k
-        e = slot.pair[]
-        e === nothing || return e
-        new = build(k)
-        slot.pair[] = new
-        return new
-    end
-    return _pool_lookup!(Base.tail(pool), k, build)
+    slot.k == k || return _with_pool_entry(f, Base.tail(pool), k, build)
+    e = slot.pair[]
+    e === nothing || return f(e)
+    slot.pair[] = build(k)
+    return f(something(slot.pair[]))
 end
-_pool_lookup!(::Tuple{}, k::Integer, build) = build(k)
+_with_pool_entry(f::F, ::Tuple{}, k::Integer, build) where {F} = f(build(k))
+
+# One element type, so there is no union to split and the plain lookup serves.
+_with_pool_entry(f::F, pool::AbstractVector, k::Integer, build) where {F} =
+    f(_pool_lookup!(pool, k, build))
 
 """
     _pool_built(pool) -> Int
@@ -374,8 +419,8 @@ _nufft_candidates(::NoTuning) = Tuple{Int,Float64}[]
 _nufft_candidates(::AbstractPlanTuning) =
     [(nt, uf) for uf in (0.0, 2.0, 1.25) for nt in Int[0; _thread_candidates()]]
 
-# NonuniformFFTs parallelizes over Julia threads rather than taking a thread count, so `nthreads` is
-# not a knob here and pairing it with σ would only time duplicates. Its oversampling factor is a real
+# NonuniformFFTs reaches only two thread counts (1 and `Threads.nthreads()`), so pairing them with σ
+# would double the search to compare a plan against a serial one. Its oversampling factor is a real
 # choice: the half-support needed for a given `tol` is derived from σ analytically, so a smaller σ
 # shrinks the FFT and grows the spreading and the winner depends on how the point count compares with
 # the mode count. Accuracy is identical across the candidates by construction, so timing alone decides.
@@ -453,7 +498,7 @@ struct FixedCountNodes{RV,SV,CT2,N1,N2} <: AbstractNodeSet
     θ_shift::SV
     fbuf::CT2
     nufft_type2::N2
-    nufft_type1::N1
+    nufft_type1::N1                     # `Nothing` for a synthesis-only plan; see `directions`
 end
 
 """
@@ -470,11 +515,30 @@ mutable struct VariableCountNodes{RV,SV,CT2,N1,N2} <: AbstractNodeSet
     θ_shift::SV
     fbuf::CT2
     const nufft_type2::N2
-    const nufft_type1::N1
+    const nufft_type1::N1               # `Nothing` for a synthesis-only plan; see `directions`
 end
 
 _node_set(::Val{false}, θ, φ, θn, θs, fbuf, p2, p1) = FixedCountNodes(θ, φ, θn, θs, fbuf, p2, p1)
 _node_set(::Val{true}, θ, φ, θn, θs, fbuf, p2, p1) = VariableCountNodes(θ, φ, θn, θs, fbuf, p2, p1)
+
+# Re-point the analysis plan with the nodes. A derived handle shares the plan just pointed, and a
+# synthesis-only plan has none.
+@inline _repoint_analysis!(::Nothing, θn, φn) = nothing
+@inline _repoint_analysis!(p1, θn, φn) = _nufft_derived(p1) ? nothing : _nufft_setpts!(p1, θn, φn)
+
+# The analysis plan, or `nothing` when the caller declined it — on every backend, so which calls a plan
+# answers does not depend on which library is loaded.
+_build_analysis(::SynthesisOnly, backend, θ, φ, n_modes, B, tol, ::Type{T}, modeord, nt, uf,
+                ::Type{Z}, p2) where {T,Z} = nothing
+
+function _build_analysis(::SynthesisAndAnalysis, backend, θ, φ, n_modes, B, tol, ::Type{T}, modeord,
+                         nt, uf, ::Type{Z}, p2) where {T,Z}
+    _nufft_share_directions(backend) && return _nufft_as_type1(p2)
+    p1 = _make_nufft(backend, θ, 1, n_modes, -1, B, tol, T, modeord, nt, uf, Z)
+    _nufft_setpts!(p1, θ, φ)
+    _nufft_finalize!(p1)
+    return p1
+end
 
 # Internal accessors for the point-dependent fields, so the rest of the package is written against
 # one spelling regardless of which node-set form a plan carries.
@@ -484,7 +548,13 @@ _node_set(::Val{true}, θ, φ, θn, θs, fbuf, p2, p1) = VariableCountNodes(θ, 
 @inline _θshift(p) = p.nodes.θ_shift
 @inline _fbuf(p) = p.nodes.fbuf
 @inline _nufft2(p) = p.nodes.nufft_type2
-@inline _nufft1(p) = p.nodes.nufft_type1
+@inline _nufft1(p) = _require_analysis(p.nodes.nufft_type1)
+
+# Name the keyword to change, rather than failing on a `nothing` somewhere inside the transform.
+@inline _require_analysis(p1) = p1
+_require_analysis(::Nothing) = throw(ArgumentError(
+    "this plan was built with `directions = SynthesisOnly()` and has no analysis plan. Rebuild with " *
+    "`directions = SynthesisAndAnalysis()` to use nusht_type1!, nusht_solve! or nusht_filter!."))
 
 """
     NUSHTplan{T}
@@ -498,7 +568,8 @@ Fields:
 - `nodes`: the [`AbstractNodeSet`](@ref) holding `θ_nodes`, `φ_nodes` (colatitudes ∈ [0,π] and
   longitudes ∈ [0,2π) of the `M` points), the `(M, B)` strengths buffer `fbuf`, and the two FINUFFT
   guru plans. [`set_nodes!`](@ref) re-points it.
-- `C`, `F`: coefficient scratch and the bivariate Fourier coefficients `P·C`, both `(Nθ, Nφ, B)` with
+- `C`: filter scratch, **empty until the first filter call** — see [`_filter_scratch`](@ref).
+  `F`: the bivariate Fourier coefficients `P·C`. Both `(Nθ, Nφ, B)` with
   eltype `FE`
 - `Fhat`: the complex mode array the NUFFT evaluates, assembled from `F` by
   [`_assemble_modes!`](@ref). The φ axis carries wavenumbers `-lmax…lmax` (`Nφ = 2lmax+1`), the θ axis
@@ -527,7 +598,7 @@ struct NUSHTplan{T<:AbstractFloat, FE<:Number, AT3<:AbstractArray{FE,3},
     B::Int
     tol::FT
     nodes::ND                     # the point-dependent half; see AbstractNodeSet
-    C::AT3
+    C::Base.RefValue{Union{Nothing,AT3}}   # filter scratch, empty until used; see _filter_scratch
     F::AT3
     Fhat::CT3
     Fslice::AT2
@@ -536,6 +607,47 @@ struct NUSHTplan{T<:AbstractFloat, FE<:Number, AT3<:AbstractArray{FE,3},
     sph_pool::SPL                 # per-task slice + plans for the threaded column loops; see _sph_pool
     size_pool::SZP                # narrower plan sets, filled on demand; see _nufft_size_pool
     pool_recipe::RCP              # what building one needs that the plan cannot supply
+end
+
+"""
+    _filter_scratch(plan) -> AbstractArray
+
+The plan's coefficient scratch, allocated on first use. Filtering scales coefficients before
+synthesising and must not modify the caller's array, so it needs a buffer of its own — and nothing else
+in the plan does. A plan that only synthesises, transforms or solves therefore never allocates one; a
+filtering plan allocates it once and reuses it, so repeated filtering allocates nothing after the first
+call.
+"""
+@inline function _filter_scratch(plan::NUSHTplan)
+    c = plan.C[]
+    c === nothing || return c
+    fresh = _zeros_like(plan.F, eltype(plan.F), plan.Nθ, plan.Nφ, plan.B)
+    plan.C[] = fresh
+    return fresh
+end
+
+"""
+    plan_memory(plan) -> NamedTuple
+
+Bytes held by each of the plan's own buffers, plus their `total`, so a caller can see where a plan's
+memory goes and what `upsampfac`, `ntrans` or the element type do to it.
+
+This counts what the plan allocates in Julia. A backend holding its oversampled grid in C (FINUFFT) is
+invisible to any Julia-side accounting, `Base.summarysize` included — measure that as the resident set
+of a process that builds one plan. An empty slot counts as zero, which is the point of it.
+"""
+function plan_memory(plan::NUSHTplan)
+    slot(r) = r[] === nothing ? 0 : Base.summarysize(r[])
+    C      = slot(plan.C)
+    F      = Base.summarysize(plan.F)
+    Fhat   = Base.summarysize(plan.Fhat)
+    Fslice = Base.summarysize(plan.Fslice)
+    fbuf   = Base.summarysize(_fbuf(plan))
+    nodes  = Base.summarysize(_θnodes(plan)) + Base.summarysize(_φnodes(plan))
+    pool   = Base.summarysize(plan.size_pool)
+    sph    = Base.summarysize(plan.sph_pool)
+    return (; C, F, Fhat, Fslice, fbuf, nodes, size_pool = pool, sph_pool = sph,
+            total = C + F + Fhat + Fslice + fbuf + nodes + pool + sph)
 end
 
 """
@@ -564,8 +676,10 @@ Keyword arguments:
   shape, so building many plans of one size pays the search once.
 - `ft_fftw_nthreads`, `ft_fftw_flags`: override the FFTW planner thread count / flags used for the
   sphere synthesis and analysis plans.
-- `nthreads`, `upsampfac`: override FINUFFT's thread count (`0` is its "all cores" sentinel) and
-  upsampling factor.
+- `nthreads`, `upsampfac`: override the NUFFT backend's thread count (`0` is "let the backend choose")
+  and upsampling factor. What a backend can reach differs: FINUFFT takes any count, while
+  NonuniformFFTs parallelises over Julia's own threads and so reaches only `1` and `Threads.nthreads()`
+  — a count it cannot deliver is an error, never silently something else.
 
 Each override keyword defaults to `nothing`, meaning "whatever `tuning` decides". An explicit value
 is honoured exactly and skips the search for that setting.
@@ -583,6 +697,7 @@ function make_plan(
     tuning::AbstractPlanTuning = NoTuning(),
     nufft::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
     variable_npts::Bool = false,
+    directions::AbstractPlanDirections = SynthesisAndAnalysis(),
     nthreads::Union{Nothing,Integer} = nothing,
     upsampfac::Union{Nothing,Real} = nothing,
     ft_fftw_nthreads::Union{Nothing,Integer} = nothing,
@@ -610,22 +725,32 @@ function make_plan(
     # `modeord = 0` exactly, with no offset to undo per point. θ reaches lmax+1 where φ reaches lmax:
     # the supernumerary slots of the square coefficient array carry degrees up to `lmax+|m|`, and an
     # odd-order column's last row is the sine at frequency `lmax+1`.
-    nub = _resolve_nufft(nufft)
-    # A real field's mode array is exactly Hermitian, so a backend with a real-data transform is given
-    # only `kθ ≥ 0` and supplies the rest itself — halving its FFT and its spreading alike, since the
-    # strengths are real too. The transform is still built for the full `2lmax+3` θ wavenumbers; it is
-    # the stored array that is half-length. Backends without a real transform get the full array:
-    # handing FINUFFT a smaller complex one shrinks its FFT but not its spreading, and measurably loses
-    # once the point count outgrows the mode count.
-    fold = realfield && _real_capable(nub)
+    nub = _resolve_nufft(nufft, FE)
+    # A real field's mode array is exactly Hermitian, so only `kθ ≥ 0` is ever stored — `lmax+2` rows
+    # rather than `2lmax+3`. That halves the deconvolution and the FFT and leaves the interpolation
+    # untouched, so it is never more work than the full array at any point count.
+    #
+    # How the other half is supplied splits the two cases. A backend with a real-data transform
+    # (`_real_capable`) is handed the half-spectrum of a transform built for the full θ axis and
+    # reconstructs the rest itself, with real strengths — so the spreading halves too, and the forward
+    # needs no weights. Without one, the transform IS half-height and complex, its centered rows are
+    # therefore labelled `kθ - Nkstore÷2`, and the missing conjugate half has to be paid for explicitly:
+    # `θ_shift` undoes the labelling per point and `_fold_weights!` doubles every `kθ > 0` row.
     Nk = 2lmax + 3
-    ZS = fold ? T : Complex{T}                # element type of the non-uniform data
-    Nkstore = _stored_modes(Nk, ZS)           # `lmax+2` folded, `Nk` not — the same rule tuning uses
-    C    = _zeros_like(θ, FE, Nθ, Nφ, B)
+    r2c  = realfield && _real_capable(nub)
+    fold = realfield
+    _warn_if_directsum(nufft, nub, M, Nk * Nφ)
+    ZS = r2c ? T : Complex{T}                 # element type of the non-uniform data
+    Nkstore = fold ? Nk ÷ 2 + 1 : Nk          # `lmax+2` folded
     F    = _zeros_like(θ, FE, Nθ, Nφ, B)
+    # Only filtering needs a coefficient scratch, and only so the caller's array is not modified. A
+    # plan that synthesises, transforms or solves never allocates one; a filtering plan allocates it
+    # once and reuses it, so repeated filtering stays allocation-free. See `_filter_scratch`.
+    C    = Base.RefValue{Union{Nothing,typeof(F)}}(nothing)
     Fhat = _zeros_like(θ, Complex{T}, Nkstore, Nφ, B)
     fbuf = _zeros_like(θ, ZS, M, B)
-    θ_shift = nothing
+    θ_shift = (fold && !r2c) ?
+        _to_like(θ, Complex{T}.(cis.(T(Nkstore ÷ 2) .* θ))) : nothing
 
     # FastTransforms plans operate on a single dense (Nθ, Nφ) HOST `Matrix` (FastTransforms is CPU-only);
     # each batch slice is `copyto!`-ed through `Fslice` (host↔device for a device plan — the S-step is an
@@ -646,18 +771,24 @@ function make_plan(
     # FFT modes need no conjugation — an axis swap takes the place of a conjugate-transpose
     # (conj(c)·e^{-ikx} = c·e^{+ikx}). type 1 (−1) is the exact adjoint.
     tol64 = Float64(tol)
-    n_modes = Int64[Nk, Nφ]
+    # A real transform is built for the full θ axis and stores its half; a complex half-height one is
+    # built at the stored size.
+    n_modes = Int64[r2c ? Nk : Nkstore, Nφ]
     modeord = 0                               # centered: both mode axes are signed and symmetric
     nt2, uf2 = _tune_nufft(nub, θ, φ, n_modes, 2, +1, B, T, tol64, modeord, tuning, ZS)
     nt1, uf1 = _tune_nufft(nub, θ, φ, n_modes, 1, -1, B, T, tol64, modeord, tuning, ZS)
     isnothing(nthreads) || (nt2 = nt1 = Int(nthreads))
     isnothing(upsampfac) || (uf2 = uf1 = Float64(upsampfac))
+    # Where a backend's plan carries no direction, one object serves both and the second is a handle
+    # onto it — that halves the oversampled grid and the sorted point copy the plan owns, and its
+    # points are already set.
     nufft_type2 = _make_nufft(nub, θ, 2, n_modes, +1, B, tol64, T, modeord, nt2, uf2, ZS)
-    nufft_type1 = _make_nufft(nub, θ, 1, n_modes, -1, B, tol64, T, modeord, nt1, uf1, ZS)
     _nufft_setpts!(nufft_type2, θ, φ)
-    _nufft_setpts!(nufft_type1, θ, φ)
     _nufft_finalize!(nufft_type2)
-    _nufft_finalize!(nufft_type1)
+    # Deferred unless the backend serves both directions from one plan, in which case it already
+    # exists. A synthesis-only caller then holds no type-1 grid at all.
+    nufft_type1 = _build_analysis(directions, nub, θ, φ, n_modes, B, tol64, T, modeord, nt1, uf1, ZS,
+                                  nufft_type2)
     # A scalar plan hands FINUFFT the colatitudes unchanged, so `θ_nufft` aliases `θ_nodes` and costs
     # no extra storage; a spin plan negates them and owns a separate array.
     # How the narrower plan sets are stored is the backend's call, through `_nufft_size_pool` — whether
@@ -676,7 +807,7 @@ function make_plan(
 
     nodes = _node_set(Val(variable_npts), θ, φ, θ, θ_shift, fbuf, nufft_type2, nufft_type1)
 
-    return NUSHTplan{T, FE, typeof(C), typeof(Fslice), typeof(Fhat), typeof(nodes),
+    return NUSHTplan{T, FE, typeof(F), typeof(Fslice), typeof(Fhat), typeof(nodes),
                      typeof(sph_plan), typeof(sph_plan_adj),
                      typeof(sph_pool), typeof(size_pool), typeof(pool_recipe), typeof(tol64)}(
         lmax, Nθ, Nφ, B, tol64, nodes, C, F, Fhat, Fslice,
@@ -709,7 +840,8 @@ function set_nodes!(plan::AbstractNUSHTplan, θ_nodes, φ_nodes)
     _set_nodes!(plan.nodes, θ_nodes, φ_nodes)
     _sync_θshift!(_θshift(plan), _θnufft(plan), _shift_offset(plan))
     _nufft_setpts!(_nufft2(plan), _θnufft(plan), _φnodes(plan))
-    _nufft_setpts!(_nufft1(plan), _θnufft(plan), _φnodes(plan))
+    # A derived handle shares the plan just pointed; re-pointing would re-sort the same points.
+    _repoint_analysis!(plan.nodes.nufft_type1, _θnufft(plan), _φnodes(plan))
     return plan
 end
 
@@ -744,6 +876,64 @@ function _valid_mask(proto, ::Type{T}, lmax::Integer) where {T}
         H[1:(Nθ - j), 2j + 1, 1] .= one(T)
     end
     return _to_like(proto, H)
+end
+
+"""
+    _valid_indices(proto, lmax) -> AbstractVector{Int}
+
+Linear positions, within one coefficient column, of the `(lmax+1)^2` slots holding degrees
+`l ≤ lmax` — the same set [`_valid_mask`](@ref) marks, as indices rather than a 0/1 array.
+
+The solver carries its vectors packed to just these, so they are `(K, B)` with `K = (lmax+1)^2` rather
+than `(Nθ, Nφ, B)` with `lmax(lmax+1)` entries per column pinned to zero. That halves four coefficient
+arrays and, since every reduction and axpy in the iteration runs over them, halves that work too.
+Built in the plan's array type so packing is device-resident.
+"""
+function _valid_indices(proto, lmax::Integer)
+    Nθ = lmax + 1
+    idx = Vector{Int}(undef, (lmax + 1)^2)
+    k = 0
+    @inbounds for i in 1:Nθ                       # column 1 is m = 0, every degree
+        idx[k += 1] = i
+    end
+    @inbounds for j in 1:lmax, c in (2j, 2j + 1)  # column pair 2j, 2j+1 is m = ∓j, degrees j…lmax
+        base = (c - 1) * Nθ
+        for i in 1:(Nθ - j)
+            idx[k += 1] = base + i
+        end
+    end
+    k == length(idx) || throw(AssertionError("valid-slot count $k ≠ $(length(idx))"))
+    return _to_like(proto, idx)
+end
+
+# Gather a packed `(K, B)` view out of a full `(Nθ, Nφ, B)` array, and scatter it back with the
+# supernumerary slots zeroed. `n` bounds the columns, matching the solver's compaction. These replace
+# a `copyto!` plus a mask multiply, so they move no more memory than the code they stand in for.
+function _pack_coeffs!(dst, src, idx, srclen::Integer, n::Integer)
+    K = length(idx)
+    @inbounds for b in 1:n
+        so = (b - 1) * srclen
+        do_ = (b - 1) * K
+        @simd for t in 1:K
+            dst[do_ + t] = src[so + idx[t]]
+        end
+    end
+    return dst
+end
+
+function _unpack_coeffs!(dst, src, idx, dstlen::Integer, n::Integer)
+    K = length(idx)
+    @inbounds for b in 1:n
+        do_ = (b - 1) * dstlen
+        so = (b - 1) * K
+        @simd for i in 1:dstlen
+            dst[do_ + i] = zero(eltype(dst))
+        end
+        @simd for t in 1:K
+            dst[do_ + idx[t]] = src[so + t]
+        end
+    end
+    return dst
 end
 
 # Centered order labels a length-`n` axis from `-(n÷2)`, so that is the offset to undo. Read off the
@@ -818,7 +1008,7 @@ halves of that on its own: it grows the pool as it narrows the batch width, and 
 """
 function close!(plan::AbstractNUSHTplan)
     _nufft_destroy!(_nufft2(plan))
-    _nufft_destroy!(_nufft1(plan))
+    _nufft_destroy!(plan.nodes.nufft_type1)
     _close_pool!(plan)
     return nothing
 end

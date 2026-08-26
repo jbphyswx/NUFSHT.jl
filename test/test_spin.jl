@@ -206,3 +206,54 @@ Test.@testset "spin recurrence: correctness at large lmax (stable where wigner_d
     Test.@test conv == (relres < 1e-8)
     NUFSHT.close!(plan)
 end
+
+# A real-`FE` spin plan folds its mode array like every other real field, and on a backend with a
+# real-data transform its strengths are real too. Both folds have to be the SAME operator wherever a
+# real spin field exists — `s = 0` with `conj(sf[l,m]) = (-1)^m sf[l,-m]`, from
+# `conj(Y_lm) = (-1)^m Y_l,-m`. Off that subspace they are two different `R`-linear extensions of a map
+# with no physical meaning, so the comparison is only made where the construction is checked to hold.
+Test.@testset "real-field spin plans: both folds are one operator" begin
+    Random.seed!(313)
+    lmax, M = 8, 324
+    N, Nf = lmax + 1, 2lmax + 1
+    θ = clamp.(π .* rand(M), 1e-9, π - 1e-9); φ = 2π .* rand(M)
+
+    sf = zeros(ComplexF64, N, Nf)
+    for ℓ in 0:lmax
+        sf[NUFSHT.spin_coeff_index(ℓ, 0, lmax)] = randn()          # m = 0 must be real
+        for m in 1:ℓ
+            a = randn(ComplexF64)
+            sf[NUFSHT.spin_coeff_index(ℓ,  m, lmax)] = a
+            sf[NUFSHT.spin_coeff_index(ℓ, -m, lmax)] = (-1)^m * conj(a)
+        end
+    end
+
+    # The unfolded complex plan is the reference, and it must actually return a real field — otherwise
+    # the coefficients above are not on the subspace and nothing below means anything.
+    full = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 0; tol = 1e-12, nthreads = 1)
+    gc = zeros(ComplexF64, M); NUFSHT.nusht_type2_spin!(gc, sf, full)
+    Test.@test size(full.G, 1) == 2lmax + 1                        # the reference is unfolded
+    Test.@test sqrt(sum(abs2, imag.(gc)) / sum(abs2, real.(gc))) < 1e-12
+    ref = real.(gc)
+
+    for be in (NUFSHT.NonuniformFFTsBackend(), NUFSHT.FINUFFTBackend(),
+               NUFSHT.SpectralBackends.DirectSumSpectralBackend())
+        p = NUFSHT.make_spin_plan(Float64, θ, φ, lmax, 0; tol = 1e-12, nthreads = 1, nufft = be)
+        Test.@test size(p.G, 1) == lmax + 1                        # folded on every backend
+        # Real strengths only where the backend reconstructs the conjugate half itself.
+        Test.@test (eltype(NUFSHT._fbuf(p)) === Float64) == NUFSHT._real_capable(be)
+        f = zeros(M); NUFSHT.nusht_type2_spin!(f, sf, p)
+        Test.@test sqrt(sum(abs2, f .- ref) / sum(abs2, ref)) < 1e-10
+
+        # Exact adjoint over the reals: the field is real, the coefficients complex.
+        x = zeros(ComplexF64, N, Nf); x .= sf
+        y = randn(M)
+        Ax = zeros(M);                    NUFSHT.nusht_type2_spin!(Ax, x, p)
+        Aty = zeros(ComplexF64, N, Nf);   NUFSHT.nusht_type1_spin!(Aty, y, p)
+        adj = abs(sum(Ax .* y) - real(sum(conj.(x) .* Aty))) / abs(sum(Ax .* y))
+        Test.@test adj < 1e-11
+        NUFSHT.close!(p)
+    end
+    NUFSHT.close!(full)
+    @info "real-field spin plans agree with the unfolded complex operator on the s=0 real subspace"
+end

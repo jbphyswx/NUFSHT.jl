@@ -11,7 +11,7 @@ Test.@testset "nusht_solve!: exact inverse at non-CC scattered points" begin
     C_true = rand_coeffs(lmax, 42)
     f_true = zeros(M); NUFSHT.nusht_type2!(f_true, C_true, plan)
 
-    C_solved = similar(plan.C)
+    C_solved = similar(plan.F)
     _, iters, rel_res, converged = NUFSHT.nusht_solve!(C_solved, f_true, plan; rtol = 1e-10, maxiter = 200)
     Test.@test converged
     Test.@test converged == (rel_res < 1e-10)
@@ -259,7 +259,7 @@ Test.@testset "nusht_solve! does not degrade with a larger iteration budget" beg
         θ = T.(acos.(2 .* rand(M) .- 1)); φ = T.(rand(M) .* 2π)
         f = T[abs(sin(3θ[k])) + T(0.1) for k in 1:M]
 
-        # Single-threaded FINUFFT so the runs are bit-reproducible: a longer run then shares its whole
+        # `nthreads = 1` so the runs are bit-reproducible: a longer run then shares its whole
         # prefix with a shorter one, and the two can be compared exactly rather than approximately.
         res = map((50, 200, 1000)) do mi
             p = NUFSHT.make_plan(T, θ, φ, lmax; ntrans = 1, nthreads = 1)

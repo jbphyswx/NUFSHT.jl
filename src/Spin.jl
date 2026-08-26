@@ -193,6 +193,7 @@ function make_spin_plan(::Type{FE}, θ_nodes, φ_nodes, lmax::Integer, s::Intege
                         tuning::AbstractPlanTuning = NoTuning(),
                         nufft::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
                         variable_npts::Bool = false,
+                        directions::AbstractPlanDirections = SynthesisAndAnalysis(),
                         wigner_table::Union{Nothing,WignerTable} = nothing,
                         nthreads::Union{Nothing,Integer} = nothing,
                         upsampfac::Union{Nothing,Real} = nothing) where {FE<:Number}
@@ -206,9 +207,18 @@ function make_spin_plan(::Type{FE}, θ_nodes, φ_nodes, lmax::Integer, s::Intege
     M = length(θ_nodes)
 
     # A real spin field has `G[-m', -m] = conj(G[m', m])`, so only `m' ≥ 0` is built or transformed;
-    # `L` odd means no self-paired Nyquist row. The `m' = 0` row pairs with itself across `m`.
+    # `L` odd means no self-paired Nyquist row.
+    #
+    # Who supplies the absent `m' < 0` half decides everything downstream. A backend with a real-data
+    # transform does it itself, from a transform built for the full `L` θ wavenumbers, and returns real
+    # strengths — halving the spreading as well as the FFT. Without one the transform is itself
+    # half-height and complex: `θ_shift` undoes its centered row labelling per point, and the missing
+    # half is paid for in the weights.
     realfield = FE <: Real
+    nub = _resolve_nufft(nufft, FE)
+    r2c = realfield && _real_capable(nub)
     Lθ = realfield ? lmax + 1 : L
+    ZS = r2c ? T : Complex{T}                  # element type of the non-uniform data
 
     # Node vectors keep their input array type (host `Vector` or device array), with eltype `T`.
     θ = T.(θ_nodes)
@@ -220,26 +230,31 @@ function make_spin_plan(::Type{FE}, θ_nodes, φ_nodes, lmax::Integer, s::Intege
     dl_curr = _zeros_like(θ, T, L, L)
     dl_prev = _zeros_like(θ, T, L, L)
     G    = _zeros_like(θ, Complex{T}, Lθ, L, B)
-    fbuf = _zeros_like(θ, Complex{T}, M, B)
+    fbuf = _zeros_like(θ, ZS, M, B)
     # Centered order labels a length-`Lθ` axis `-(Lθ÷2) … `, so a `m' ≥ 0` axis is that ordering shifted
-    # by a constant, undone per point. `θ_nufft` is `-θ`, which is the coordinate this pairs with.
-    θ_shift = realfield ? _to_like(θ, Complex{T}.(cis.(T(Lθ ÷ 2) .* negθ))) : nothing
+    # by a constant, undone per point. `θ_nufft` is `-θ`, which is the coordinate this pairs with. A
+    # real-data transform's half-spectrum is labelled `0 … n₁÷2` already and needs no shift.
+    θ_shift = (realfield && !r2c) ?
+        _to_like(θ, Complex{T}.(cis.(T(Lθ ÷ 2) .* negθ))) : nothing
 
     # NUFFT built through the backend seam: host nodes → FINUFFT, device nodes → cuFINUFFT (CUDA ext).
     # `modeord = 0` (CMCL-centered) here, unlike the scalar plan — the G mode array is already centered.
     tol64 = Float64(tol)
-    n_modes = Int64[Lθ, L]
-    nub = _resolve_nufft(nufft)
-    nt2, uf2 = _tune_nufft(nub, negθ, φ, n_modes, 2, +1, B, T, tol64, 0, tuning)
-    nt1, uf1 = _tune_nufft(nub, negθ, φ, n_modes, 1, -1, B, T, tol64, 0, tuning)
+    # A real transform covers the full θ axis and stores its half; a complex half-height one is built
+    # at the stored size.
+    n_modes = Int64[r2c ? L : Lθ, L]
+    _warn_if_directsum(nufft, nub, M, Lθ * L)
+    nt2, uf2 = _tune_nufft(nub, negθ, φ, n_modes, 2, +1, B, T, tol64, 0, tuning, ZS)
+    nt1, uf1 = _tune_nufft(nub, negθ, φ, n_modes, 1, -1, B, T, tol64, 0, tuning, ZS)
     isnothing(nthreads) || (nt2 = nt1 = Int(nthreads))
     isnothing(upsampfac) || (uf2 = uf1 = Float64(upsampfac))
-    nufft_type2 = _make_nufft(nub, negθ, 2, n_modes, +1, B, tol64, T, 0, nt2, uf2)
-    nufft_type1 = _make_nufft(nub, negθ, 1, n_modes, -1, B, tol64, T, 0, nt1, uf1)
+    # See `_nufft_share_directions`: where the backend's plan carries no direction, one object serves
+    # both and the second is a handle onto it, already pointed at the same nodes.
+    nufft_type2 = _make_nufft(nub, negθ, 2, n_modes, +1, B, tol64, T, 0, nt2, uf2, ZS)
     _nufft_setpts!(nufft_type2, negθ, φ)
-    _nufft_setpts!(nufft_type1, negθ, φ)
     _nufft_finalize!(nufft_type2)
-    _nufft_finalize!(nufft_type1)
+    nufft_type1 = _build_analysis(directions, nub, negθ, φ, n_modes, B, tol64, T, 0, nt1, uf1,
+                                  ZS, nufft_type2)
     # `negθ` is this plan's `θ_nufft`: a separate array, unlike the scalar plan's alias, because the
     # e^{-im'θ} factor is absorbed by handing FINUFFT the negated colatitudes.
     nodes = _node_set(Val(variable_npts), θ, φ, negθ, θ_shift, fbuf, nufft_type2, nufft_type1)
@@ -257,27 +272,59 @@ _copy_out!(f, fbuf, plan::SpinNUSHTplan) = _copy_out!(f, fbuf, _θshift(plan))
 _copy_out!(f, fbuf, ::Nothing) = _copy_field!(f, fbuf)
 _copy_out!(f, fbuf, ::AbstractVector) = _copy_real!(f, fbuf)
 
-# Row index for wavenumber `m'` in the mode buffer: the full layout centers it, the folded one keeps
-# only `m' ≥ 0`. `_mprange` is the matching set of `m'` the contraction has to visit.
-# The layout is carried by whether the plan has a `θ_shift` — which only the folded one needs — so it
-# lives in the node-set type and needs no separate parameter on the plan.
-@inline _grow(plan::SpinNUSHTplan, mp) = _grow(plan, mp, _θshift(plan))
-@inline _grow(plan::SpinNUSHTplan, mp, ::Nothing) = mp + plan.lmax + 1
-@inline _grow(::SpinNUSHTplan, mp, ::AbstractVector) = mp + 1
-@inline _mprange(plan::SpinNUSHTplan, ℓ) = _mprange(ℓ, _θshift(plan))
-@inline _mprange(ℓ, ::Nothing) = -ℓ:ℓ
-@inline _mprange(ℓ, ::AbstractVector) = 0:ℓ
+"""
+    FullModes, FoldedComplex, FoldedReal
 
-# Each retained mode stands for itself and its partner, so it counts twice — except `(0,0)`, its own
-# partner. The `m' = 0` row's `m < 0` half is the dropped one.
-_fold_weights!(G, plan::SpinNUSHTplan) = _fold_weights!(G, plan, _θshift(plan))
-_fold_weights!(G, ::SpinNUSHTplan, ::Nothing) = G
-function _fold_weights!(G, plan::SpinNUSHTplan{T}, ::AbstractVector) where {T}
+Which Hermitian treatment a spin plan's mode array needs. A complex field has no symmetry to exploit
+([`FullModes`](@ref)); a real one stores only `m' ≥ 0` either way, and the two folded kinds differ in
+**who supplies the absent `m' < 0` half** — which is what fixes the row indexing and the weights.
+
+The kind is read off the plan rather than stored: only a half-height *complex* transform needs a
+`θ_shift`, and only a real-data transform has real strengths, so the pair `(θ_shift, fbuf)` names all
+three without a further plan parameter.
+"""
+struct FullModes end
+struct FoldedComplex end
+struct FoldedReal end
+
+@inline _fold_kind(plan::SpinNUSHTplan) = _fold_kind(_θshift(plan), _fbuf(plan))
+@inline _fold_kind(::AbstractVector, _fbuf) = FoldedComplex()
+@inline _fold_kind(::Nothing, ::AbstractArray{<:Real}) = FoldedReal()
+@inline _fold_kind(::Nothing, ::AbstractArray) = FullModes()
+
+# Row index for wavenumber `m'` in the mode buffer, and the set of `m'` the contraction visits: the
+# full layout centers `m'`, both folded ones keep only `m' ≥ 0` starting at row 1.
+@inline _grow(plan::SpinNUSHTplan, mp) = _grow(plan, mp, _fold_kind(plan))
+@inline _grow(plan::SpinNUSHTplan, mp, ::FullModes) = mp + plan.lmax + 1
+@inline _grow(::SpinNUSHTplan, mp, ::Union{FoldedComplex,FoldedReal}) = mp + 1
+@inline _mprange(plan::SpinNUSHTplan, ℓ) = _mprange(ℓ, _fold_kind(plan))
+@inline _mprange(ℓ, ::FullModes) = -ℓ:ℓ
+@inline _mprange(ℓ, ::Union{FoldedComplex,FoldedReal}) = 0:ℓ
+
+# A half-height complex transform returns only what it was given, so each retained mode has to stand
+# for its partner too: everything counts twice except `(0,0)`, which is its own, and the `m' = 0` row's
+# `m < 0` half, which is the one dropped. A real-data transform reconstructs the partner itself, so the
+# forward hands it the half unweighted.
+_fold_weights!(G, plan::SpinNUSHTplan) = _fold_weights!(G, plan, _fold_kind(plan))
+_fold_weights!(G, ::SpinNUSHTplan, ::Union{FullModes,FoldedReal}) = G
+function _fold_weights!(G, plan::SpinNUSHTplan{T}, ::FoldedComplex) where {T}
     lmax = plan.lmax
     G .*= T(2)
     # Views, not element writes: a GPU array rejects scalar indexing.
     @views fill!(G[1, 1:lmax, :], zero(eltype(G)))
     @views G[1, lmax + 1, :] ./= T(2)
+    return G
+end
+
+# The transpose of the forward. `FoldedComplex` is self-adjoint in its weights, so it repeats them.
+# `FoldedReal` has no forward weight, but its embedding `G[-m',-m] = conj(G[m',m])` is R-linear and not
+# C-linear, so the transpose picks up a factor 2 on every `m' > 0` row; the `m' = 0` row is stored whole
+# and is its own conjugate, so it keeps weight 1.
+_fold_weights_adjoint!(G, plan::SpinNUSHTplan) = _fold_weights_adjoint!(G, plan, _fold_kind(plan))
+_fold_weights_adjoint!(G, ::SpinNUSHTplan, ::FullModes) = G
+_fold_weights_adjoint!(G, plan::SpinNUSHTplan, k::FoldedComplex) = _fold_weights!(G, plan, k)
+function _fold_weights_adjoint!(G, ::SpinNUSHTplan{T}, ::FoldedReal) where {T}
+    @views G[2:end, :, :] .*= T(2)
     return G
 end
 
@@ -330,7 +377,9 @@ function _wigner_d_halfpi_step!(dl::AbstractMatrix{T}, dlp::AbstractMatrix{T}, �
                 end
             end
         end
-        # Symmetry fill to the full (2ℓ+1)² plane.
+        # Symmetry fill to the full (2ℓ+1)² plane. Serial on purpose: one multiply per element makes
+        # these streaming rather than compute, and threading them measurably loses. The contraction has
+        # arithmetic per element and is the part worth threading.
         for m in 0:ℓ, n in (m + 1):ℓ                       # S1 transpose: eighth → quarter
             dl[n + off, m + off] = ifelse(iseven(m + n), one(T), -one(T)) * dl[m + off, n + off]
         end
@@ -366,12 +415,34 @@ _assemble_G!(G, sf, plan::SpinNUSHTplan) =
 
 # Precomputed path: Δ is already contracted into Q, so ℓ can run innermost and each output column of
 # G stays hot across the whole degree sum.
-function _assemble_G_impl!(G, sf, plan::SpinNUSHTplan{T}, tbl::WignerTable) where {T}
-    _check_table(tbl, plan)
-    lmax = plan.lmax; s = plan.s; off = lmax + 1
+# Work, in fused multiply-adds, an assembly must carry before threading it is worth a `@sync` barrier —
+# roughly an order of magnitude more than a barrier costs. Counted in FMAs rather than orders so it
+# scales with the batch.
+const _CONTRACT_MIN_WORK = 30_000
+
+# With a table there is no recurrence to sequence, so orders run outermost over the whole range and
+# split with no per-degree barrier — one `@sync` for the entire assembly, which is why this pays where
+# the on-the-fly path (barrier per degree) does not. Each order owns its own column of `G` / entry of
+# `sf`, so the ranges need no synchronisation. One thread spawns nothing, keeping the transform
+# allocation-free.
+@inline function _thread_all_orders(f::F, lmax::Int, B::Int) where {F}
+    nord = 2lmax + 1
+    nt = min(Threads.nthreads(), max(1, (nord * nord * lmax * B) ÷ _CONTRACT_MIN_WORK))
+    nt <= 1 && return f(-lmax:lmax)
+    chunk = cld(nord, nt)
+    @sync for t in 1:nt
+        lo = -lmax + (t - 1) * chunk
+        hi = min(lmax, lo + chunk - 1)
+        lo > hi && continue
+        Threads.@spawn f(lo:hi)
+    end
+    return nothing
+end
+
+@inline function _table_orders!(G, sf, plan::SpinNUSHTplan{T}, tbl::WignerTable, ms,
+                                s::Int, off::Int, lmax::Int) where {T}
     Q = tbl.Q; qoff = tbl.offsets
-    fill!(G, zero(Complex{T}))
-    @inbounds for m in -lmax:lmax
+    @inbounds for m in ms
         ph0 = _im_pow(Complex{T}, -(m + s))
         for b in 1:plan.B
             for ℓ in max(abs(m), abs(s)):lmax
@@ -382,6 +453,37 @@ function _assemble_G_impl!(G, sf, plan::SpinNUSHTplan{T}, tbl::WignerTable) wher
                 @simd for mp in _mprange(plan, ℓ)
                     G[_grow(plan, mp), m + off, b] += c * Q[col + mp]
                 end
+            end
+        end
+    end
+    return G
+end
+
+function _assemble_G_impl!(G, sf, plan::SpinNUSHTplan{T}, tbl::WignerTable) where {T}
+    _check_table(tbl, plan)
+    lmax = plan.lmax; s = plan.s; off = lmax + 1
+    fill!(G, zero(Complex{T}))
+    _thread_all_orders(lmax, plan.B) do ms
+        _table_orders!(G, sf, plan, tbl, ms, s, off, lmax)
+    end
+    return G
+end
+
+# One degree's contraction over a subrange of orders. Split out so one body serves the serial and the
+# threaded path, and so a spawned task captures a concrete range rather than a loop variable.
+# `m` outermost so the i^{m+s}·N_ℓ phase is formed once per order rather than once per (batch, order);
+# `mp` innermost so both Δ reads and the G write run down contiguous columns.
+@inline function _contract_orders!(G, sf, plan::SpinNUSHTplan{T}, dl, ℓ::Int, ms,
+                                   Nℓ::T, s::Int, off::Int, lmax::Int) where {T}
+    @inbounds for m in ms
+        ph0 = _im_pow(Complex{T}, -(m + s)) * Nℓ
+        for b in 1:plan.B
+            val = sf[ℓ + 1, m + lmax + 1, b]
+            iszero(val) && continue
+            ph = ph0 * val
+            @simd for mp in _mprange(plan, ℓ)
+                G[_grow(plan, mp), m + off, b] +=
+                    ph * (dl[mp + off, m + off] * dl[mp + off, (-s) + off])
             end
         end
     end
@@ -401,21 +503,11 @@ function _assemble_G_impl!(G, sf, plan::SpinNUSHTplan{T}, ::Nothing) where {T}
             _wigner_d_halfpi_step!(dl, dlp, ℓ, off)
         end
         ℓ < abs(s) && continue
-        Nℓ = T(_Nℓ(ℓ))
-        # `m` outermost so the i^{m+s}·N_ℓ phase is formed once per order rather than once per
-        # (batch, order); `mp` innermost so both Δ reads and the G write run down contiguous columns.
-        for m in -ℓ:ℓ
-            ph0 = _im_pow(Complex{T}, -(m + s)) * Nℓ
-            for b in 1:plan.B
-                val = sf[ℓ + 1, m + lmax + 1, b]
-                iszero(val) && continue
-                ph = ph0 * val
-                @simd for mp in _mprange(plan, ℓ)
-                    G[_grow(plan, mp), m + off, b] +=
-                        ph * (dl[mp + off, m + off] * dl[mp + off, (-s) + off])
-                end
-            end
-        end
+        # Serial over orders. They are independent, but the on-the-fly path can only split *within* a
+        # degree — the recurrence sequences the degrees — and a barrier per degree costs more than the
+        # split returns. Measured neutral on the forward and a clear loss on the adjoint. The table
+        # path has no such barrier and is threaded.
+        _contract_orders!(G, sf, plan, dl, ℓ, -ℓ:ℓ, T(_Nℓ(ℓ)), s, off, lmax)
     end
     return G
 end
@@ -424,14 +516,12 @@ end
 # The fold weights are a real diagonal, hence self-adjoint, so the adjoint applies the same ones —
 # before the contraction here, after it in `_assemble_G!`.
 _assemble_G_adjoint!(sf, Ĝ, plan::SpinNUSHTplan) =
-    _assemble_G_adjoint_impl!(sf, _fold_weights!(Ĝ, plan), plan, plan.wigner)
+    _assemble_G_adjoint_impl!(sf, _fold_weights_adjoint!(Ĝ, plan), plan, plan.wigner)
 
-function _assemble_G_adjoint_impl!(sf, Ĝ, plan::SpinNUSHTplan{T}, tbl::WignerTable) where {T}
-    _check_table(tbl, plan)
-    lmax = plan.lmax; s = plan.s; off = lmax + 1
+@inline function _table_orders_adj!(sf, Ĝ, plan::SpinNUSHTplan{T}, tbl::WignerTable, ms,
+                                    s::Int, off::Int, lmax::Int) where {T}
     Q = tbl.Q; qoff = tbl.offsets
-    fill!(sf, zero(Complex{T}))
-    @inbounds for m in -lmax:lmax
+    @inbounds for m in ms
         phc = conj(_im_pow(Complex{T}, -(m + s)))
         for b in 1:plan.B
             for ℓ in max(abs(m), abs(s)):lmax
@@ -442,6 +532,33 @@ function _assemble_G_adjoint_impl!(sf, Ĝ, plan::SpinNUSHTplan{T}, tbl::WignerTa
                 end
                 sf[ℓ + 1, m + lmax + 1, b] = phc * T(_Nℓ(ℓ)) * acc
             end
+        end
+    end
+    return sf
+end
+
+function _assemble_G_adjoint_impl!(sf, Ĝ, plan::SpinNUSHTplan{T}, tbl::WignerTable) where {T}
+    _check_table(tbl, plan)
+    lmax = plan.lmax; s = plan.s; off = lmax + 1
+    fill!(sf, zero(Complex{T}))
+    _thread_all_orders(lmax, plan.B) do ms
+        _table_orders_adj!(sf, Ĝ, plan, tbl, ms, s, off, lmax)
+    end
+    return sf
+end
+
+# Adjoint counterpart of `_contract_orders!`: each order reduces over `m'` into its own `sf` entry.
+@inline function _contract_orders_adj!(sf, Ĝ, plan::SpinNUSHTplan{T}, dl, ℓ::Int, ms,
+                                       Nℓ::T, s::Int, off::Int, lmax::Int) where {T}
+    @inbounds for m in ms
+        phc = conj(_im_pow(Complex{T}, -(m + s))) * Nℓ
+        for b in 1:plan.B
+            acc = zero(Complex{T})
+            @simd for mp in _mprange(plan, ℓ)
+                acc += dl[mp + off, m + off] * dl[mp + off, (-s) + off] *
+                       Ĝ[_grow(plan, mp), m + off, b]
+            end
+            sf[ℓ + 1, m + lmax + 1, b] = phc * acc
         end
     end
     return sf
@@ -458,18 +575,7 @@ function _assemble_G_adjoint_impl!(sf, Ĝ, plan::SpinNUSHTplan{T}, ::Nothing) wh
             _wigner_d_halfpi_step!(dl, dlp, ℓ, off)
         end
         ℓ < abs(s) && continue
-        Nℓ = T(_Nℓ(ℓ))
-        for m in -ℓ:ℓ
-            phc = conj(_im_pow(Complex{T}, -(m + s))) * Nℓ
-            for b in 1:plan.B
-                acc = zero(Complex{T})
-                @simd for mp in _mprange(plan, ℓ)
-                    acc += dl[mp + off, m + off] * dl[mp + off, (-s) + off] *
-                           Ĝ[_grow(plan, mp), m + off, b]
-                end
-                sf[ℓ + 1, m + lmax + 1, b] = phc * acc
-            end
-        end
+        _contract_orders_adj!(sf, Ĝ, plan, dl, ℓ, -ℓ:ℓ, T(_Nℓ(ℓ)), s, off, lmax)  # serial: see forward
     end
     return sf
 end
@@ -513,9 +619,10 @@ end
 """
     LSMRWorkspace(plan::SpinNUSHTplan)
 
-Reusable scratch for [`nusht_solve_spin!`](@ref) — the same workspace the scalar path uses, at complex
-element type and with no `valid` projection: the spin coefficient array is dense, with no
-supernumerary slots to exclude.
+Reusable scratch for [`nusht_solve_spin!`](@ref) — the same workspace the scalar path uses, with no
+`valid` projection: the spin coefficient array is dense, with no supernumerary slots to exclude. The
+coefficient vectors are complex because spin coefficients are; `u` is a point-space residual and so
+takes the plan's strengths type, which is real wherever the backend has a real-data transform.
 """
 function LSMRWorkspace(plan::SpinNUSHTplan{T}) where {T}
     lmax, B, M = plan.lmax, plan.B, _spin_npts(plan)
@@ -524,7 +631,8 @@ function LSMRWorkspace(plan::SpinNUSHTplan{T}) where {T}
     vB() = _zeros_like(_θnodes(plan), T, B)
     hB() = zeros(T, B)
     nrm, cf = vB(), vB()
-    return LSMRWorkspace(z3(), z3(), z3(), z3(), z3(), _zeros_like(_fbuf(plan), CT, M, B),
+    return LSMRWorkspace(z3(), z3(), z3(), z3(), z3(),
+                         _zeros_like(_fbuf(plan), eltype(_fbuf(plan)), M, B),
                          nothing, collect(1:B),
                          nrm, cf, _host_mirror(nrm), _host_mirror(cf),
                          hB(), hB(), hB(), hB(), hB(), hB(), hB(), hB(),

@@ -57,20 +57,27 @@ itself rejects a half-support too large for the grid (`σN ≥ 2M`).
 end
 
 """
-    NonuniformFFTsPlan{P,T}
+    NonuniformFFTsPlan{P,Nc}
 
 NUFSHT-owned handle wrapping a `PlanNUFFT`. Owning the handle (rather than dispatching the seam on
 NonuniformFFTs' own type) keeps every reference to the library inside function bodies, so this
 extension precompiles regardless of which of the library's symbols exist at precompile time.
 
-`type` and the buffers are carried alongside because the seam's `_nufft_exec!` is direction-agnostic:
-NonuniformFFTs splits it into `exec_type1!`/`exec_type2!`.
+`type` is carried alongside because the seam's `_nufft_exec!` is direction-agnostic while NonuniformFFTs
+splits it into `exec_type1!`/`exec_type2!`. That is also why `plan` can be **shared** between the two
+directions: a `PlanNUFFT` encodes no direction — the sign comes from which exec function is called — so
+one of them serves both and only `type` differs here. See `NUFSHT._nufft_share_directions`.
+
+`Nc` is the transform count, a type parameter rather than a field: `exec_type1!`/`exec_type2!` take one
+array per transform, so every call builds a tuple of views whose length is that count, and a count read
+from a field leaves the length unknown to inference — the views box and the library call becomes a
+dynamic dispatch. `PlanNUFFT` already carries the count in its own type (`to_static`), so naming it here
+costs no specialisation that did not already exist.
 """
-struct NonuniformFFTsPlan{P, V}
+struct NonuniformFFTsPlan{P, Nc}
     plan::P
     type::Int
-    ntrans::Int
-    scratch::V          # (M, ntrans) strengths view buffer, as NonuniformFFTs wants per-transform vectors
+    derived::Bool     # wraps another handle's plan, so its points are already set
 end
 
 # `strengths` is the non-uniform data type, forwarded straight to `PlanNUFFT` — a real one selects the
@@ -90,20 +97,47 @@ end
 # at lmax 64 / M 1e4 and 1.26x at lmax 128 / M 2e5, with bit-identical output.
 const _DEFAULT_σ = 2.0
 
+"""
+    _unblocked(nthreads) -> Bool
+
+Whether to build on the library's `block_size = nothing` path. Two thread counts are reachable and no
+others: the blocked path fixes its width at `Threads.nthreads()` when the plan is built (`blocking/cpu.jl`,
+one buffer and one block range per thread, no keyword), and the unblocked path spreads from a plain
+serial loop over the points. So `nthreads` is honoured at `1` and at whatever Julia is running, and
+anything else is refused rather than silently dropped.
+"""
+function _unblocked(nthreads)
+    (isnothing(nthreads) || nthreads == 0 || nthreads == Threads.nthreads()) && return false
+    nthreads == 1 || throw(ArgumentError(
+        "NonuniformFFTs reaches only two thread counts: 1, or the `Threads.nthreads()` it is running " *
+        "under ($(Threads.nthreads())). Got nthreads = $nthreads. `0` takes the default; " *
+        "`nufft = FINUFFTBackend()` takes an arbitrary count."))
+    return true
+end
+
 function NUFSHT._nufft_makeplan(::NUFSHT.NonuniformFFTsBackend, nodes::AbstractVector, type, n_modes,
                                 iflag, ntrans, tol; dtype = Float64, strengths = Complex{dtype},
-                                modeord = 0, upsampfac = nothing, kwargs...)
+                                modeord = 0, upsampfac = nothing, nthreads = nothing, kwargs...)
     Ns = (Int(n_modes[1]), Int(n_modes[2]))
     σ = isnothing(upsampfac) ? _DEFAULT_σ : Float64(upsampfac)
-    plan = NonuniformFFTs.PlanNUFFT(strengths, Ns;
-                            ntransforms = Int(ntrans),
-                            m = _halfsupport(tol, σ),
-                            σ = σ,
-                            fftshift = (modeord == 0),
-                            sort_points = NonuniformFFTs.True())
-    scratch = similar(nodes, strengths, length(nodes) * Int(ntrans))
-    return NonuniformFFTsPlan{typeof(plan), typeof(scratch)}(plan, Int(type), Int(ntrans), scratch)
+    kw = (; ntransforms = Int(ntrans),
+            m = _halfsupport(tol, σ),
+            σ = σ,
+            fftshift = (modeord == 0),
+            sort_points = NonuniformFFTs.True())
+    plan = _unblocked(nthreads) ?
+        NonuniformFFTs.PlanNUFFT(strengths, Ns; kw..., block_size = nothing) :
+        NonuniformFFTs.PlanNUFFT(strengths, Ns; kw...)
+    return NonuniformFFTsPlan{typeof(plan), Int(ntrans)}(plan, Int(type), false)
 end
+
+# One `PlanNUFFT` serves both directions: it carries no direction of its own, and the two are never
+# executed concurrently (a plan already carries that restriction). Sharing it halves the oversampled
+# grid and the sorted point copy a plan owns.
+NUFSHT._nufft_share_directions(::NUFSHT.NonuniformFFTsBackend) = true
+NUFSHT._nufft_as_type1(p::NonuniformFFTsPlan{P,Nc}) where {P,Nc} =
+    NonuniformFFTsPlan{P,Nc}(p.plan, 1, true)
+NUFSHT._nufft_derived(p::NonuniformFFTsPlan) = p.derived
 
 NUFSHT._nufft_setpts!(p::NonuniformFFTsPlan, x, y) = (NonuniformFFTs.set_points!(p.plan, (x, y)); p)
 
@@ -133,6 +167,7 @@ _retype_count(::Type{Vector{NTuple{N,X}}}, old::Int, k::Int) where {N,X} =
 # the dimensionality whenever the batch width happened to equal it.
 function _inner_at_width(@nospecialize(Q::Type), old::Int, k::Int)
     q = collect(Q.parameters)
+    length(q) ≥ 3 || return Q          # `NullBlockData` carries no count: an unblocked plan's is here
     q[3] = k
     for i in 5:length(q)
         q[i] = _retype_count(q[i], old, k)
@@ -158,9 +193,8 @@ function _plan_at_width(@nospecialize(P::Type), k::Int)
     return Base.typename(P).wrapper{p...}
 end
 
-# The wrapper's scratch buffer is sized at run time, so only the inner plan type varies with the width.
-_wrapper_at_width(::Type{NonuniformFFTsPlan{P,V}}, k::Int) where {P,V} =
-    NonuniformFFTsPlan{_plan_at_width(P, k), V}
+_wrapper_at_width(::Type{NonuniformFFTsPlan{P,Nc}}, k::Int) where {P,Nc} =
+    NonuniformFFTsPlan{_plan_at_width(P, k), k}
 
 # One empty, concretely typed slot per width. Nothing is built here — `_pool_lookup!` fills a slot the
 # first time a solve narrows to it, and it stays filled for the plan's life.
@@ -175,24 +209,25 @@ function NUFSHT._nufft_size_pool(::NUFSHT.NonuniformFFTsBackend, nufft_type2, nu
     end
 end
 
-# NonuniformFFTs takes one vector per transform; NUFSHT stores strengths as a flat (M, ntrans) block.
-@inline function _as_transforms(v, M, ntrans)
-    return ntuple(b -> view(vec(v), ((b - 1) * M + 1):(b * M)), ntrans)
+# NonuniformFFTs takes one array per transform; NUFSHT stores both sides as one flat block. The count
+# comes in as `Val` so the tuple length is known at compile time and the views stay unboxed.
+@inline function _as_transforms(v, M, ::Val{Nc}) where {Nc}
+    return ntuple(b -> view(vec(v), ((b - 1) * M + 1):(b * M)), Val(Nc))
 end
-@inline function _as_modes(u, n1, n2, ntrans)
-    return ntuple(b -> reshape(view(vec(u), ((b - 1) * n1 * n2 + 1):(b * n1 * n2)), n1, n2), ntrans)
+@inline function _as_modes(u, n1, n2, ::Val{Nc}) where {Nc}
+    return ntuple(b -> reshape(view(vec(u), ((b - 1) * n1 * n2 + 1):(b * n1 * n2)), n1, n2), Val(Nc))
 end
 
-function NUFSHT._nufft_exec!(p::NonuniformFFTsPlan, input, output)
+function NUFSHT._nufft_exec!(p::NonuniformFFTsPlan{P,Nc}, input, output) where {P,Nc}
     n1, n2 = size(p.plan)
     if p.type == 2
-        M = length(output) ÷ p.ntrans
-        NonuniformFFTs.exec_type2!(_as_transforms(output, M, p.ntrans), p.plan,
-                           _as_modes(input, n1, n2, p.ntrans))
+        M = length(output) ÷ Nc
+        NonuniformFFTs.exec_type2!(_as_transforms(output, M, Val(Nc)), p.plan,
+                           _as_modes(input, n1, n2, Val(Nc)))
     else
-        M = length(input) ÷ p.ntrans
-        NonuniformFFTs.exec_type1!(_as_modes(output, n1, n2, p.ntrans), p.plan,
-                           _as_transforms(input, M, p.ntrans))
+        M = length(input) ÷ Nc
+        NonuniformFFTs.exec_type1!(_as_modes(output, n1, n2, Val(Nc)), p.plan,
+                           _as_transforms(input, M, Val(Nc)))
     end
     return output
 end

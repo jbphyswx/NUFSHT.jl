@@ -251,6 +251,40 @@ function NUFSHT._col_scale!(y::GPUArraysCore.AbstractGPUArray, s,          # y[:
     return y
 end
 
+# ── Device pack/unpack between the packed solver vectors and the plan's full layout ──────────────
+# The scalar solver carries its vectors packed to the `l ≤ lmax` slots, so crossing to and from the
+# plan's `(Nθ, Nφ, B)` layout is a gather/scatter by index vector. The `src` versions are scalar loops
+# (zero-allocation on a host array); here they are broadcasts over reshaped views, which a device array
+# can execute — a `SubArray` header costs nothing against a kernel launch.
+function NUFSHT._pack_coeffs!(dst::GPUArraysCore.AbstractGPUArray, src, idx, srclen::Integer,
+                              n::Integer)
+    _cols(dst, n) .= view(reshape(src, srclen, :), idx, 1:n)
+    return dst
+end
+
+function NUFSHT._unpack_coeffs!(dst::GPUArraysCore.AbstractGPUArray, src, idx, dstlen::Integer,
+                                n::Integer)
+    fill!(dst, zero(eltype(dst)))
+    view(reshape(dst, dstlen, :), idx, 1:n) .= _cols(src, n)
+    return dst
+end
+
+function NUFSHT._col_pbp_pack!(v::GPUArraysCore.AbstractGPUArray, wfull, β, idx,
+                               fulllen::Integer, n::Integer)
+    _cols(v, n) .= view(reshape(wfull, fulllen, :), idx, 1:n) .+
+                   reshape(view(β, 1:n), 1, :) .* _cols(v, n)
+    return v
+end
+
+function NUFSHT._write_solution!(C::GPUArraysCore.AbstractGPUArray, ws::NUFSHT.LSMRWorkspace,
+                                 plan::NUFSHT.NUSHTplan, slot::Integer, dstcol::Integer)
+    full = NUFSHT._fulllen(plan)
+    col = view(reshape(C, full, :), :, dstcol)
+    fill!(col, zero(eltype(C)))
+    view(col, ws.valid) .= view(reshape(ws.x, length(ws.valid), :), :, slot)
+    return C
+end
+
 # ── Device real↔complex field copy (scalar type-2/type-1 bracket) ───────────────
 # `f` may be `(M,)` or `(M,B)`; `fbuf` is `(M,B)` and equal length — a `reshape`d broadcast handles
 # either shape (the `src` versions are CPU scalar loops). Dispatched on the plan buffer `fbuf`.

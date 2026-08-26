@@ -71,10 +71,15 @@ Pkg.add(url="https://github.com/jbphyswx/NUFSHT.jl")
 Everything below is dependency-light by default — the accelerators are **package extensions**, loaded
 only when you load their trigger package, so a plain `using NUFSHT` never pulls in MPI/CUDA/etc.
 
-- **Persistent guru plans, zero allocation.** A plan builds the FINUFFT guru plans once (points set
-  once) and pre-allocates every buffer, so warmed-up `nusht_type2!`/`nusht_type1!` and the hundreds of
-  solver matvecs inside `nusht_solve!` allocate **nothing** and never re-plan. (Single-threaded FINUFFT is
-  exactly zero-alloc; the all-cores default adds only FINUFFT's own small planner-lock allocation.)
+- **Persistent guru plans, zero allocation.** A plan builds its NUFFT plans once (points set once) and
+  pre-allocates every buffer, so warmed-up `nusht_type2!`/`nusht_type1!` and the hundreds of solver
+  matvecs inside `nusht_solve!` allocate **nothing** in NUFSHT's own code and never re-plan. What the
+  backend does inside its own exec is its own: single-threaded FINUFFT adds nothing, its all-cores
+  default adds a small planner-lock allocation, and NonuniformFFTs spawns tasks in its deconvolution.
+- **`nthreads` is honoured or refused, never dropped.** FINUFFT takes any count; direct summation
+  splits the axis each direction writes and gives bit-identical output at any count; NonuniformFFTs
+  parallelises over Julia's threads and so reaches `1` (serial spreading) and `Threads.nthreads()`,
+  erroring on anything else. Use `nthreads = 1` when two runs must agree bit for bit.
 - **Batching (`ntrans = B`).** Transform `B` co-located fields (same points) in one call —
   `make_plan(θ, φ, lmax; ntrans = B)`, coefficients/fields carry a trailing batch axis. FFTW and
   FINUFFT parallelize *across the batch* internally (measured ~4.5× / ~2.8× on small transforms), which
@@ -84,6 +89,20 @@ only when you load their trigger package, so a plain `using NUFSHT` never pulls 
   a complex one; likewise `make_spin_plan(FE, θ, φ, lmax, s)`. Both compute the same transform — the
   real one additionally exploits the Hermitian symmetry a real field gives its spectrum, folding one
   mode axis in half. The keyword spelling `T = ComplexF64` forwards to the positional form.
+- **Only the directions you use.** `make_plan(…; directions = SynthesisOnly())` builds no analysis
+  plan, so a caller that only synthesises holds no type-1 grid; `nusht_type1!` / `nusht_solve!` /
+  `nusht_filter!` on such a plan raise rather than silently building one. The default is
+  `SynthesisAndAnalysis()`. Where a backend's plan carries no direction, both directions already share
+  one object and the keyword costs nothing either way.
+- **Knowing what a plan holds.** `plan_memory(plan)` returns the byte count of each field and the
+  total — the coefficient array, the mode array, the strengths, the node set and the plan pools — so
+  the memory of a configuration can be checked before committing to it.
+- **Trading memory for speed.** Most of a plan's memory is the backend's oversampled grid, which
+  `upsampfac` (σ) sizes. `tol`, σ and the kernel half-support are exchangeable by construction, so
+  lowering σ meets the same tolerance on a smaller grid and pays for it in spreading: `σ = 1.25`
+  roughly halves the NUFFT's memory against the default `2.0` and costs synthesis ~1.1-1.5×, while
+  making analysis slightly *faster*. Use it when a dataset does not otherwise fit; `AutoTuning` times
+  the candidates and picks per plan.
 - **Mixed precision.** `Float32` and `ComplexF32` are supported. The sphere plans FastTransforms
   provides are `Float64`/`ComplexF64` only, so single-precision plans run their S-step through a
   double-precision slice buffer and everything else at the requested precision.
@@ -132,20 +151,29 @@ the device S-engine.)
 
 The field element type is positional, as in `zeros(T, …)`, and it is a statement about the data:
 `make_plan(Float64, …)` asserts the field **values** are real, which makes the mode array Hermitian in
-`kθ`. On a NUFFT backend with a genuine real-data transform — `NonuniformFFTsBackend`; FINUFFT has
-none — only the `kθ ≥ 0` half is then built and only real strengths come back, so the mode array, the
-upsampled FFT **and** the spreading/interpolation all halve:
+`kθ`. Only the `kθ ≥ 0` half is then stored — on **every** backend, since halving the θ axis halves
+the deconvolution and the upsampled FFT and leaves the interpolation alone. On a backend with a
+genuine real-data transform (`NonuniformFFTsBackend`; FINUFFT has none) the strengths come back real
+too, so the spreading/interpolation halves as well:
 
 ```julia
-make_plan(Float64,    θ, φ, lmax; nufft = NonuniformFFTsBackend())   # kθ ≥ 0, real strengths
-make_plan(ComplexF64, θ, φ, lmax; nufft = NonuniformFFTsBackend())   # full array
+make_plan(Float64,    θ, φ, lmax)   # kθ ≥ 0, real strengths, if a real-capable backend is loaded
+make_plan(ComplexF64, θ, φ, lmax)   # full array
 ```
 
-Forward, that is free: writing the half and letting the complex-to-real transform imply the conjugate
-is exact, no weights. Its **transpose** is not — the embedding `Z[−k] = conj(Z[k])` is `ℝ`-linear but
-not `ℂ`-linear, so `A†` carries a factor `2` on every `kθ > 0` row (`{1, 2, 2, …}`, one at `kθ = 0`
-because that row is its own partner). There is no third case at the top: the θ axis has odd length
-`2·lmax+3` and so has no self-paired Nyquist row.
+Backend selection follows the field: with no `nufft` given, a real `FE` prefers a loaded real-capable
+backend, and a complex `FE` keeps the usual order. Naming a backend explicitly overrides that and is
+never swapped — `nufft = FINUFFTBackend()` on a real field still folds, but with complex strengths.
+
+With a real-data transform the forward is free: writing the half and letting the complex-to-real
+transform imply the conjugate is exact, no weights. Its **transpose** is not — the embedding
+`Z[−k] = conj(Z[k])` is `ℝ`-linear but not `ℂ`-linear, so `A†` carries a factor `2` on every `kθ > 0`
+row (`{1, 2, 2, …}`, one at `kθ = 0` because that row is its own partner). There is no third case at
+the top: the θ axis has odd length `2·lmax+3` and so has no self-paired Nyquist row.
+
+Without a real-data transform the half-height transform is complex, so the conjugate half is not
+implied by anything and the same `{1, 2, 2, …}` is applied on the **forward** as well; a per-point
+phase undoes the centered row labelling, and the field is the real part of the result.
 
 ### Adjoint vs inverse
 
@@ -274,6 +302,7 @@ nusht_filter_renorm!(f_out, mask, filt, plan)   # divide by filtered mask
 | Function | Description |
 |----------|-------------|
 | `make_plan([FE,] θ, φ, lmax; tol)` | Construct pre-allocated plan for M scattered points; `FE` real or complex |
+| `plan_memory(plan)` | Per-field byte breakdown of what the plan holds, plus the total |
 | `nusht_type2!(f, C, plan)` | Synthesis: SH coefficients → scattered field values |
 | `nusht_type1!(C, f, plan)` | Adjoint `A†` (the transpose, not an inverse) |
 | `nusht_solve!(C, f, plan; maxiter, rtol, verbose)` | Exact LSMR inversion at any scattered points |
