@@ -7,6 +7,20 @@ make_plan
 NUSHTplan
 close!
 set_nodes!
+plan_memory
+```
+
+### Which directions a plan holds
+
+A plan that only ever synthesises has no reason to hold an analysis plan. `directions` says which it
+needs; asking a synthesis-only plan to analyse raises rather than quietly building the missing half.
+Where a backend's plan carries no direction of its own, both directions already share one object and
+the choice costs nothing either way.
+
+```@docs
+NUFSHT.AbstractPlanDirections
+NUFSHT.SynthesisOnly
+NUFSHT.SynthesisAndAnalysis
 ```
 
 ### Node sets

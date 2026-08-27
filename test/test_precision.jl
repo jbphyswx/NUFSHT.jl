@@ -48,12 +48,13 @@ Test.@testset "mixed precision (Float32) — scalar path" begin
     for (T, tol, synth_tol, adj_tol) in ((Float64, 1e-12, 1e-11, 1e-11),
                                          (Float32, 1.0f-6, 2e-5, 1e-4))
         p = NUFSHT.make_plan(T, T.(θ64), T.(φ64), lmax; tol = tol)
-        Test.@test eltype(p.C) === T && eltype(p.F) === T
+        Test.@test eltype(p.F) === T          # `p.C` is a slot, empty until something filters
         Test.@test eltype(p.Fhat) === Complex{T}
-        # Real strengths and a half-height mode array are the same decision, whichever backend the
-        # `Auto` resolution picked here.
-        folded = size(p.Fhat, 1) == lmax + 2
-        Test.@test eltype(NUFSHT._fbuf(p)) === (folded ? T : Complex{T})
+        # A real field always folds its mode array; real strengths need a real-capable backend, which
+        # is a separate question and is what `Auto` picked here.
+        Test.@test size(p.Fhat, 1) == lmax + 2
+        Test.@test eltype(NUFSHT._fbuf(p)) === (NUFSHT._real_capable(p.pool_recipe.backend) ?
+                                                T : Complex{T})
         Test.@test eltype(p.Fslice) === Float64          # the one FastTransforms pins
 
         f = zeros(T, M); NUFSHT.nusht_type2!(f, T.(C64), p)

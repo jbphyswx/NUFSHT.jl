@@ -206,3 +206,120 @@ Test.@testset "spin recurrence: correctness at large lmax (stable where wigner_d
     Test.@test conv == (relres < 1e-8)
     NUFSHT.close!(plan)
 end
+
+# A real-`FE` spin plan folds its mode array like every other real field, and on a backend with a
+# real-data transform its strengths are real too. Both folds have to be the SAME operator wherever a
+# real spin field exists — `s = 0` with `conj(sf[l,m]) = (-1)^m sf[l,-m]`, from
+# `conj(Y_lm) = (-1)^m Y_l,-m`. Off that subspace they are two different `R`-linear extensions of a map
+# with no physical meaning, so the comparison is only made where the construction is checked to hold.
+Test.@testset "real-field spin plans: both folds are one operator" begin
+    Random.seed!(313)
+    lmax, M = 8, 324
+    N, Nf = lmax + 1, 2lmax + 1
+    θ = clamp.(π .* rand(M), 1e-9, π - 1e-9); φ = 2π .* rand(M)
+
+    sf = zeros(ComplexF64, N, Nf)
+    for ℓ in 0:lmax
+        sf[NUFSHT.spin_coeff_index(ℓ, 0, lmax)] = randn()          # m = 0 must be real
+        for m in 1:ℓ
+            a = randn(ComplexF64)
+            sf[NUFSHT.spin_coeff_index(ℓ,  m, lmax)] = a
+            sf[NUFSHT.spin_coeff_index(ℓ, -m, lmax)] = (-1)^m * conj(a)
+        end
+    end
+
+    # The unfolded complex plan is the reference, and it must actually return a real field — otherwise
+    # the coefficients above are not on the subspace and nothing below means anything.
+    full = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 0; tol = 1e-12, nthreads = 1)
+    gc = zeros(ComplexF64, M); NUFSHT.nusht_type2_spin!(gc, sf, full)
+    Test.@test size(full.G, 1) == 2lmax + 1                        # the reference is unfolded
+    Test.@test sqrt(sum(abs2, imag.(gc)) / sum(abs2, real.(gc))) < 1e-12
+    ref = real.(gc)
+
+    for be in (NUFSHT.NonuniformFFTsBackend(), NUFSHT.FINUFFTBackend(),
+               NUFSHT.SpectralBackends.DirectSumSpectralBackend())
+        p = NUFSHT.make_spin_plan(Float64, θ, φ, lmax, 0; tol = 1e-12, nthreads = 1, nufft = be)
+        Test.@test size(p.G, 1) == lmax + 1                        # folded on every backend
+        # Real strengths only where the backend reconstructs the conjugate half itself.
+        Test.@test (eltype(NUFSHT._fbuf(p)) === Float64) == NUFSHT._real_capable(be)
+        f = zeros(M); NUFSHT.nusht_type2_spin!(f, sf, p)
+        Test.@test sqrt(sum(abs2, f .- ref) / sum(abs2, ref)) < 1e-10
+
+        # Exact adjoint over the reals: the field is real, the coefficients complex.
+        x = zeros(ComplexF64, N, Nf); x .= sf
+        y = randn(M)
+        Ax = zeros(M);                    NUFSHT.nusht_type2_spin!(Ax, x, p)
+        Aty = zeros(ComplexF64, N, Nf);   NUFSHT.nusht_type1_spin!(Aty, y, p)
+        adj = abs(sum(Ax .* y) - real(sum(conj.(x) .* Aty))) / abs(sum(Ax .* y))
+        Test.@test adj < 1e-11
+        NUFSHT.close!(p)
+    end
+    NUFSHT.close!(full)
+    @info "real-field spin plans agree with the unfolded complex operator on the s=0 real subspace"
+end
+
+# A real field's coefficients are Hermitian, which is `(lmax+1)²` real numbers rather than the
+# `(lmax+1)(2lmax+1)` complex ones the array holds. Fitting over the unrestricted array asks a question
+# with no unique answer — the operator's continuation off the Hermitian subspace is whatever the fold
+# happens to be — so the solve runs over the packed real degrees instead. That restriction closes only
+# at `s = 0`: conjugation maps spin `s` to spin `-s`, so a spin-`s ≠ 0` field is never real.
+Test.@testset "real-field spin solve fits the Hermitian degrees" begin
+    Random.seed!(414)
+    lmax, M = 8, 324
+    N, Nf = lmax + 1, 2lmax + 1
+    K = (lmax + 1)^2
+    θ = clamp.(π .* rand(M), 1e-9, π - 1e-9); φ = 2π .* rand(M)
+
+    # The packed map must be an isometry (so "minimum norm" survives it) and `_pack_herm!` must be the
+    # exact adjoint of `_unpack_herm!`, not a projection: a wrong sign or scale here is silent.
+    p1 = randn(K, 1)
+    sfu = zeros(ComplexF64, N, Nf, 1); NUFSHT._unpack_herm!(sfu, p1, lmax, 1)
+    Test.@test sqrt(sum(abs2, sfu)) ≈ sqrt(sum(abs2, p1))
+    g = randn(ComplexF64, N, Nf, 1); Utg = zeros(K, 1)
+    NUFSHT._pack_herm!(Utg, g, lmax, 1)
+    Test.@test real(sum(conj.(sfu) .* g)) ≈ sum(p1 .* Utg)
+    # and it lands on Hermitian arrays, which is the subspace it is supposed to parametrise
+    for ℓ in 0:lmax, m in 1:ℓ
+        Test.@test sfu[NUFSHT.spin_coeff_index(ℓ, -m, lmax), 1] ≈
+                   (-1)^m * conj(sfu[NUFSHT.spin_coeff_index(ℓ, m, lmax), 1])
+    end
+
+    sf = zeros(ComplexF64, N, Nf)
+    for ℓ in 0:lmax
+        sf[NUFSHT.spin_coeff_index(ℓ, 0, lmax)] = randn()
+        for m in 1:ℓ
+            a = randn(ComplexF64)
+            sf[NUFSHT.spin_coeff_index(ℓ,  m, lmax)] = a
+            sf[NUFSHT.spin_coeff_index(ℓ, -m, lmax)] = (-1)^m * conj(a)
+        end
+    end
+
+    for be in (NUFSHT.NonuniformFFTsBackend(), NUFSHT.FINUFFTBackend())
+        p = NUFSHT.make_spin_plan(Float64, θ, φ, lmax, 0; tol = 1e-13, nthreads = 1, nufft = be)
+        Test.@test NUFSHT._coefflen(p) == K            # the fit runs over the real degrees
+        f = zeros(M); NUFSHT.nusht_type2_spin!(f, sf, p)
+        S = zeros(ComplexF64, N, Nf)
+        _, it, relres, conv = NUFSHT.nusht_solve_spin!(S, f, p; rtol = 1e-11, maxiter = 500)
+        Test.@test conv && it < 200
+        Test.@test relerr(S, sf) < 1e-9                # the coefficients, not just the field
+        NUFSHT.close!(p)
+    end
+
+    # A complex plan carries the full array and is unaffected by any of the above.
+    pc = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 0; tol = 1e-13, nthreads = 1)
+    Test.@test NUFSHT._coefflen(pc) == N * Nf
+    fc = zeros(ComplexF64, M); NUFSHT.nusht_type2_spin!(fc, sf, pc)
+    Sc = zeros(ComplexF64, N, Nf)
+    _, itc, _, convc = NUFSHT.nusht_solve_spin!(Sc, fc, pc; rtol = 1e-11, maxiter = 500)
+    Test.@test convc && relerr(Sc, sf) < 1e-9
+    NUFSHT.close!(pc)
+
+    # s ≠ 0 has no real subspace to fit over, so the solve refuses; synthesis is exact and stays.
+    ps = NUFSHT.make_spin_plan(Float64, θ, φ, lmax, 1; tol = 1e-10, nthreads = 1)
+    Test.@test_throws ArgumentError NUFSHT.nusht_solve_spin!(zeros(ComplexF64, N, Nf), zeros(M), ps;
+                                                             maxiter = 2)
+    fs = zeros(M); NUFSHT.nusht_type2_spin!(fs, sf, ps)
+    Test.@test all(isfinite, fs)
+    NUFSHT.close!(ps)
+    @info "real-field spin solve: $(K) packed real degrees vs $(N * Nf) complex slots"
+end

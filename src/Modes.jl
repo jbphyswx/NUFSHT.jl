@@ -35,8 +35,8 @@ a gather because at most two coefficient entries reach any one mode slot: the sl
 @inline _theta_freq(i::Integer, am::Integer) = iseven(am) ? i - 1 : i
 
 # Whether the mode array holds only `kθ ≥ 0` (`lmax+2` rows) rather than the centered `-(lmax+1) …
-# lmax+1` (`2lmax+3` rows). A real field's array is exactly Hermitian, so a backend with a real-data
-# transform takes the half and supplies the rest itself — see `_real_capable`.
+# lmax+1` (`2lmax+3` rows). A real field's array is exactly Hermitian, so every backend stores the
+# half; how the other half is supplied is the plan's business, not this gather's.
 @inline _folded(Z, lmax::Integer) = size(Z, 1) == lmax + 2
 
 # The three normalizations every element needs, formed once per call instead of per element.

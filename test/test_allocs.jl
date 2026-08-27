@@ -28,6 +28,7 @@ _a_analy(p)              = (NUFSHT._dfn_analysis!(p); @allocated NUFSHT._dfn_ana
 _a_transfer(C, ft, l)    = (NUFSHT.apply_transfer!(C, ft, l); @allocated NUFSHT.apply_transfer!(C, ft, l); @allocated NUFSHT.apply_transfer!(C, ft, l))
 _a_filter(o, i, ft, p, w) = (NUFSHT.nusht_filter!(o, i, ft, p; ws = w); @allocated NUFSHT.nusht_filter!(o, i, ft, p; ws = w); @allocated NUFSHT.nusht_filter!(o, i, ft, p; ws = w))
 _a_renorm(o, m, ft, p, s, w) = (NUFSHT.nusht_filter_renorm!(o, m, ft, p; mask_filt = s, ws = w); @allocated NUFSHT.nusht_filter_renorm!(o, m, ft, p; mask_filt = s, ws = w); @allocated NUFSHT.nusht_filter_renorm!(o, m, ft, p; mask_filt = s, ws = w))
+_a_sphev(p)              = (NUFSHT._sph_evaluate!(p); @allocated NUFSHT._sph_evaluate!(p); @allocated NUFSHT._sph_evaluate!(p))
 _a_asmM(Z, G, l)         = (NUFSHT._assemble_modes!(Z, G, l); @allocated NUFSHT._assemble_modes!(Z, G, l); @allocated NUFSHT._assemble_modes!(Z, G, l))
 _a_asmMa(G, Z, l)        = (NUFSHT._assemble_modes_adjoint!(G, Z, l); @allocated NUFSHT._assemble_modes_adjoint!(G, Z, l); @allocated NUFSHT._assemble_modes_adjoint!(G, Z, l))
 _a_caxpy(y, al, x, s)    = (NUFSHT._col_axpy!(y, al, x, s); @allocated NUFSHT._col_axpy!(y, al, x, s); @allocated NUFSHT._col_axpy!(y, al, x, s))
@@ -53,9 +54,14 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
     θ, φ = fib_points(M)          # cond(A) ≈ 1.04, so the solve converges in a few iterations
     filt = NUFSHT.gaussian_from_scale(2000e3)
 
+    # The backend is named rather than left to `Auto`, because what this asserts is that *NUFSHT's own*
+    # hot path allocates nothing, and a backend can allocate inside its own exec regardless. FINUFFT
+    # does not, so it is the one that isolates NUFSHT's contribution; the stage-by-stage assertions
+    # further down hold on every backend and are the backend-independent half of the guarantee.
     for B in (1, 2)
         Test.@testset "scalar transform + CG (B=$B)" begin
-            plan = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-10, ntrans = B, nthreads = 1)
+            plan = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-10, ntrans = B, nthreads = 1,
+                                    nufft = NUFSHT.FINUFFTBackend())
             C = randn(Nθ, Nφ, B); f = zeros(M, B); Cout = zeros(Nθ, Nφ, B); out = zeros(M, B)
             NUFSHT.nusht_type2!(f, C, plan)
             mask = abs.(randn(M, B)) .+ 0.5; scratch = similar(out)
@@ -64,7 +70,7 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
                 C_true[FastSphericalHarmonics.sph_mode(ℓ, m), b] = randn()
             end
             ftrue = zeros(M, B); NUFSHT.nusht_type2!(ftrue, C_true, plan)
-            Csol = similar(plan.C); ws = NUFSHT.LSMRWorkspace(plan)
+            Csol = similar(plan.F); ws = NUFSHT.LSMRWorkspace(plan)
             # Warm the whole pipeline on this plan: the first real use of the adjoint / solve path builds
             # FastTransforms' lazy adjoint plan (a one-time ~few-hundred-byte per-plan setup cost, not a
             # per-call allocation). After warmup, steady-state is zero.
@@ -80,11 +86,22 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
                 Test.@test _a_adj(Cout, f, plan)          == 0
                 Test.@test _a_synth(plan)                 == 0
                 Test.@test _a_analy(plan)                 == 0
-                Test.@test _a_transfer(plan.C, filt, lmax) == 0
+                # The warmup above ran a filter, so the scratch exists and is reused, not reallocated.
+                Test.@test _a_transfer(NUFSHT._filter_scratch(plan), filt, lmax) == 0
                 Test.@test _a_filter(out, f, filt, plan, ws) == 0
                 Test.@test _a_renorm(out, mask, filt, plan, scratch, ws) == 0
                 Test.@test _a_asmM(plan.Fhat, plan.F, lmax) == 0
                 Test.@test _a_asmMa(plan.F, plan.Fhat, lmax) == 0
+                # NUFSHT's own stages allocate nothing on *every* backend — the parts above can only
+                # be asserted where the backend's exec is itself allocation-free.
+                for be in (NUFSHT.FINUFFTBackend(), NUFSHT.NonuniformFFTsBackend())
+                    q = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-10, ntrans = B, nthreads = 1, nufft = be)
+                    copyto!(q.F, C)
+                    Test.@test _a_sphev(q) == 0
+                    Test.@test _a_asmM(q.Fhat, q.F, lmax) == 0
+                    Test.@test _a_asmMa(q.F, q.Fhat, lmax) == 0
+                    NUFSHT.close!(q)
+                end
                 Test.@test _a_chdot(ws.nrm, ws.v, ws.v)   == 0
                 Test.@test _a_caxpy(ws.x, ws.cf, ws.hbar, 1.0) == 0
                 Test.@test _a_cpbp(ws.h, ws.v, ws.cf)     == 0

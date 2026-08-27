@@ -3,7 +3,7 @@ using ComputationalBackends: ComputationalBackends
 
 # Node-local thread parallelism over independent problems. FastTransforms is unsafe to *drive* from a
 # Julia task, so the extension forces it single-threaded around the whole threaded section; the plans
-# are built with `nthreads = 1` (single-threaded FINUFFT) so each threaded transform is deterministic
+# are built with `nthreads = 1` (serial NUFFT) so each threaded transform is deterministic
 # and cores are not oversubscribed across tasks. With those, a threaded transform is bit-for-bit the
 # serial one (verified below), and the main task is uncorrupted afterward.
 Test.@testset "OhMyThreads extension: threaded == serial, main task intact" begin

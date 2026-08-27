@@ -67,7 +67,7 @@ function NUFSHT.nusht_solve(θs, φs, fs, lmax, ::ComputationalBackends.Abstract
     return _farm(NUFSHT._fasttransforms_single!, length(fs)) do i
         plan = NUFSHT.make_plan(θs[i], φs[i], lmax; tol = tol, nthreads = nthreads, kwargs...)
         try
-            C = zeros(eltype(plan.C), lmax + 1, 2lmax + 1)
+            C = zeros(eltype(plan.F), lmax + 1, 2lmax + 1)
             NUFSHT.nusht_solve!(C, fs[i], plan; rtol = rtol, maxiter = maxiter)
             return C
         finally

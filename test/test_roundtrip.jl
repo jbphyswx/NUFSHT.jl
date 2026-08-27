@@ -10,7 +10,7 @@ Test.@testset "Round-trip: solve then synthesize recovers the field at scattered
         C_true = rand_coeffs(lmax, 5)
         f_in = zeros(M); NUFSHT.nusht_type2!(f_in, C_true, plan)
 
-        C_out = similar(plan.C)
+        C_out = similar(plan.F)
         _, iters, rel, conv = NUFSHT.nusht_solve!(C_out, f_in, plan; rtol = 1e-11, maxiter = 400)
         Test.@test conv
         # Overdetermined and well conditioned, so the coefficients themselves come back, not merely a
