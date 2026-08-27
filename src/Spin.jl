@@ -627,11 +627,18 @@ takes the plan's strengths type, which is real wherever the backend has a real-d
 function LSMRWorkspace(plan::SpinNUSHTplan{T}) where {T}
     lmax, B, M = plan.lmax, plan.B, _spin_npts(plan)
     CT = Complex{T}
-    z3() = _zeros_like(plan.G, CT, lmax + 1, 2lmax + 1, B)
+    # A real field's iterate is packed to the `(lmax+1)²` real degrees its coefficients actually have
+    # (see `_hermitian_domain`); a complex one carries the full array. `w` holds `A†u`, which lands in
+    # the full complex layout either way, so it is the one buffer whose shape does not follow.
+    # A complex field's iterate keeps the coefficient array's own `(lmax+1, 2lmax+1, B)` shape, which
+    # `_assemble_G!` indexes directly; a packed real one is `(K, B)` and is expanded before assembly.
+    z3() = _hermitian_domain(plan) ? _zeros_like(plan.G, T, _herm_len(lmax), B) :
+                                     _zeros_like(plan.G, CT, lmax + 1, 2lmax + 1, B)
     vB() = _zeros_like(_θnodes(plan), T, B)
     hB() = zeros(T, B)
     nrm, cf = vB(), vB()
-    return LSMRWorkspace(z3(), z3(), z3(), z3(), z3(),
+    return LSMRWorkspace(z3(), z3(), z3(), z3(),
+                         _zeros_like(plan.G, CT, lmax + 1, 2lmax + 1, B),
                          _zeros_like(_fbuf(plan), eltype(_fbuf(plan)), M, B),
                          nothing, collect(1:B),
                          nrm, cf, _host_mirror(nrm), _host_mirror(cf),
@@ -639,7 +646,56 @@ function LSMRWorkspace(plan::SpinNUSHTplan{T}) where {T}
                          hB(), hB(), hB(), hB(), hB(), hB(), hB())
 end
 
-@inline _coefflen(plan::SpinNUSHTplan) = (plan.lmax + 1) * (2plan.lmax + 1)
+@inline _coefflen(plan::SpinNUSHTplan) =
+    _hermitian_domain(plan) ? _herm_len(plan.lmax) : (plan.lmax + 1) * (2plan.lmax + 1)
+
+# `v` starts as `A†f` and is folded with `A†u` each iteration. Both arrive in the full complex layout,
+# so on a real field both go through the packing, which is where the restriction to the Hermitian
+# subspace is applied — once, rather than as a projection bolted onto every step.
+_lsmr_init_v!(ws, plan::SpinNUSHTplan) = _lsmr_init_v!(ws, plan, _fold_kind(plan))
+_lsmr_init_v!(ws, ::SpinNUSHTplan, ::FullModes) = copyto!(ws.v, ws.w)
+_lsmr_init_v!(ws, plan::SpinNUSHTplan, ::Union{FoldedComplex,FoldedReal}) =
+    _pack_herm!(ws.v, ws.w, plan.lmax, plan.B)
+
+_lsmr_fold_v!(ws, plan::SpinNUSHTplan, n::Integer) = _lsmr_fold_v!(ws, plan, n, _fold_kind(plan))
+_lsmr_fold_v!(ws, ::SpinNUSHTplan, n::Integer, ::FullModes) = _col_pbp!(ws.v, ws.w, ws.cf, n)
+_lsmr_fold_v!(ws, plan::SpinNUSHTplan, n::Integer, ::Union{FoldedComplex,FoldedReal}) =
+    _pack_herm!(ws.v, ws.w, plan.lmax, n, ws.cf)
+
+# The caller's `sf` is the full complex array whatever the iterate is, so a packed solution expands on
+# the way out.
+_write_solution!(C, ws::LSMRWorkspace, plan::SpinNUSHTplan, slot::Integer, dstcol::Integer) =
+    _write_solution!(C, ws, plan, slot, dstcol, _fold_kind(plan))
+_write_solution!(C, ws::LSMRWorkspace, plan::SpinNUSHTplan, slot::Integer, dstcol::Integer,
+                 ::FullModes) = _copy_col!(C, dstcol, ws.x, slot, _coefflen(plan))
+function _write_solution!(C, ws::LSMRWorkspace, plan::SpinNUSHTplan, slot::Integer, dstcol::Integer,
+                          ::Union{FoldedComplex,FoldedReal})
+    lmax = plan.lmax
+    K = _herm_len(lmax)
+    full = (lmax + 1) * (2lmax + 1)
+    T = real(eltype(C))
+    s2 = one(T) / sqrt(T(2))
+    so = (slot - 1) * K
+    do_ = (dstcol - 1) * full
+    @inbounds begin
+        for i in 1:full
+            C[do_ + i] = zero(eltype(C))
+        end
+        # `spin_coeff_index` is Cartesian, so the destination column is a trailing index rather than a
+        # linear offset — which also serves a 2-D `C` at `B = 1`, its trailing axis being singleton.
+        for ℓ in 0:lmax
+            o = _herm_offset(ℓ)
+            C[spin_coeff_index(ℓ, 0, lmax), dstcol] = ws.x[so + o + 1]
+            for m in 1:ℓ
+                a = complex(ws.x[so + o + 2m], ws.x[so + o + 2m + 1]) * s2
+                C[spin_coeff_index(ℓ,  m, lmax), dstcol] = a
+                C[spin_coeff_index(ℓ, -m, lmax), dstcol] =
+                    ifelse(iseven(m), one(T), -one(T)) * conj(a)
+            end
+        end
+    end
+    return C
+end
 # The spin transform has no width-narrowing machinery — `_assemble_G!` and the NUFFT are built for `B`
 # columns — so compaction here reduces the per-column vector work only.
 @inline _lsmr_widths(plan::SpinNUSHTplan, ::Integer) = (plan.B, plan.B)
@@ -650,15 +706,101 @@ _add_out!(f, fbuf, plan::SpinNUSHTplan, n) = _add_out!(f, fbuf, _θshift(plan), 
 _add_out!(f, fbuf, ::Nothing, n) = _add_field!(f, fbuf, n)
 _add_out!(f, fbuf, ::AbstractVector, n) = _add_real!(f, fbuf, n)
 
+"""
+    _hermitian_domain(plan) -> Bool
+
+Whether the plan's field is real, and so whether its coefficients are constrained.
+
+A real field's coefficients are Hermitian — `sf[ℓ,-m] = (-1)^m conj(sf[ℓ,m])`, from
+`conj(Y_ℓm) = (-1)^m Y_ℓ,-m` — which is `(lmax+1)²` real numbers rather than the `(lmax+1)(2lmax+1)`
+complex ones the array holds. Synthesis needs no such restriction: it is handed coefficients and
+evaluates them. A *solve* does. Searching the unrestricted space asks a question with no unique
+answer, and the operator's continuation off the Hermitian subspace is arbitrary — it is fixed by
+whichever fold the backend uses, not by the mathematics — so the search lands wherever that
+continuation happens to point.
+"""
+@inline _hermitian_domain(plan::SpinNUSHTplan) = _hermitian_domain(_fold_kind(plan))
+@inline _hermitian_domain(::FullModes) = false
+@inline _hermitian_domain(::Union{FoldedComplex,FoldedReal}) = true
+
+# Packed offset of degree `ℓ`: the degrees below it occupy `Σ (2ℓ'+1) = ℓ²` slots. `m = 0` is one real
+# number, each `m > 0` a real and an imaginary part.
+@inline _herm_offset(ℓ::Integer) = ℓ * ℓ
+@inline _herm_len(lmax::Integer) = (lmax + 1)^2
+
+"""
+    _unpack_herm!(sf, p, lmax, B) -> sf
+
+Expand packed real coefficients into the full Hermitian array. Scaled by `1/√2` off `m = 0` so the map
+is an **isometry**: `‖U p‖ = ‖p‖`, which is what keeps "minimum norm" meaning the same thing on both
+sides of it. [`_pack_herm!`](@ref) is its exact adjoint, not its inverse-by-projection.
+"""
+function _unpack_herm!(sf, p, lmax::Integer, B::Integer)
+    T = real(eltype(sf))
+    s2 = one(T) / sqrt(T(2))
+    K = _herm_len(lmax)
+    fill!(sf, zero(eltype(sf)))
+    @inbounds for b in 1:B
+        po = (b - 1) * K
+        for ℓ in 0:lmax
+            o = _herm_offset(ℓ)
+            sf[spin_coeff_index(ℓ, 0, lmax), b] = p[po + o + 1]
+            for m in 1:ℓ
+                a = complex(p[po + o + 2m], p[po + o + 2m + 1]) * s2
+                sf[spin_coeff_index(ℓ,  m, lmax), b] = a
+                sf[spin_coeff_index(ℓ, -m, lmax), b] = ifelse(iseven(m), one(T), -one(T)) * conj(a)
+            end
+        end
+    end
+    return sf
+end
+
+"""
+    _pack_herm!(p, g, lmax, B, β = nothing) -> p
+
+The exact adjoint of [`_unpack_herm!`](@ref) under the real inner product `Re⟨a,b⟩`. With `β` given it
+also folds `p ← U†g + β·p`, which is the packed counterpart of `_col_pbp!` and saves a pass.
+"""
+function _pack_herm!(p, g, lmax::Integer, B::Integer, β = nothing)
+    T = real(eltype(g))
+    s2 = one(T) / sqrt(T(2))
+    K = _herm_len(lmax)
+    @inbounds for b in 1:B
+        po = (b - 1) * K
+        c = β === nothing ? zero(T) : T(β[b])
+        for ℓ in 0:lmax
+            o = _herm_offset(ℓ)
+            i0 = po + o + 1
+            p[i0] = real(g[spin_coeff_index(ℓ, 0, lmax), b]) + c * p[i0]
+            for m in 1:ℓ
+                gp = g[spin_coeff_index(ℓ,  m, lmax), b]
+                gm = g[spin_coeff_index(ℓ, -m, lmax), b]
+                sg = ifelse(iseven(m), one(T), -one(T))
+                ir, ii = po + o + 2m, po + o + 2m + 1
+                p[ir] = (real(gp) + sg * real(gm)) * s2 + c * p[ir]
+                p[ii] = (imag(gp) - sg * imag(gm)) * s2 + c * p[ii]
+            end
+        end
+    end
+    return p
+end
+
 # `u ← A v − α u`, with `A v` landing in the plan's own strengths buffer so no second point-space
-# array is needed: scale `u` first, then accumulate the synthesis onto it.
+# array is needed: scale `u` first, then accumulate the synthesis onto it. On a real field the iterate
+# is packed, and expanding it into `ws.w` is free: that buffer is live only between `_lsmr_Atu!`
+# writing it and the fold that reads it, which is exactly the window this fills.
 function _lsmr_Av_axpy!(ws::LSMRWorkspace, plan::SpinNUSHTplan, ::Integer, ::Integer, n::Integer)
     _col_scale!(ws.u, ws.cf, n)
-    _assemble_G!(plan.G, ws.v, plan)
+    _assemble_G!(plan.G, _av_coeffs(ws, plan), plan)
     _nufft_exec!(_nufft2(plan), plan.G, _fbuf(plan))
     _rephase!(_fbuf(plan), _θshift(plan))
     return _add_out!(ws.u, _fbuf(plan), plan, n)
 end
+
+@inline _av_coeffs(ws, plan::SpinNUSHTplan) = _av_coeffs(ws, plan, _fold_kind(plan))
+@inline _av_coeffs(ws, ::SpinNUSHTplan, ::FullModes) = ws.v
+@inline _av_coeffs(ws, plan::SpinNUSHTplan, ::Union{FoldedComplex,FoldedReal}) =
+    _unpack_herm!(ws.w, ws.v, plan.lmax, plan.B)
 
 function _lsmr_Atu!(ws::LSMRWorkspace, plan::SpinNUSHTplan, ::Integer, ::Integer)
     nusht_type1_spin!(ws.w, ws.u, plan)
@@ -671,6 +813,24 @@ end
 Exact inversion of the spin-weighted synthesis at arbitrary scattered points: solve
 `min ‖A sf − f‖` by LSMR on the Golub–Kahan bidiagonalization of `A`. Batched (`B > 1`) runs the
 columns as independent single-column solves. Same contract and return as [`nusht_solve!`](@ref).
+
+On a real-field plan the fit runs over the `(lmax+1)²` real degrees a real field's coefficients have
+rather than the full complex array — see [`_hermitian_domain`](@ref) — which is both the well-posed
+problem and a quarter of the unknowns.
+
+That restriction exists only at `s = 0`. Conjugating a spin-`s` field flips its spin weight
+(`conj(ₛY_ℓm) = (-1)^{m+s} ₋ₛY_ℓ,-m`), so for `s ≠ 0` no reality condition closes, no subspace makes
+the fit well-posed, and this raises rather than returning one of the arbitrarily many coefficient sets
+that reproduce the samples. Synthesis and the adjoint are unaffected and stay exact there.
 """
-nusht_solve_spin!(sf, f, plan::SpinNUSHTplan; ws::LSMRWorkspace = LSMRWorkspace(plan), kwargs...) =
-    _lsmr!(sf, f, plan, ws; kwargs...)
+function nusht_solve_spin!(sf, f, plan::SpinNUSHTplan;
+                           ws::LSMRWorkspace = LSMRWorkspace(plan), kwargs...)
+    if _hermitian_domain(plan) && plan.s != 0
+        throw(ArgumentError(
+            "a spin-$(plan.s) field cannot be real — conjugation maps spin s to spin -s — so a " *
+            "real-field plan at s ≠ 0 has no coefficient subspace on which this fit is determined. " *
+            "Build the plan with a complex element type to invert, or keep the real one for " *
+            "synthesis and the adjoint, which are exact."))
+    end
+    return _lsmr!(sf, f, plan, ws; kwargs...)
+end

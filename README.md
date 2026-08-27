@@ -89,6 +89,11 @@ only when you load their trigger package, so a plain `using NUFSHT` never pulls 
   a complex one; likewise `make_spin_plan(FE, θ, φ, lmax, s)`. Both compute the same transform — the
   real one additionally exploits the Hermitian symmetry a real field gives its spectrum, folding one
   mode axis in half. The keyword spelling `T = ComplexF64` forwards to the positional form.
+  A real field's coefficients are Hermitian, so `nusht_solve_spin!` on a real-field plan fits the
+  `(lmax+1)²` real degrees they actually have rather than the full complex array — the well-posed
+  problem, and a quarter of the unknowns. That closes only at `s = 0`: conjugation maps spin `s` to
+  spin `−s`, so no spin-`s ≠ 0` field is real and inverting one needs a complex plan. Synthesis and
+  the adjoint are exact for a real element type at every `s`.
 - **Only the directions you use.** `make_plan(…; directions = SynthesisOnly())` builds no analysis
   plan, so a caller that only synthesises holds no type-1 grid; `nusht_type1!` / `nusht_solve!` /
   `nusht_filter!` on such a plan raise rather than silently building one. The default is
