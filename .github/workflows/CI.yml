@@ -10,31 +10,29 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 jobs:
   test:
-    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: Julia ${{ matrix.version }} - ${{ matrix.threads }} threads
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        # 1.11 = floor (this package's [workspace] and the test/docs [sources] entries are
-        # Julia >= 1.11 features); '1' = latest stable; nightly = early warning (non-blocking).
-        version: ['1.11', '1']
-        os: [ubuntu-latest]
-        arch: [x64]
+        # 1.11 is the floor: [workspace] and [sources] need it.
+        version: ['1.11', '1.12']
+        threads: ['1', '4']
         include:
           - version: 'nightly'
-            os: ubuntu-latest
-            arch: x64
+            threads: '4'
     continue-on-error: ${{ matrix.version == 'nightly' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: julia-actions/setup-julia@v2
+      - uses: actions/checkout@v6
+      - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.version }}
-          arch: ${{ matrix.arch }}
-      - uses: julia-actions/cache@v2
+      - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+        env:
+          JULIA_NUM_THREADS: ${{ matrix.threads }}
       - uses: julia-actions/julia-processcoverage@v1
       - uses: codecov/codecov-action@v4
         with:
@@ -42,18 +40,38 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
         continue-on-error: true
 
+  mpi:
+    name: MPI point decomposition (mpiexec -n 2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.12'
+      - uses: julia-actions/cache@v3
+      - name: Instantiate test env
+        run: julia --project=test -e 'using Pkg; Pkg.instantiate()'
+      - name: Run test/mpi_run.jl
+        shell: julia --project=test {0}
+        run: |
+          using MPI: MPI
+          MPI.mpiexec() do exe
+              run(`$exe -n 2 julia --project=test test/mpi_run.jl`)
+          end
+
   examples:
     name: Run examples
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: julia-actions/setup-julia@v2
+      - uses: actions/checkout@v6
+      - uses: julia-actions/setup-julia@v3
         with:
-          version: '1'
-      - uses: julia-actions/cache@v2
+          version: '1.12'
+      - uses: julia-actions/cache@v3
       - name: Instantiate examples env
-        run: julia --project=examples -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate()'
+        run: julia --project=examples -e 'using Pkg; Pkg.instantiate()'
       - name: Execute example scripts
         run: |
           for f in examples/*.jl; do
