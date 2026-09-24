@@ -13,6 +13,7 @@ using FFTW: FFTW
 using FastTransforms: FastTransforms
 
 export AbstractNUSHTplan, NUSHTplan, make_plan, close!, set_nodes!, plan_memory
+export coefficient_size, allocate_coefficients
 export AbstractNodeSet, FixedCountNodes, VariableCountNodes
 export AbstractPlanTuning, NoTuning, AutoTuning, ThoroughTuning
 export AbstractPlanDirections, SynthesisOnly, SynthesisAndAnalysis
@@ -627,6 +628,23 @@ call.
 end
 
 """
+    coefficient_size(plan) -> NTuple{3,Int}
+
+The shape of the coefficient array `plan` transforms: `(Nθ, Nφ, B)` for a scalar plan in
+FastTransforms' layout, `(lmax+1, 2lmax+1, B)` for a spin plan.
+"""
+coefficient_size(plan::NUSHTplan) = (plan.Nθ, plan.Nφ, plan.B)
+
+"""
+    allocate_coefficients(plan) -> AbstractArray
+
+A zeroed coefficient array for `plan`, of [`coefficient_size`](@ref)`(plan)`, in the plan's coefficient
+element type and array type, so a device plan returns a device array.
+"""
+allocate_coefficients(plan::NUSHTplan) =
+    _zeros_like(plan.F, eltype(plan.F), coefficient_size(plan)...)
+
+"""
     plan_memory(plan) -> NamedTuple
 
 Bytes held by each of the plan's own buffers, plus their `total`, so a caller can see where a plan's
@@ -824,16 +842,15 @@ make_plan(θ_nodes, φ_nodes, lmax; kwargs...) =
     set_nodes!(plan, θ_nodes, φ_nodes) -> plan
 
 Move a plan's nodes to new positions, reusing every structure fixed by `(lmax, B, T)` — the
-FastTransforms sphere plans, the FFTW plans and all coefficient buffers. Only FINUFFT's point tables
-are rebuilt, so this costs 0.01–0.10 ms against 3–7 ms to build an equivalent plan from scratch
-(measured, lmax 45–128).
+FastTransforms sphere plans, the FFTW plans and all coefficient buffers. The NUFFT plans' point tables
+are rebuilt, and any reduced-width plan pair a batched solve cached is released, to be rebuilt at the
+new nodes if a later solve narrows again.
 
 The points may move anywhere. Changing how *many* there are additionally needs the plan's
 point-indexed buffers to be replaced, which requires `make_plan(…; variable_npts = true)`; a plan
-built with the default [`FixedCountNodes`](@ref) throws instead of silently reallocating.
+built with the default [`FixedCountNodes`](@ref) throws a `DimensionMismatch`.
 
-With the count unchanged this rewrites array contents only and allocates nothing, on either node-set
-form.
+With the count unchanged and no reduced-width plans cached, this rewrites array contents only.
 """
 function set_nodes!(plan::AbstractNUSHTplan, θ_nodes, φ_nodes)
     @assert length(θ_nodes) == length(φ_nodes)
@@ -842,6 +859,7 @@ function set_nodes!(plan::AbstractNUSHTplan, θ_nodes, φ_nodes)
     _nufft_setpts!(_nufft2(plan), _θnufft(plan), _φnodes(plan))
     # A derived handle shares the plan just pointed; re-pointing would re-sort the same points.
     _repoint_analysis!(plan.nodes.nufft_type1, _θnufft(plan), _φnodes(plan))
+    _close_pool!(plan)
     return plan
 end
 

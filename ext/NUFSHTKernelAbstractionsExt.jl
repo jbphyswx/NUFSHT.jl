@@ -285,6 +285,53 @@ function NUFSHT._write_solution!(C::GPUArraysCore.AbstractGPUArray, ws::NUFSHT.L
     return C
 end
 
+# ── Device Hermitian pack/unpack (the real-field spin solve) ─────────────────────
+# A real spin-0 field's solver vectors are packed to `(lmax+1)²` real values per column. Each output
+# entry is a gather from index arithmetic alone, so each is one workitem calling the same
+# `_herm_entry`/`_pack_entry` the host loops do. The arrays are reshaped to three axes first, so a
+# `B = 1` coefficient matrix takes the same kernel.
+@kernel function _unpack_herm_kern!(sf, @Const(p), lmax, K, pcol0, scol0)
+    i, j, b = @index(Global, NTuple)
+    @inbounds sf[i, j, b + scol0] =
+        NUFSHT._herm_entry(eltype(sf), p, i - 1, j - 1 - lmax, (b + pcol0 - 1) * K)
+end
+
+@kernel function _pack_herm_kern!(p, @Const(g), lmax, K, β)
+    t, b = @index(Global, NTuple)
+    i = (b - 1) * K + t
+    @inbounds p[i] = NUFSHT._fold_packed(NUFSHT._pack_entry(g, t, lmax, b), β, p, i, b)
+end
+
+@inline _as3(A, lmax) = reshape(A, lmax + 1, 2lmax + 1, :)
+
+function NUFSHT._unpack_herm!(sf::GPUArraysCore.AbstractGPUArray, p, lmax::Integer, B::Integer)
+    backend = KernelAbstractions.get_backend(sf)
+    _unpack_herm_kern!(backend)(_as3(sf, lmax), p, Int(lmax), NUFSHT._herm_len(lmax), 0, 0;
+                                ndrange = (lmax + 1, 2lmax + 1, B))
+    _sync(backend)
+    return sf
+end
+
+function NUFSHT._pack_herm!(p::GPUArraysCore.AbstractGPUArray, g, lmax::Integer, B::Integer,
+                            β = nothing)
+    backend = KernelAbstractions.get_backend(p)
+    K = NUFSHT._herm_len(lmax)
+    _pack_herm_kern!(backend)(p, _as3(g, lmax), Int(lmax), K, β; ndrange = (K, B))
+    _sync(backend)
+    return p
+end
+
+function NUFSHT._write_solution!(C::GPUArraysCore.AbstractGPUArray, ws::NUFSHT.LSMRWorkspace,
+                                 plan::NUFSHT.SpinNUSHTplan, slot::Integer, dstcol::Integer,
+                                 ::Union{NUFSHT.FoldedComplex,NUFSHT.FoldedReal})
+    lmax = plan.lmax
+    backend = KernelAbstractions.get_backend(C)
+    _unpack_herm_kern!(backend)(_as3(C, lmax), ws.x, lmax, NUFSHT._herm_len(lmax), Int(slot) - 1,
+                                Int(dstcol) - 1; ndrange = (lmax + 1, 2lmax + 1, 1))
+    _sync(backend)
+    return C
+end
+
 # ── Device real↔complex field copy (scalar type-2/type-1 bracket) ───────────────
 # `f` may be `(M,)` or `(M,B)`; `fbuf` is `(M,B)` and equal length — a `reshape`d broadcast handles
 # either shape (the `src` versions are CPU scalar loops). Dispatched on the plan buffer `fbuf`.
@@ -295,6 +342,19 @@ end
 function NUFSHT._copy_field!(fbuf::GPUArraysCore.AbstractGPUArray, f)      # fbuf = f (real→complex)
     fbuf .= reshape(f, size(fbuf))
     return fbuf
+end
+
+# The accumulating pair, over the first `n` columns: the solver's `u ← A v − α u` adds the synthesis
+# onto the scaled `u`, dispatched on the plan buffer `fbuf` as the copies above are.
+function NUFSHT._add_real!(f, fbuf::GPUArraysCore.AbstractGPUArray,        # f[:,k] += Re fbuf[:,k]
+                           n::Integer = size(f, ndims(f)))
+    _cols(f, n) .+= real.(_cols(fbuf, n))
+    return f
+end
+function NUFSHT._add_field!(f, fbuf::GPUArraysCore.AbstractGPUArray,       # f[:,k] += fbuf[:,k]
+                            n::Integer = size(f, ndims(f)))
+    _cols(f, n) .+= _cols(fbuf, n)
+    return f
 end
 
 # ── Device spectral filter (× H(ℓ)) ─────────────────────────────────────────────

@@ -55,7 +55,7 @@ function figure_synthesis_and_accuracy()
     f_cc = zeros(length(θ_cc))
     NUFSHT.nusht_type2!(f_cc, C_rand, plan_cc)
 
-    C_rec = similar(plan_cc.C)
+    C_rec = NUFSHT.allocate_coefficients(plan_cc)
     NUFSHT.nusht_solve!(C_rec, f_cc, plan_cc; rtol=1e-12, maxiter=400)
 
     ell_rms_rel = Float64[]
@@ -117,7 +117,7 @@ function figure_cg_inversion()
     f_obs = zeros(M_cg)
     NUFSHT.nusht_type2!(f_obs, C_cg_true, plan_cg)
 
-    C_cg_sol = similar(plan_cg.C)
+    C_cg_sol = NUFSHT.allocate_coefficients(plan_cg)
     C_cg_sol, cg_iters, cg_res = NUFSHT.nusht_solve!(C_cg_sol, f_obs, plan_cg; rtol=1e-6, maxiter=1000)
 
     f_rec = zeros(M_cg)
@@ -175,9 +175,9 @@ function figure_spectral_filtering()
 
     # A fit, not an adjoint: `A†f` is not the coefficient vector at scattered points.
     ws_f = NUFSHT.LSMRWorkspace(plan_f)
-    C_full = copy(plan_f.C);   NUFSHT.nusht_solve!(C_full, f_full, plan_f; ws=ws_f, rtol=1e-10)
-    C_gauss = copy(plan_f.C);  NUFSHT.nusht_solve!(C_gauss, f_gauss, plan_f; ws=ws_f, rtol=1e-10)
-    C_tophat = copy(plan_f.C); NUFSHT.nusht_solve!(C_tophat, f_tophat, plan_f; ws=ws_f, rtol=1e-10)
+    C_full = NUFSHT.allocate_coefficients(plan_f);   NUFSHT.nusht_solve!(C_full, f_full, plan_f; ws=ws_f, rtol=1e-10)
+    C_gauss = NUFSHT.allocate_coefficients(plan_f);  NUFSHT.nusht_solve!(C_gauss, f_gauss, plan_f; ws=ws_f, rtol=1e-10)
+    C_tophat = NUFSHT.allocate_coefficients(plan_f); NUFSHT.nusht_solve!(C_tophat, f_tophat, plan_f; ws=ws_f, rtol=1e-10)
 
     pow_full = per_degree_power(C_full, lmax_f)
     pow_gauss = per_degree_power(C_gauss, lmax_f)

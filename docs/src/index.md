@@ -27,7 +27,7 @@ arbitrary scattered (colatitude, longitude) points.
 Given a field sampled at M arbitrary points on the sphere, NUFSHT.jl can:
 
 - **Synthesise** (Type 2): Evaluate a bandlimited field (given as SH coefficients) at any scattered point set in O(K log K + M) time.
-- **Analyse** (Type 1): Project scattered values back to SH coefficients; exact on the Clenshaw-Curtis (CC) quadrature grid.
+- **Adjoint** (Type 1): Apply `A†`, the transpose of the synthesis, to scattered values. It carries no quadrature weights, so it is not an analysis; `nusht_solve!` is.
 - **Solve** (LSMR): Exactly invert the synthesis operator at any scattered point set.
 - **Filter**: Apply isotropic spectral filters (Gaussian, top-hat, custom) entirely in harmonic space.
 
@@ -52,9 +52,9 @@ C[sph_mode(2, 0)] = 1.0
 f = zeros(length(θ))
 nusht_type2!(f, C, plan)
 
-# Exact inversion (for non-CC scattered points)
-C_rec = similar(plan.C)
-C_rec, iters, rel_res = nusht_solve!(C_rec, f, plan; rtol=1e-6)
+# Exact inversion at the scattered points
+C_rec = allocate_coefficients(plan)
+C_rec, iters, rel_res, converged = nusht_solve!(C_rec, f, plan; rtol=1e-6)
 ```
 
 ## Which function should I use?

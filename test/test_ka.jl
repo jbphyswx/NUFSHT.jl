@@ -236,12 +236,94 @@ Test.@testset "KernelAbstractions extension: device solver bookkeeping never sca
     # packed values at the valid slots and zero everywhere else.
     for c in 1:2
         Test.@test Array(Cj)[:, :, c][idx] == xp[:, c]
-        Test.@test sum(abs, Array(Cj)[:, :, c]) == sum(abs, xp[:, c])   # nothing outside them
+        Test.@test all(iszero, vec(Array(Cj)[:, :, c])[setdiff(1:(N * Nf), idx)])   # nothing outside them
     end
     Test.@test nlive == 2
     Test.@test sort(ws.perm) == collect(1:B)
     Test.@test ws.colres[1] == 1e-9 && ws.colres[2] == 0.5
     Test.@test ws.rel[1:nlive] == [0.4, 0.3]       # survivors' state moved with them
+end
+
+# A NUFFT for device plans where no device NUFFT library exists: the plan's buffers stay on the device
+# and each execution moves its input and output across in bulk, which the scalar-indexing guard allows.
+# Everything else a solve runs under that guard is NUFSHT's own device path.
+struct HostBounceNUFFT <: NUFSHT.SpectralBackends.AbstractNUFFTSpectralBackend end
+struct HostBouncePlan{P}
+    inner::P
+end
+NUFSHT._nufft_makeplan(::HostBounceNUFFT, nodes, type, n_modes, iflag, ntrans, tol; kwargs...) =
+    HostBouncePlan(NUFSHT._nufft_makeplan(NUFSHT.SpectralBackends.DirectSumSpectralBackend(),
+                                          Array(nodes), type, n_modes, iflag, ntrans, tol; kwargs...))
+NUFSHT._nufft_setpts!(p::HostBouncePlan, x, y) = (NUFSHT._nufft_setpts!(p.inner, Array(x), Array(y)); p)
+NUFSHT._nufft_finalize!(p::HostBouncePlan) = p
+NUFSHT._nufft_destroy!(::HostBouncePlan) = nothing
+function NUFSHT._nufft_exec!(p::HostBouncePlan, input, output)
+    hout = Array(output)
+    NUFSHT._nufft_exec!(p.inner, Array(input), hout)
+    return copyto!(output, hout)
+end
+
+# `nusht_solve!` and `nusht_solve_spin!` end to end on device arrays with scalar indexing an error,
+# scored against the coefficients the fields were synthesised from by an independent evaluation.
+Test.@testset "KernelAbstractions extension: device solves never scalar-index (JLArray)" begin
+    J(v) = JLArrays.JLArray(v)
+    no_scalar(f) = task_local_storage(f, :ScalarIndexing, GPUArraysCore.ScalarDisallowed)
+    Test.@test_throws ErrorException no_scalar(() -> J(zeros(3))[1])
+    lmax, B = 6, 2
+    M = 4 * (lmax + 1)^2
+    θ, φ = fib_points(M)
+    nb = HostBounceNUFFT()
+
+    # Scalar plan, real and complex field.
+    for FE in (Float64, ComplexF64)
+        Random.seed!(808)
+        Cr = rand_coeffs(lmax, 808, B)
+        Ct = FE <: Real ? Cr : Cr .+ im .* rand_coeffs(lmax, 809, B)
+        f = zeros(FE, M, B)
+        for b in 1:B
+            f[:, b] .= synth_ref(real.(Ct[:, :, b]), lmax, θ, φ)
+            FE <: Complex && (f[:, b] .+= im .* synth_ref(imag.(Ct[:, :, b]), lmax, θ, φ))
+        end
+        p = NUFSHT.make_plan(FE, J(θ), J(φ), lmax; ntrans = B, nufft = nb)
+        ws = NUFSHT.LSMRWorkspace(p)
+        C = NUFSHT.allocate_coefficients(p)
+        Test.@test C isa GPUArraysCore.AbstractGPUArray
+        fj = J(f)
+        res = no_scalar(() -> NUFSHT.nusht_solve!(C, fj, p; ws = ws, rtol = 1e-11, maxiter = 100))
+        Test.@test res[4]
+        Test.@test relerr(Array(C), Ct) < 1e-9
+        g = J(zeros(FE, M, B))
+        no_scalar(() -> NUFSHT.nusht_type2!(g, C, p))
+        Test.@test relerr(Array(g), f) < 1e-9
+        NUFSHT.close!(p)
+    end
+
+    # Spin plans: a real spin-0 field, whose fit runs over the packed Hermitian degrees, and a
+    # complex spin-1 one over the full array.
+    for (FE, s) in ((Float64, 0), (ComplexF64, 1))
+        Random.seed!(810 + s)
+        sf = zeros(ComplexF64, lmax + 1, 2lmax + 1, B)
+        for b in 1:B, ℓ in abs(s):lmax
+            sf[NUFSHT.spin_coeff_index(ℓ, 0, lmax), b] = FE <: Real ? randn() : randn(ComplexF64)
+            for m in 1:ℓ
+                a = randn(ComplexF64)
+                sf[NUFSHT.spin_coeff_index(ℓ, m, lmax), b] = a
+                sf[NUFSHT.spin_coeff_index(ℓ, -m, lmax), b] =
+                    FE <: Real ? (-1)^m * conj(a) : randn(ComplexF64)
+            end
+        end
+        fc = [sum(sf[NUFSHT.spin_coeff_index(ℓ, m, lmax), b] * NUFSHT.sYlm(s, ℓ, m, θ[i], φ[i])
+                  for ℓ in abs(s):lmax for m in -ℓ:ℓ) for i in 1:M, b in 1:B]
+        f = FE <: Real ? real.(fc) : fc
+        p = NUFSHT.make_spin_plan(FE, J(θ), J(φ), lmax, s; ntrans = B, nufft = nb)
+        ws = NUFSHT.LSMRWorkspace(p)
+        S = NUFSHT.allocate_coefficients(p)
+        fj = J(f)
+        res = no_scalar(() -> NUFSHT.nusht_solve_spin!(S, fj, p; ws = ws, rtol = 1e-11, maxiter = 100))
+        Test.@test res[4]
+        Test.@test relerr(Array(S), sf) < 1e-9
+        NUFSHT.close!(p)
+    end
 end
 
 # Device-generic spectral filter (`apply_transfer!`, × H(ℓ)) — must match the CPU scalar mode loop

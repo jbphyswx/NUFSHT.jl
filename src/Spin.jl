@@ -328,6 +328,10 @@ function _fold_weights_adjoint!(G, ::SpinNUSHTplan{T}, ::FoldedReal) where {T}
     return G
 end
 
+coefficient_size(plan::SpinNUSHTplan) = (plan.lmax + 1, 2plan.lmax + 1, plan.B)
+allocate_coefficients(plan::SpinNUSHTplan{T}) where {T} =
+    _zeros_like(plan.G, Complex{T}, coefficient_size(plan)...)
+
 Base.show(io::IO, plan::SpinNUSHTplan{T}) where {T} =
     print(io, "SpinNUSHTplan{", T, "}(lmax=", plan.lmax, ", s=", plan.s, ", M=", length(_θnodes(plan)), ", B=", plan.B, ")")
 
@@ -729,28 +733,61 @@ continuation happens to point.
 @inline _herm_len(lmax::Integer) = (lmax + 1)^2
 
 """
+    _herm_entry(CT, p, ℓ, m, po) -> CT
+
+The entry `_unpack_herm!` writes at degree `ℓ`, order `m`, from the packed column starting after linear
+offset `po` of `p`: zero where `|m| > ℓ`, the real value at `m = 0`, `(p[2m] + i p[2m+1])/√2` for
+`m > 0` and `(-1)^m` times its conjugate for `m < 0`. One per output entry, so the host loop and the
+device kernel evaluate the same expression.
+"""
+@inline function _herm_entry(::Type{CT}, p, ℓ::Int, m::Int, po::Int) where {CT}
+    abs(m) > ℓ && return zero(CT)
+    T = real(CT)
+    o = po + _herm_offset(ℓ)
+    @inbounds begin
+        m == 0 && return CT(p[o + 1])
+        a = complex(p[o + 2abs(m)], p[o + 2abs(m) + 1]) * (one(T) / sqrt(T(2)))
+        return CT(m > 0 ? a : ifelse(iseven(m), one(T), -one(T)) * conj(a))
+    end
+end
+
+"""
+    _pack_entry(g, t, lmax, b) -> real
+
+Packed value `t` of column `b` under [`_pack_herm!`](@ref), read from the full array `g`. With
+`ℓ = isqrt(t-1)` and `r = t - 1 - ℓ²`: the real part of `g[ℓ,0]` at `r = 0`, and for
+`m = ⌈r/2⌉` the real (`r` odd) or imaginary (`r` even) part of `(g[ℓ,m] ± (-1)^m g[ℓ,-m])/√2`.
+"""
+@inline function _pack_entry(g, t::Int, lmax::Int, b::Int)
+    T = real(eltype(g))
+    ℓ = isqrt(t - 1)
+    r = t - 1 - ℓ * ℓ
+    @inbounds begin
+        r == 0 && return real(g[ℓ + 1, lmax + 1, b])
+        m = (r + 1) >> 1
+        gp = g[ℓ + 1, m + lmax + 1, b]
+        gm = g[ℓ + 1, lmax + 1 - m, b]
+        sg = ifelse(iseven(m), one(T), -one(T))
+        s2 = one(T) / sqrt(T(2))
+        return isodd(r) ? (real(gp) + sg * real(gm)) * s2 : (imag(gp) - sg * imag(gm)) * s2
+    end
+end
+
+# `p ← v` without `β`, `p ← v + β[b]·p` with it.
+@inline _fold_packed(v, ::Nothing, p, i, b) = v
+@inline _fold_packed(v, β, p, i, b) = @inbounds v + β[b] * p[i]
+
+"""
     _unpack_herm!(sf, p, lmax, B) -> sf
 
 Expand packed real coefficients into the full Hermitian array. Scaled by `1/√2` off `m = 0` so the map
-is an **isometry**: `‖U p‖ = ‖p‖`, which is what keeps "minimum norm" meaning the same thing on both
-sides of it. [`_pack_herm!`](@ref) is its exact adjoint, not its inverse-by-projection.
+is an **isometry**: `‖U p‖ = ‖p‖`, so a minimum-norm solution is minimum-norm on both sides of it.
+[`_pack_herm!`](@ref) is its exact adjoint.
 """
 function _unpack_herm!(sf, p, lmax::Integer, B::Integer)
-    T = real(eltype(sf))
-    s2 = one(T) / sqrt(T(2))
     K = _herm_len(lmax)
-    fill!(sf, zero(eltype(sf)))
-    @inbounds for b in 1:B
-        po = (b - 1) * K
-        for ℓ in 0:lmax
-            o = _herm_offset(ℓ)
-            sf[spin_coeff_index(ℓ, 0, lmax), b] = p[po + o + 1]
-            for m in 1:ℓ
-                a = complex(p[po + o + 2m], p[po + o + 2m + 1]) * s2
-                sf[spin_coeff_index(ℓ,  m, lmax), b] = a
-                sf[spin_coeff_index(ℓ, -m, lmax), b] = ifelse(iseven(m), one(T), -one(T)) * conj(a)
-            end
-        end
+    @inbounds for b in 1:B, j in 1:(2lmax + 1), i in 1:(lmax + 1)
+        sf[i, j, b] = _herm_entry(eltype(sf), p, i - 1, j - 1 - lmax, (b - 1) * K)
     end
     return sf
 end
@@ -759,28 +796,13 @@ end
     _pack_herm!(p, g, lmax, B, β = nothing) -> p
 
 The exact adjoint of [`_unpack_herm!`](@ref) under the real inner product `Re⟨a,b⟩`. With `β` given it
-also folds `p ← U†g + β·p`, which is the packed counterpart of `_col_pbp!` and saves a pass.
+also folds `p ← U†g + β·p`, the packed counterpart of `_col_pbp!`, in the same pass.
 """
 function _pack_herm!(p, g, lmax::Integer, B::Integer, β = nothing)
-    T = real(eltype(g))
-    s2 = one(T) / sqrt(T(2))
     K = _herm_len(lmax)
-    @inbounds for b in 1:B
-        po = (b - 1) * K
-        c = β === nothing ? zero(T) : T(β[b])
-        for ℓ in 0:lmax
-            o = _herm_offset(ℓ)
-            i0 = po + o + 1
-            p[i0] = real(g[spin_coeff_index(ℓ, 0, lmax), b]) + c * p[i0]
-            for m in 1:ℓ
-                gp = g[spin_coeff_index(ℓ,  m, lmax), b]
-                gm = g[spin_coeff_index(ℓ, -m, lmax), b]
-                sg = ifelse(iseven(m), one(T), -one(T))
-                ir, ii = po + o + 2m, po + o + 2m + 1
-                p[ir] = (real(gp) + sg * real(gm)) * s2 + c * p[ir]
-                p[ii] = (imag(gp) - sg * imag(gm)) * s2 + c * p[ii]
-            end
-        end
+    @inbounds for b in 1:B, t in 1:K
+        i = (b - 1) * K + t
+        p[i] = _fold_packed(_pack_entry(g, t, lmax, b), β, p, i, b)
     end
     return p
 end

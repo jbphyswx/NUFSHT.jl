@@ -309,6 +309,51 @@ Test.@testset "nusht_solve! reports whether it converged" begin
     NUFSHT.close!(p)
 end
 
+# A batched solve whose columns retire narrows its NUFFT to the live width and keeps that plan pair for
+# later solves. Moving the nodes has to move that pair too, so a solve after `set_nodes!` recovers the
+# coefficients of fields evaluated at the new nodes, on each backend that narrows.
+Test.@testset "set_nodes! moves every plan a solve narrows into" begin
+    lmax, B = 8, 4
+    M = 4 * (lmax + 1)^2
+    θa, φa = iid_points(M, 21)
+    θb, φb = iid_points(M, 22)
+    C_true = rand_coeffs(lmax, 23)
+    for nufft in (NUFSHT.FINUFFTBackend(), NUFSHT.NonuniformFFTsBackend())
+        p = NUFSHT.make_plan(Float64, θa, φa, lmax; ntrans = B, nufft = nufft, nthreads = 1)
+        # Columns 2:B are zero, so they retire before the first iteration and the solve runs at
+        # width 1 throughout.
+        fa = zeros(M, B); fa[:, 1] .= synth_ref(C_true, lmax, θa, φa)
+        C = NUFSHT.allocate_coefficients(p)
+        NUFSHT.nusht_solve!(C, fa, p; rtol = 1e-10)
+        Test.@test NUFSHT._pool_built(p.size_pool) ≥ 1
+        NUFSHT.set_nodes!(p, θb, φb)
+        fb = zeros(M, B); fb[:, 1] .= synth_ref(C_true, lmax, θb, φb)
+        _, _, _, conv = NUFSHT.nusht_solve!(C, fb, p; rtol = 1e-10)
+        Test.@test conv
+        Test.@test relerr(C[:, :, 1], C_true) < 1e-8
+        NUFSHT.close!(p)
+    end
+end
+
+# The coefficient array a plan transforms, in its shape, element type and array type.
+Test.@testset "allocate_coefficients is what the transforms take" begin
+    θ, φ = fib_points(200)
+    for (FE, B) in ((Float64, 1), (ComplexF64, 3))
+        p = NUFSHT.make_plan(FE, θ, φ, 6; ntrans = B)
+        C = NUFSHT.allocate_coefficients(p)
+        Test.@test size(C) == NUFSHT.coefficient_size(p) == (7, 13, B)
+        Test.@test eltype(C) === FE && all(iszero, C)
+        f = zeros(FE, 200, B)
+        Test.@test NUFSHT.nusht_type2!(f, C, p) === f
+        NUFSHT.close!(p)
+    end
+    sp = NUFSHT.make_spin_plan(θ, φ, 6, 1; ntrans = 2)
+    S = NUFSHT.allocate_coefficients(sp)
+    Test.@test size(S) == NUFSHT.coefficient_size(sp) == (7, 13, 2)
+    Test.@test eltype(S) === ComplexF64 && all(iszero, S)
+    NUFSHT.close!(sp)
+end
+
 # Curvature retirement through the compaction path: a stalled column has to leave the live set with its
 # own best iterate already in its own column, and the slot bookkeeping has to survive it. Batched
 # against single-column results is NOT comparable here — the widths differ, so FINUFFT rounds

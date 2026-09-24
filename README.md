@@ -88,7 +88,7 @@ only when you load their trigger package, so a plain `using NUFSHT` never pulls 
   it is for `zeros`: `make_plan(Float64, θ, φ, lmax)` for a real field, `make_plan(ComplexF64, …)` for
   a complex one; likewise `make_spin_plan(FE, θ, φ, lmax, s)`. Both compute the same transform — the
   real one additionally exploits the Hermitian symmetry a real field gives its spectrum, folding one
-  mode axis in half. The keyword spelling `T = ComplexF64` forwards to the positional form.
+  mode axis in half.
   A real field's coefficients are Hermitian, so `nusht_solve_spin!` on a real-field plan fits the
   `(lmax+1)²` real degrees they actually have rather than the full complex array — the well-posed
   problem, and a quarter of the unknowns. That closes only at `s = 0`: conjugation maps spin `s` to
@@ -234,7 +234,7 @@ f = zeros(length(θ))
 nusht_type2!(f, C, plan)
 ```
 
-### Adjoint analysis (CC grid only — exact round-trip)
+### Fitting coefficients on the Clenshaw–Curtis grid
 
 ```julia
 using NUFSHT, FastSphericalHarmonics
@@ -249,7 +249,7 @@ C_true = randn(lmax+1, 2lmax+1)
 f = zeros(length(θ))
 nusht_type2!(f, C_true, plan)     # synthesise
 
-C_rec = similar(plan.C)
+C_rec = allocate_coefficients(plan)
 nusht_solve!(C_rec, f, plan; rtol=1e-12)   # fit the l ≤ lmax coefficients
 # maximum(abs.(C_rec .- C_true)) ≈ 1e-11
 ```
@@ -267,7 +267,7 @@ plan = make_plan(θ, φ, lmax; tol=1e-10)
 
 f = ...               # observed field values at (θ,φ)
 
-C = similar(plan.C)
+C = allocate_coefficients(plan)
 C, iters, rel_res, converged = nusht_solve!(C, f, plan; rtol=1e-6, maxiter=500)
 # Returns (coefficients, solver iterations, relative residual of `C`, whether it met `rtol`)
 ```
@@ -308,6 +308,7 @@ nusht_filter_renorm!(f_out, mask, filt, plan)   # divide by filtered mask
 |----------|-------------|
 | `make_plan([FE,] θ, φ, lmax; tol)` | Construct pre-allocated plan for M scattered points; `FE` real or complex |
 | `plan_memory(plan)` | Per-field byte breakdown of what the plan holds, plus the total |
+| `allocate_coefficients(plan)` | A zeroed coefficient array of `coefficient_size(plan)`, on the plan's device |
 | `nusht_type2!(f, C, plan)` | Synthesis: SH coefficients → scattered field values |
 | `nusht_type1!(C, f, plan)` | Adjoint `A†` (the transpose, not an inverse) |
 | `nusht_solve!(C, f, plan; maxiter, rtol, verbose)` | Exact LSMR inversion at any scattered points |
