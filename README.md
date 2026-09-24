@@ -117,9 +117,11 @@ only when you load their trigger package, so a plain `using NUFSHT` never pulls 
     back to serial when there are none.
   - `using MPI` — point-decomposition: partition the `M` points across ranks; `A` needs no
     communication, `A†` and the point-space norm are `Allreduce`d.
-  > Note: FastTransforms is *not* safe to call from a Julia task/thread (its OpenMP corrupts results);
-  > the thread/process extensions force it single-threaded, which is why batching + processes are the
-  > recommended scaling paths. See `dev/fasttransforms_task_safety.md`.
+  > FastTransforms runs its S-step in OpenMP regions. NUFSHT loads FlowTransformBindings first, which
+  > on macOS selects the OpenMP runtime's thread-local mode (`KMP_GTID_MODE=2`) before FastTransforms
+  > loads it, so calls from Julia tasks are exact; in a session that loaded FastTransforms earlier with
+  > that variable unset, calls from tasks run on one OpenMP thread. The farms above run FastTransforms
+  > on one thread per task.
 - **GPU** (`using CUDA`, with `using KernelAbstractions`). The array-indexed steps (the spin Wigner-`d`
   recurrence + bivariate-Fourier assembly, and the per-column solver primitives) are KA `@kernel`s —
   **written once, run on any backend** — and the NUFFT is bound to cuFINUFFT. A device node set yields a

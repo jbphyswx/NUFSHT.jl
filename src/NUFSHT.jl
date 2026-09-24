@@ -26,6 +26,9 @@ work buffer, so repeated transforms — filtering, or the hundreds of matvecs in
 """
 module NUFSHT
 
+# First, so its `__init__` selects the OpenMP runtime's thread-local mode before FastTransforms loads
+# that runtime; see `FlowTransformBindings.with_fasttransforms_threads`.
+using FlowTransformBindings: FlowTransformBindings as FTB
 using ComputationalBackends: ComputationalBackends
 using FFTW: FFTW
 using FastSphericalHarmonics: FastSphericalHarmonics
@@ -87,56 +90,10 @@ _backend_unavailable(backend, what) = throw(ArgumentError(
     "ThreadedBackend needs `using OhMyThreads`, DistributedBackend `using Distributed`, " *
     "MPIBackend `using MPI`."))
 
-# FastTransforms' `__init__` starts its bundled OpenMP FFTW with `ceil(CPU_THREADS/2)` threads
-# (FastTransforms/src/libfasttransforms.jl `__init__`). Its butterfly transforms and sphere FFTs then
-# run inside OpenMP parallel regions. Executing such a transform from a **non-root Julia task**
-# (`@async`/`Threads.@spawn`/a `Distributed` worker's message-handler task) silently corrupts the
-# result — it reproduces even at `-t1` (one OS thread), so it is the OpenMP runtime being entered from
-# a task context, not thread migration or oversubscription. Forcing FastTransforms to a single thread
-# takes its serial code path (no OpenMP parallel region) and is exact in a task (verified round-trip
-# 3e-16 in `@async` vs ~0.5 multi-threaded). `ft_set_num_threads(1)` covers the butterfly step and
-# `ft_fftw_plan_with_nthreads(1)` the FFTW plans built afterward. MPI is unaffected: ranks are separate
-# processes running on their main task. There is no FastTransforms thread-count getter, so the
-# `__init__` default `cld(CPU_THREADS, 2)` is the value to restore.
-_fasttransforms_default_nthreads() = max(1, cld(Sys.CPU_THREADS, 2))
-
-"""
-    _fasttransforms_single!()
-
-Force FastTransforms single-threaded **without restoring** (set-only). Idempotent and race-free to
-call concurrently — every caller writes the same value `1` — so it is the safe primitive to invoke
-inside each farmed worker task, where the coordinator's barrier-protected restore cannot reach the
-worker's process. See [`_with_fasttransforms_single`](@ref) for why single-threading is required.
-"""
-function _fasttransforms_single!()
-    FastTransforms.ft_set_num_threads(1)
-    FastTransforms.ft_fftw_plan_with_nthreads(1)
-    return nothing
-end
-
-"""
-    _with_fasttransforms_single(f)
-
-Run `f()` with FastTransforms single-threaded, restoring the `__init__` default afterward. Wrap the
-**entire** task-parallel section in this from the coordinating (root) task — the set happens before
-any task is spawned and the restore after the join barrier, so concurrent worker tasks never touch
-the global thread count and cannot race on it. (Wrapping each task's body individually instead would
-let one task's restore corrupt another's in-flight transform.) Remote `Distributed` workers live in
-other processes that this restore cannot reach; they call [`_fasttransforms_single!`](@ref)
-themselves. See its comment above for the underlying FastTransforms OpenMP-in-task hazard.
-"""
-function _with_fasttransforms_single(f)
-    # FastTransforms and FFTW.jl share one libfftw3, so the planner count has a real getter and can be
-    # restored exactly; the butterfly count has none, so that one falls back to the `__init__` default.
-    prev_planner = FFTW.get_num_threads()
-    try
-        _fasttransforms_single!()
-        return f()
-    finally
-        FastTransforms.ft_set_num_threads(_fasttransforms_default_nthreads())
-        FastTransforms.ft_fftw_plan_with_nthreads(prev_planner)
-    end
-end
+# Every FastTransforms call goes through `FTB.with_fasttransforms_threads`, which sets the OpenMP count
+# on the OS thread that makes the call: FastTransforms' own count by default, one thread inside a task
+# farm, which sets `FTB.FASTTRANSFORMS_THREADS` for the tasks it spawns.
+@inline _ft_lmul!(P, x) = FTB.with_fasttransforms_threads(() -> LinearAlgebra.lmul!(P, x))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shape helpers (B=1 ergonomics): user passes vectors/matrices; cores work on (…, B).
@@ -205,9 +162,8 @@ _add_out!(f, fbuf, ::NUSHTplan{T,FE}, n) where {T,FE<:Complex} = _add_field!(f, 
 
 # Walk the active columns applying a per-column sphere operation. FastTransforms has no batched `lmul!`
 # for these, so the column loop is the only parallelism available; each spawned task takes its own
-# slice buffer and its own plans from the pool, keyed by chunk (see `_sph_pool`). The whole region runs
-# under `_with_fasttransforms_single` — FastTransforms returns WRONG RESULTS from a non-root task while
-# its OpenMP regions are live, so that pin is a correctness requirement, not a tuning choice.
+# slice buffer and its own plans from the pool, keyed by chunk (see `_sph_pool`). The tasks carry the
+# parallelism, so FastTransforms runs on one OpenMP thread inside them.
 function _sph_columns!(op!, plan::NUSHTplan, k::Integer)
     pool = plan.sph_pool
     nt = min(length(pool), k)
@@ -217,7 +173,7 @@ function _sph_columns!(op!, plan::NUSHTplan, k::Integer)
         end
         return plan
     end
-    _with_fasttransforms_single() do
+    Base.ScopedValues.with(FTB.FASTTRANSFORMS_THREADS => 1) do
         @sync for c in 1:nt
             Threads.@spawn begin
                 sl, P, Padj = pool[c]
@@ -231,13 +187,12 @@ function _sph_columns!(op!, plan::NUSHTplan, k::Integer)
 end
 
 # S (forward): `plan_sph2fourier` alone, per batch slice through a dense slice buffer. Its output IS
-# the DFS bivariate Fourier series, which `_assemble_modes!` hands straight to the NUFFT — evaluating
-# it onto the equiangular grid (`plan_sph_synthesis`) only to double it and transform back would be a
-# round trip, and the doubling step is not even exact for the odd `Nφ = 2lmax+1` this package uses.
+# the DFS bivariate Fourier series, which `_assemble_modes!` hands straight to the NUFFT. No
+# equiangular grid is formed; the doubling that route needs is not exact at the odd `Nφ = 2lmax+1`.
 function _sph_evaluate!(plan::NUSHTplan, k::Integer = plan.B)
     _sph_columns!(plan, k) do sl, P, _Padj, b
         _load_slice!(sl, plan.F, plan, b)
-        LinearAlgebra.lmul!(P, sl)
+        _ft_lmul!(P, sl)
         _store_slice!(plan.F, sl, plan, b)
     end
     return plan
@@ -366,7 +321,7 @@ function _nusht_true_adjoint!(C, f, plan::NUSHTplan{T}, k::Integer = plan.B,
     _dfn_analysis!(plan, kdfn)
     _sph_columns!(plan, k) do sl, _P, Padj, b
         _load_slice!(sl, plan.F, plan, b)
-        LinearAlgebra.lmul!(Padj, sl)
+        _ft_lmul!(Padj, sl)
         _store_slice!(C, sl, plan, b)
     end
     return C

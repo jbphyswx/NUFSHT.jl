@@ -172,7 +172,7 @@ _thread_candidates() = sort!(unique!(Int[1, 2, 4, cld(Sys.CPU_THREADS, 2), Sys.C
 # FFTW.jl share one libfftw3 and the count is baked into a plan when it is built.
 function _build_sph_plans(Fslice, nt::Integer, flags::Integer)
     return _with_fftw_planner_nthreads(nt) do
-        P = FastTransforms.plan_sph2fourier(Fslice)
+        P = FTB.with_fasttransforms_threads(() -> FastTransforms.plan_sph2fourier(Fslice))
         # `P'` leaves `AdjointFTPlan.adjoint` undefined, which FastTransforms then resolves through an
         # `UndefRefError` on every `lmul!`. Name the parent explicitly.
         return (P, FastTransforms.AdjointFTPlan(P, P))
@@ -360,8 +360,8 @@ end
 # cannot bias the argmin, and it stops repeated application drifting the values.
 function _apply_sph!(P, Padj, src, scratch)
     copyto!(scratch, src)
-    LinearAlgebra.lmul!(P, scratch)
-    LinearAlgebra.lmul!(Padj, scratch)
+    _ft_lmul!(P, scratch)
+    _ft_lmul!(Padj, scratch)
     return scratch
 end
 

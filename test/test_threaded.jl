@@ -1,11 +1,10 @@
 using OhMyThreads: OhMyThreads   # triggers NUFSHTOhMyThreadsExt
 using ComputationalBackends: ComputationalBackends
 
-# Node-local thread parallelism over independent problems. FastTransforms is unsafe to *drive* from a
-# Julia task, so the extension forces it single-threaded around the whole threaded section; the plans
-# are built with `nthreads = 1` (serial NUFFT) so each threaded transform is deterministic
-# and cores are not oversubscribed across tasks. With those, a threaded transform is bit-for-bit the
-# serial one (verified below), and the main task is uncorrupted afterward.
+# Node-local thread parallelism over independent problems. The farm runs FastTransforms on one OpenMP
+# thread per task, and the plans are built with `nthreads = 1` (serial NUFFT), so each threaded
+# transform is deterministic and cores are not oversubscribed across tasks. A threaded transform then
+# equals the serial one, and the main task's transforms are unchanged afterwards.
 Test.@testset "OhMyThreads extension: threaded == serial, main task intact" begin
     Random.seed!(11)
     lmax = 10

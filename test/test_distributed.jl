@@ -1,10 +1,9 @@
 using Distributed: Distributed   # triggers NUFSHTDistributedExt
 using ComputationalBackends: ComputationalBackends
 
-# Farming independent problems across Distributed *worker processes* (process isolation makes
-# FastTransforms safe — each worker has its own OpenMP/FFTW state). We add real workers so the test
-# exercises the actual cross-process path, not the local serial fallback. Well-conditioned canonical
-# problem (matches test_solve.jl); nthreads=1 farm plans (deterministic, no core oversubscription).
+# Farming independent problems across Distributed *worker processes*. Real workers are added, so the
+# farm takes its cross-process path. Well-conditioned canonical problem (matches test_solve.jl);
+# nthreads=1 farm plans (deterministic, no core oversubscription).
 Test.@testset "Distributed extension: farm over worker processes" begin
     nadd = 2
     added = Distributed.addprocs(nadd; exeflags = "--project=$(Base.active_project())")

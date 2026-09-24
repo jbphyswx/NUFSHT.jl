@@ -1,9 +1,11 @@
 using Test: Test
+# Before FastSphericalHarmonics: NUFSHT loads FlowTransformBindings, which selects the OpenMP runtime's
+# thread-local mode before FastTransforms loads that runtime.
+using NUFSHT: NUFSHT
 using Statistics: Statistics
 using Random: Random
 using FastSphericalHarmonics: FastSphericalHarmonics
 using Aqua: Aqua
-using NUFSHT: NUFSHT
 using FINUFFT: FINUFFT
 using NonuniformFFTs: NonuniformFFTs
 using LinearAlgebra: LinearAlgebra
