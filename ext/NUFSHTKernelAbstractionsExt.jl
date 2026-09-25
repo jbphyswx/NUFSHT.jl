@@ -23,6 +23,13 @@ using NUFSHT: NUFSHT
 # convention; all non-DSL KA entry points stay qualified (`KernelAbstractions.get_backend`, etc.).
 using KernelAbstractions: KernelAbstractions, @kernel, @index, @Const
 using GPUArraysCore: GPUArraysCore
+using ComputationalBackends: ComputationalBackends
+
+# A plan on `GPUBackend(b)`: its nodes, and so every buffer, in `b`'s memory.
+function NUFSHT._backend_plan(::Type{FE}, θ, φ, lmax, b::ComputationalBackends.GPUBackend; kwargs...) where {FE}
+    on_device(x) = copyto!(KernelAbstractions.allocate(b.backend, eltype(x), (length(x),)), x)
+    return NUFSHT.make_plan(FE, on_device(θ), on_device(φ), lmax; kwargs...)
+end
 
 # GPU kernel launches are asynchronous on real device backends (CUDA/ROCm/…), so results must be
 # synchronized before the host reads them; JLArrays' reference backend is synchronous and defines no

@@ -62,24 +62,19 @@ function plot_field end
 # Parallelism is a `ComputationalBackends.AbstractExecutionBackend` argument, in two families:
 #
 #  • **Farm over independent problems** (collection methods below). A NUFFT plan is not safe to
-#    `exec!` concurrently, so each problem carries its own. `DistributedBackend` needs the node-set
-#    form — plans hold C pointers and cannot be serialized, so each worker builds its own.
-#  • **Decompose one transform** — `MPIBackend`, partitioning the `M` points across ranks.
-#
-# GPU is not a backend argument: it follows from the plan's array types.
+#    `exec!` concurrently, so each problem carries its own. Under `DistributedBackend` the node-set form
+#    builds each problem's plan on its worker, since a plan holding C pointers cannot be serialized.
+#  • **One transform** — `make_plan(FE, θ, φ, lmax, backend)`: a thread count, a device, or the points
+#    divided among `DistributedBackend` workers or `MPIBackend` ranks.
 
 @inline _omt_loaded() = Base.get_extension(@__MODULE__, :NUFSHTOhMyThreadsExt) !== nothing
 
 """
     _resolve_backend(backend) -> AbstractExecutionBackend
 
-Concrete backends pass through untouched. `AutoBackend` is the only thing allowed to choose, and it
-chooses on **real capability**: a `ThreadedBackend` only when Julia has more than one thread *and* the
-OhMyThreads extension is loaded, otherwise `SerialBackend`. A backend the caller named explicitly is
-either honoured exactly or refused — never silently downgraded.
-
-This is deliberately NUFSHT's own function rather than a method on `ComputationalBackends.resolve_backend`,
-which would be type piracy.
+NUFSHT's resolution of `AutoBackend` for a farm: `ThreadedBackend` when Julia has more than one thread
+and the OhMyThreads extension is loaded, otherwise `SerialBackend`. Every other backend is returned
+as given.
 """
 @inline _resolve_backend(backend::ComputationalBackends.AbstractExecutionBackend) = backend
 @inline _resolve_backend(::ComputationalBackends.AbstractAutoBackend) =
@@ -87,9 +82,9 @@ which would be type piracy.
                                                 ComputationalBackends.SerialBackend()
 
 _backend_unavailable(backend, what) = throw(ArgumentError(
-    "$(nameof(typeof(backend))) cannot run $what here — the extension providing it is not loaded. " *
-    "ThreadedBackend needs `using OhMyThreads`, DistributedBackend `using Distributed`, " *
-    "MPIBackend `using MPI`."))
+    "$(nameof(typeof(backend))) cannot run $what here: its extension is not loaded. ThreadedBackend " *
+    "farms need `using OhMyThreads`, GPUBackend plans `using KernelAbstractions`, DistributedBackend " *
+    "`using Distributed`, MPIBackend `using MPI`."))
 
 # Every FastTransforms call goes through `FTB.with_fasttransforms_threads`, which sets the OpenMP count
 # on the OS thread that makes the call: FastTransforms' own count by default, one thread inside a task
@@ -678,13 +673,19 @@ nusht_solve!(C, f, plan::NUSHTplan; ws::LSMRWorkspace = LSMRWorkspace(plan), kwa
 
 # The solve itself, shared by the scalar and spin paths: they differ only in `_lsmr_Av_axpy!`,
 # `_lsmr_Atu!`, `_lsmr_widths` and `_coefflen`, all of which dispatch on the plan.
+#
+# `reduce!(A)` sums `A` in place over the processes that each hold a plan over a share of the points, and
+# is applied to the two sums over points the recurrence takes: the per-column `‖u‖²` and `A†u`. The
+# coefficient-space vectors are the same on every process, so every process runs the same recurrence and
+# stops on the same iteration.
 function _lsmr!(
     C, f, plan::AbstractNUSHTplan, ws::LSMRWorkspace;
     maxiter::Int = 500,
     rtol::Real = 1e-6,
     conlim::Real = 0,
     verbose::Bool = false,
-)
+    reduce!::R = identity,
+) where {R}
     T = real(eltype(ws.x))
     FE = eltype(ws.x)
     _assert_solve(C, f, plan)
@@ -697,6 +698,7 @@ function _lsmr!(
     _copy_field!(ws.u, f)
     _col_hdot!(ws.nrm, ws.u, ws.u, B)
     _mirror!(ws.nrm_h, ws.nrm)
+    reduce!(ws.nrm_h)
     @inbounds for k in 1:B
         ws.β[k] = sqrt(ws.nrm_h[k])
         ws.cf_h[k] = ws.β[k] > 0 ? inv(ws.β[k]) : zero(T)
@@ -705,7 +707,7 @@ function _lsmr!(
     _col_scale!(ws.u, ws.cf, B)
 
     kB, kdfnB = _lsmr_widths(plan, B)
-    _lsmr_Atu!(ws, plan, kB, kdfnB)
+    reduce!(_lsmr_Atu!(ws, plan, kB, kdfnB))
     _lsmr_init_v!(ws, plan)
     _col_hdot!(ws.nrm, ws.v, ws.v, B)
     _mirror!(ws.nrm_h, ws.nrm)
@@ -749,6 +751,7 @@ function _lsmr!(
         _lsmr_Av_axpy!(ws, plan, k, kdfn, nlive)
         _col_hdot!(ws.nrm, ws.u, ws.u, nlive)
         _mirror!(ws.nrm_h, ws.nrm)
+        reduce!(ws.nrm_h)
         @inbounds for k in 1:nlive
             ws.β[k] = sqrt(max(ws.nrm_h[k], zero(T)))
             ws.cf_h[k] = ws.β[k] > 0 ? inv(ws.β[k]) : zero(T)
@@ -761,7 +764,7 @@ function _lsmr!(
             ws.cf_h[k] = -ws.β[k]
         end
         _push_cf!(ws)
-        _lsmr_Atu!(ws, plan, k, kdfn)
+        reduce!(_lsmr_Atu!(ws, plan, k, kdfn))
         _lsmr_fold_v!(ws, plan, nlive)
         _col_hdot!(ws.nrm, ws.v, ws.v, nlive)
         _mirror!(ws.nrm_h, ws.nrm)

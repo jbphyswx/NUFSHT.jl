@@ -673,8 +673,9 @@ Keyword arguments:
   shape, so building many plans of one size pays the search once.
 - `ft_fftw_nthreads`, `ft_fftw_flags`: override the FFTW planner thread count / flags used for the
   sphere synthesis and analysis plans.
-- `nthreads`, `upsampfac`: override the NUFFT backend's thread count (`0` takes `Threads.nthreads()`)
-  and upsampling factor. What a backend can reach differs: FINUFFT takes any count, while
+- `nthreads`, `upsampfac`: override the plan's thread count (`0` takes `Threads.nthreads()`), which
+  the NUFFT runs at and the per-column sphere steps divide among tasks at, and the NUFFT's
+  upsampling factor. What a backend can reach differs: FINUFFT takes any count, while
   NonuniformFFTs parallelises over Julia's own threads and so reaches only `1` and `Threads.nthreads()`
   — a count it cannot deliver is an error, never silently something else.
 
@@ -759,7 +760,8 @@ function make_plan(
     sph_plan, sph_plan_adj = _build_sph_plans(Fslice, sph_nt, sph_flags)
     # Replicated only when there is something to thread, so a single-threaded plan pays no build cost
     # and no memory. Capped at `B`: more tasks than columns cannot help.
-    sph_pool = _sph_pool(Fslice, min(Threads.nthreads(), B), sph_nt, sph_flags)
+    ntasks = (nthreads === nothing || nthreads == 0) ? Threads.nthreads() : Int(nthreads)
+    sph_pool = _sph_pool(Fslice, min(ntasks, B), sph_nt, sph_flags)
 
     # iflag +1 for synthesis (type 2): reconstruction uses the +i (inverse-DFT) sign, so the raw
     # FFT modes need no conjugation — an axis swap takes the place of a conjugate-transpose
@@ -801,6 +803,32 @@ end
 # precision comes from the nodes and the field is real.
 make_plan(θ_nodes, φ_nodes, lmax; kwargs...) =
     make_plan(float(eltype(θ_nodes)), θ_nodes, φ_nodes, lmax; kwargs...)
+
+"""
+    make_plan(FE, θ_nodes, φ_nodes, lmax, backend; kwargs...)
+
+A plan that runs on `backend`, with the other keywords of `make_plan`; the backend sets the thread
+count, so `nthreads` is not among them. `SerialBackend()` runs the plan on one thread and
+`ThreadedBackend()` on `Threads.nthreads()`; `AutoBackend()` is the keyword form's default.
+`GPUBackend(b)` puts the nodes, and so the plan, in `b`'s memory (with KernelAbstractions).
+`DistributedBackend` divides the points among the worker processes and `MPIBackend` among the ranks of
+its communicator (with Distributed, MPI); both plans take and return the whole field.
+"""
+function make_plan(::Type{FE}, θ_nodes, φ_nodes, lmax, backend::ComputationalBackends.AbstractExecutionBackend;
+                   kwargs...) where {FE<:Number}
+    haskey(kwargs, :nthreads) && throw(ArgumentError(
+        "make_plan with a backend takes its thread count from the backend; it takes no `nthreads`"))
+    return _backend_plan(FE, θ_nodes, φ_nodes, lmax, backend; kwargs...)
+end
+
+_backend_plan(::Type{FE}, θ, φ, lmax, ::ComputationalBackends.AbstractSerialBackend; kwargs...) where {FE} =
+    make_plan(FE, θ, φ, lmax; nthreads = 1, kwargs...)
+_backend_plan(::Type{FE}, θ, φ, lmax, ::ComputationalBackends.AbstractThreadedBackend; kwargs...) where {FE} =
+    make_plan(FE, θ, φ, lmax; nthreads = Threads.nthreads(), kwargs...)
+_backend_plan(::Type{FE}, θ, φ, lmax, ::ComputationalBackends.AbstractAutoBackend; kwargs...) where {FE} =
+    make_plan(FE, θ, φ, lmax; kwargs...)
+_backend_plan(::Type{FE}, θ, φ, lmax, b::ComputationalBackends.AbstractExecutionBackend; kwargs...) where {FE} =
+    _backend_unavailable(b, "a plan")
 
 """
     set_nodes!(plan, θ_nodes, φ_nodes) -> plan
@@ -975,8 +1003,9 @@ end
 """
     close!(plan::NUSHTplan)
 
-Free every NUFFT plan the plan owns: its own and any narrower set [`_build_width!`](@ref) cached for a
-compacted solve. No finalizer frees them. Safe to call more than once.
+Free every NUFFT plan the plan owns, now: its own and any narrower set [`_build_width!`](@ref) cached
+for a compacted solve. A plan left unreachable has its host NUFFT plans freed by collection, and its
+cuFINUFFT plans only by this. Safe to call more than once.
 """
 function close!(plan::AbstractNUSHTplan)
     _nufft_destroy!(_nufft2(plan))

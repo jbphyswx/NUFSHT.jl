@@ -100,4 +100,21 @@ Test.@testset "threaded sphere loops agree with serial" begin
 
     @info "sphere loops: pool=$(length(pB.sph_pool)) at $(Threads.nthreads()) thread(s), matches serial"
     NUFSHT.close!(pB); NUFSHT.close!(p1)
+
+    # A backend sets the plan's thread count: its NUFFT's and its sphere-column tasks'.
+    CB = ComputationalBackends
+    pS = NUFSHT.make_plan(Float64, θ, φ, lmax, CB.SerialBackend(); ntrans = B)
+    pT = NUFSHT.make_plan(Float64, θ, φ, lmax, CB.ThreadedBackend(); ntrans = B)
+    pA = NUFSHT.make_plan(Float64, θ, φ, lmax, CB.AutoBackend(); ntrans = B)
+    Test.@test isempty(pS.sph_pool)
+    Test.@test FTB.nthreads(pS.nodes.nufft_type2.plan) == 1
+    Test.@test length(pT.sph_pool) == (Threads.nthreads() > 1 ? min(Threads.nthreads(), B) : 0)
+    Test.@test FTB.nthreads(pT.nodes.nufft_type2.plan) == Threads.nthreads()
+    Test.@test length(pA.sph_pool) == length(pT.sph_pool)
+    Test.@test_throws ArgumentError NUFSHT.make_plan(Float64, θ, φ, lmax, CB.SerialBackend(); nthreads = 2)
+    Test.@test_throws ArgumentError NUFSHT.make_plan(Float64, θ, φ, lmax, CB.MPIBackend())
+    fS = zeros(M, B); NUFSHT.nusht_type2!(fS, C, pS)
+    fT = zeros(M, B); NUFSHT.nusht_type2!(fT, C, pT)
+    Test.@test maximum(abs, fT .- fS) / maximum(abs, fS) < 1e-10
+    foreach(NUFSHT.close!, (pS, pT, pA))
 end

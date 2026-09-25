@@ -1,6 +1,7 @@
 using KernelAbstractions: KernelAbstractions   # loads NUFSHTKernelAbstractionsExt (with GPUArraysCore)
 using GPUArraysCore: GPUArraysCore
 using JLArrays: JLArrays                        # reference GPU-array backend for GPU-less testing
+using ComputationalBackends: ComputationalBackends
 
 # Device-genericity of the KA-kernel steps, exercised on `JLArray` (a CPU-backed `AbstractGPUArray`
 # with a KA backend) — it takes the exact `::AbstractGPUArray` dispatch + kernel-launch path a real
@@ -145,6 +146,13 @@ Test.@testset "KernelAbstractions extension: device plan buffers are device-resi
     end
     check_workspace(NUFSHT.LSMRWorkspace(plan))
     NUFSHT.close!(plan)
+
+    # `GPUBackend(b)` puts host nodes in `b`'s memory.
+    gplan = NUFSHT.make_plan(Float64, Array(θ), Array(φ), lmax, ComputationalBackends.GPUBackend(JLArrays.JLBackend());
+                             tol = 1e-8, ntrans = B, nufft = nb)
+    Test.@test isdev(gplan.F) && isdev(gplan.nodes.θ_nodes) && isdev(gplan.nodes.φ_nodes)
+    Test.@test Array(gplan.nodes.θ_nodes) == Array(θ) && Array(gplan.nodes.φ_nodes) == Array(φ)
+    NUFSHT.close!(gplan)
 
     splan = NUFSHT.make_spin_plan(θ, φ, lmax, 2; tol = 1e-8, ntrans = B, nufft = nb)
     for f in (:dl_curr, :dl_prev, :G)

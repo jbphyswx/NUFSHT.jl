@@ -79,9 +79,8 @@ _real_capable(::_FTBLibrary) = true
     _resolve_nufft(backend, FE) -> backend
 
 Concrete backends pass through untouched — one named explicitly is honoured or refused, never swapped.
-`AutoSpectralBackend` takes the first loaded of NonuniformFFTs and FINUFFT, the order in which
-FlowTransformBindings' `benchmark/nufft_libraries.jl` measures them faster per execution, and direct
-summation when neither is loaded. Override with `nufft=`.
+`AutoSpectralBackend` takes NonuniformFFTs when it is loaded, FINUFFT when only it is, and direct
+summation when neither is. Override with `nufft=`.
 """
 _resolve_nufft(backend::SpectralBackends.AbstractSpectralBackend, ::Type) = backend
 function _resolve_nufft(::SpectralBackends.AbstractAutoSpectralBackend, ::Type)
