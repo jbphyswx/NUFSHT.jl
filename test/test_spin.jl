@@ -236,7 +236,7 @@ Test.@testset "real-field spin plans: both folds are one operator" begin
     Test.@test sqrt(sum(abs2, imag.(gc)) / sum(abs2, real.(gc))) < 1e-12
     ref = real.(gc)
 
-    for be in (NUFSHT.NonuniformFFTsBackend(), NUFSHT.FINUFFTBackend(),
+    for be in (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend(),
                NUFSHT.SpectralBackends.DirectSumSpectralBackend())
         p = NUFSHT.make_spin_plan(Float64, θ, φ, lmax, 0; tol = 1e-12, nthreads = 1, nufft = be)
         Test.@test size(p.G, 1) == lmax + 1                        # folded on every backend
@@ -294,7 +294,7 @@ Test.@testset "real-field spin solve fits the Hermitian degrees" begin
         end
     end
 
-    for be in (NUFSHT.NonuniformFFTsBackend(), NUFSHT.FINUFFTBackend())
+    for be in (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend())
         p = NUFSHT.make_spin_plan(Float64, θ, φ, lmax, 0; tol = 1e-13, nthreads = 1, nufft = be)
         Test.@test NUFSHT._coefflen(p) == K            # the fit runs over the real degrees
         f = zeros(M); NUFSHT.nusht_type2_spin!(f, sf, p)

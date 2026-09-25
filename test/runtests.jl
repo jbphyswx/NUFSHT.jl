@@ -2,6 +2,7 @@ using Test: Test
 # Before FastSphericalHarmonics: NUFSHT loads FlowTransformBindings, which selects the OpenMP runtime's
 # thread-local mode before FastTransforms loads that runtime.
 using NUFSHT: NUFSHT
+using FlowTransformBindings: FlowTransformBindings as FTB
 using Statistics: Statistics
 using Random: Random
 using FastSphericalHarmonics: FastSphericalHarmonics
@@ -22,7 +23,6 @@ Test.@testset "NUFSHT.jl" begin
     include("test_precision.jl")
     include("test_adjoint.jl")
     include("test_allocs.jl")
-    include("test_extensions.jl")
     include("test_nufft_backends.jl")
     include("test_ka.jl")
     include("test_threaded.jl")

@@ -61,7 +61,7 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
     for B in (1, 2)
         Test.@testset "scalar transform + CG (B=$B)" begin
             plan = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-10, ntrans = B, nthreads = 1,
-                                    nufft = NUFSHT.FINUFFTBackend())
+                                    nufft = FTB.FINUFFTBackend())
             C = randn(Nθ, Nφ, B); f = zeros(M, B); Cout = zeros(Nθ, Nφ, B); out = zeros(M, B)
             NUFSHT.nusht_type2!(f, C, plan)
             mask = abs.(randn(M, B)) .+ 0.5; scratch = similar(out)
@@ -94,7 +94,7 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
                 Test.@test _a_asmMa(plan.F, plan.Fhat, lmax) == 0
                 # NUFSHT's own stages allocate nothing on *every* backend — the parts above can only
                 # be asserted where the backend's exec is itself allocation-free.
-                for be in (NUFSHT.FINUFFTBackend(), NUFSHT.NonuniformFFTsBackend())
+                for be in (FTB.FINUFFTBackend(), FTB.NonuniformFFTsBackend())
                     q = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-10, ntrans = B, nthreads = 1, nufft = be)
                     copyto!(q.F, C)
                     Test.@test _a_sphev(q) == 0
@@ -107,13 +107,20 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
                 Test.@test _a_cpbp(ws.h, ws.v, ws.cf)     == 0
                 Test.@test _a_cscale(ws.u, ws.cf)         == 0
                 Test.@test _a_solve(Csol, ftrue, plan, ws) == 0
+                if B == 2
+                    # Column 2 is zero and retires at once, so the solve narrows to width 1.
+                    fz = copy(ftrue); fz[:, 2] .= 0
+                    Test.@test _a_solve(Csol, fz, plan, ws) == 0
+                    Test.@test NUFSHT._pool_built(plan.size_pool) == 1
+                end
             end
             NUFSHT.close!(plan)
         end
 
         Test.@testset "spin transform + CG (B=$B)" begin
             s = 1
-            plan = NUFSHT.make_spin_plan(θ, φ, lmax, s; tol = 1e-10, ntrans = B, nthreads = 1)
+            plan = NUFSHT.make_spin_plan(θ, φ, lmax, s; tol = 1e-10, ntrans = B, nthreads = 1,
+                                         nufft = FTB.FINUFFTBackend())
             sf = zeros(ComplexF64, Nθ, Nφ, B); fs = zeros(ComplexF64, M, B); sfo = zeros(ComplexF64, Nθ, Nφ, B)
             for b in 1:B, ℓ in abs(s):min(4, lmax), m in -ℓ:ℓ
                 sf[NUFSHT.spin_coeff_index(ℓ, m, lmax), b] = randn(ComplexF64)

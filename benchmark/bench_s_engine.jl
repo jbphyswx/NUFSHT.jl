@@ -15,6 +15,7 @@
 # The butterfly is asymptotically better, so this measures where the crossover actually is rather than
 # assuming either answer. Only the S step is timed: no NUFFT, no real/complex basis conversion.
 using NUFSHT: NUFSHT
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FINUFFT: FINUFFT
 using FastSphericalHarmonics: FastSphericalHarmonics
 using LinearAlgebra: LinearAlgebra
@@ -37,9 +38,9 @@ end
 spin_triples(L) = sum((2ℓ + 1)^2 for ℓ in 0:L)
 
 function main()
-    @printf("julia -t%d | BLAS=%d | FFTW planner=%d | FastTransforms default nthreads=%d\n",
-            Threads.nthreads(), LinearAlgebra.BLAS.get_num_threads(),
-            NUFSHT.FFTW.get_num_threads(), NUFSHT._fasttransforms_default_nthreads())
+    @printf("julia -t%d | BLAS=%d | FFTW planner=%d | FastTransforms nthreads=%d\n",
+            Threads.nthreads(), LinearAlgebra.BLAS.get_num_threads(), NUFSHT.FFTW.get_num_threads(),
+            ccall((:omp_get_max_threads, NUFSHT.FastTransforms.libfasttransforms), Cint, ()))
     @printf("loadavg=%s | %s physical / %s logical cores\n",
             strip(read(`sysctl -n vm.loadavg`, String)),
             strip(read(`sysctl -n hw.physicalcpu`, String)),
@@ -66,7 +67,7 @@ function main()
             sf[NUFSHT.spin_coeff_index(l, m, lmax)] = (randn() + im * randn()) / (1 + l)
         end
 
-        be = NUFSHT.FINUFFTBackend()
+        be = FTB.FINUFFTBackend()
         ps = NUFSHT.make_plan(Float64, θ, φ, lmax; tol = 1e-8, nufft = be)
         pg = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 0; tol = 1e-8, nufft = be)
 

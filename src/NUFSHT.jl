@@ -10,19 +10,20 @@ Double Fourier Sphere (DFS) + nuFFT spherical harmonic transforms at arbitrary s
   complex exponentials a NUFFT evaluates. The φ axis carries wavenumbers `-lmax…lmax`, the θ axis
   `-(lmax+1)…lmax+1` — one further out, because the coefficient array's supernumerary slots hold
   degrees up to `lmax+|m|` and an odd-order column reaches θ-frequency `lmax+1`.
-- **N** (NUFFT guru type 2 / type 1): non-uniform FFT evaluating the 2D Fourier series at the
-  scattered points. A real-eltype plan on a backend with a real-data transform stores only `kθ ≥ 0`
-  and lets that backend supply the Hermitian half, halving both the mode array and the spreading.
+- **N** (NUFFT type 2 / type 1): non-uniform FFT evaluating the 2D Fourier series at the scattered
+  points. A real-eltype plan on a backend with a real-data transform stores only `kθ ≥ 0` and lets
+  that backend supply the Hermitian half, halving both the mode array and the spreading.
 
-A [`NUSHTplan`](@ref) owns persistent FINUFFT guru plans (built once, points set once) and every
-work buffer, so repeated transforms — filtering, or the hundreds of matvecs in [`nusht_solve!`](@ref)
-— allocate nothing and never re-plan. All calls transform a batch of `B = plan.B` co-located fields
-(`ntrans`); `B = 1` methods accept plain vectors/matrices.
+A [`NUSHTplan`](@ref) owns persistent NUFFT plans (built once over the nodes) and every work buffer, so
+repeated transforms — filtering, or the hundreds of matvecs in [`nusht_solve!`](@ref) — allocate
+nothing and never re-plan. All calls transform a batch of `B = plan.B` co-located fields (`ntrans`);
+`B = 1` methods accept plain vectors/matrices. The NUFFT is FlowTransformBindings' (NonuniformFFTs or
+FINUFFT), or the in-core direct sum.
 
 ## References
 - Merilees (1973); Townsend & Olver (2015); Reinecke & Seljebotn (2013, A&A 554 A112);
   Keiner, Kunis & Potts (2009); Belkner et al. (2024, arXiv:2406.14542).
-- FastSphericalHarmonics.jl, FINUFFT.jl, FastTransforms.jl.
+- FastSphericalHarmonics.jl, FastTransforms.jl, FINUFFT.jl, NonuniformFFTs.jl.
 """
 module NUFSHT
 
@@ -60,7 +61,7 @@ function plot_field end
 # ── Parallel execution: backend dispatch ──────────────────────────────────────
 # Parallelism is a `ComputationalBackends.AbstractExecutionBackend` argument, in two families:
 #
-#  • **Farm over independent problems** (collection methods below). A FINUFFT plan is not safe to
+#  • **Farm over independent problems** (collection methods below). A NUFFT plan is not safe to
 #    `exec!` concurrently, so each problem carries its own. `DistributedBackend` needs the node-set
 #    form — plans hold C pointers and cannot be serialized, so each worker builds its own.
 #  • **Decompose one transform** — `MPIBackend`, partitioning the `M` points across ranks.
@@ -276,7 +277,7 @@ scattered points, writing values into `f`. Batched: `C` is `(Nθ, Nφ)` / `(Nθ,
 length-`M` / `(M, B)`.
 
 Algorithm `A = N·F·S`: `plan_sph2fourier` to the bivariate Fourier series (S) → assemble the complex
-mode array (F) → FINUFFT type 2 (N).
+mode array (F) → NUFFT type 2 (N).
 """
 function nusht_type2!(f, C, plan::NUSHTplan{T}, k::Integer = plan.B,
                       kdfn::Integer = k) where {T}

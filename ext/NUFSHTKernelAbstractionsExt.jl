@@ -9,7 +9,8 @@ without per-vendor code. The plain CPU `Array` methods in `src` are untouched; a
 
 Every array-indexed step needs a kernel — the scalar mode assembly and its adjoint, the spin Wigner
 recurrence and contraction, the solver's per-column primitives and the spectral filter. The NUFFT is
-not among them: it is dispatched through the `_nufft_*` seam (cuFINUFFT via the CUDA extension).
+not among them: it is dispatched through the `_nufft_*` seam to FlowTransformBindings, which puts the
+plan on the device of the nodes.
 
 Loaded by `using KernelAbstractions` (with `GPUArraysCore`).
 """
@@ -72,7 +73,7 @@ end
 # ── Device spin S-engine: on-the-fly Trapani–Navaza recurrence + G-contraction ──
 # The spin transform's `_assemble_G!` (Legendre step + bivariate-Fourier assembly) as KA kernels, so
 # the whole spin path runs on device (recurrence buffers `similar` to the device nodes; NUFFT via the
-# cuFINUFFT seam). Same math as the CPU `src/Spin.jl` methods — validated bit-for-bit on JLArray. The
+# FlowTransformBindings). Same math as the CPU `src/Spin.jl` methods — validated bit-for-bit on JLArray. The
 # degree loop is sequential (ℓ depends on ℓ-1); per degree, Stage A+B is one thread per column, the
 # symmetry fills and the contraction are elementwise.
 

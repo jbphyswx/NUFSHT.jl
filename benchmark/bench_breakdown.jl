@@ -11,6 +11,7 @@
 #   * cold and warm separately — a min-over-repeats hides first-call specialization, and for a shape
 #     used once that is the number the user actually experiences.
 using NUFSHT: NUFSHT
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FINUFFT: FINUFFT
 using NonuniformFFTs: NonuniformFFTs
 using FastSphericalHarmonics: FastSphericalHarmonics
@@ -43,9 +44,10 @@ function smooth(n::Integer)
 end
 
 function header()
-    Printf.@printf("julia -t%d | BLAS=%d | FFTW planner=%d | FastTransforms default=%d | loadavg=%s\n",
+    Printf.@printf("julia -t%d | BLAS=%d | FFTW planner=%d | FastTransforms=%d | loadavg=%s\n",
             Threads.nthreads(), LinearAlgebra.BLAS.get_num_threads(),
-            NUFSHT.FFTW.get_num_threads(), NUFSHT._fasttransforms_default_nthreads(),
+            NUFSHT.FFTW.get_num_threads(),
+            ccall((:omp_get_max_threads, NUFSHT.FastTransforms.libfasttransforms), Cint, ()),
             strip(read(`sysctl -n vm.loadavg`, String)))
     println("="^118)
     Printf.@printf("%-5s %-8s %-9s %-15s | %-8s %-8s %-8s | %-7s | %-8s %-9s | %s\n",
@@ -82,7 +84,7 @@ function run(lmax, M, FE, be, tol = 1e-8)
     g1, g2 = smooth(round(Int, 1.25 * (2lmax + 3))), smooth(round(Int, 1.25 * (2lmax + 1)))
     mem = NUFSHT.plan_memory(p)
     Printf.@printf("%-5d %-8d %-9s %-15s | %-8.3f %-8.3f %-8.3f | %-6.0f%% | %-8.3f %-9.3f | %.1f\n",
-            lmax, M, be isa NUFSHT.FINUFFTBackend ? "FINUFFT" : "NUFFTs",
+            lmax, M, be isa FTB.FINUFFTBackend ? "FINUFFT" : "NUFFTs",
             string(g1, "x", g2), 1e3tS, 1e3tF, 1e3tN, 100 * tS / t2,
             1e3t2, 1e3tsolve / max(iters, 1), mem.total / 2^20)
     NUFSHT.close!(p)
@@ -91,7 +93,7 @@ end
 
 header()
 for (lmax, M) in ((32, 4_000), (64, 20_000), (128, 80_000), (256, 300_000))
-    for be in (NUFSHT.FINUFFTBackend(), NUFSHT.NonuniformFFTsBackend())
+    for be in (FTB.FINUFFTBackend(), FTB.NonuniformFFTsBackend())
         run(lmax, M, Float64, be)
     end
     flush(stdout)

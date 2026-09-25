@@ -2,13 +2,14 @@
     NUFSHTOhMyThreadsExt
 
 Node-local multithreaded execution over a collection of **independent** problems (distinct point sets
-→ distinct plans), one plan per task: a single FINUFFT plan's buffers are mutated in place and are not
-safe to share across threads. Selected by passing a `ComputationalBackends.ThreadedBackend`. Loaded by
+→ distinct plans), one plan per task: a NUFFT plan's buffers are mutated in place and are not safe to
+share across threads. Selected by passing a `ComputationalBackends.ThreadedBackend`. Loaded by
 `using OhMyThreads`.
 
 The tasks carry the parallelism, so the scalar farms run FastTransforms on one OpenMP thread inside
-them (`FlowTransformBindings.FASTTRANSFORMS_THREADS`). Build the plans with `nthreads = 1` to keep
-FINUFFT from oversubscribing across concurrent tasks too. The spin path makes no FastTransforms calls.
+them (`FlowTransformBindings.FASTTRANSFORMS_THREADS`). Build the plans with `nthreads = 1` so the NUFFT
+does not oversubscribe the cores across concurrent tasks either. The spin path makes no FastTransforms
+calls.
 """
 module NUFSHTOhMyThreadsExt
 

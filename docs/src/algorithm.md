@@ -116,15 +116,14 @@ therefore stored — ``l_\text{max}+2`` rows instead of ``2 l_\text{max}+3`` —
 backend: halving the ``\theta`` axis halves the deconvolution and the upsampled FFT and leaves
 the interpolation untouched, so it is never more work than the full array.
 
-How the missing half is supplied splits into two cases. On a backend with a genuine real-data
-transform (`NonuniformFFTsBackend`; FINUFFT has none) the transform is built for the full
-``\theta`` axis, is handed the half-spectrum, and reconstructs the rest itself — with **real
-strengths**, so the spreading/interpolation halves too and the forward needs no weights.
-Without one, the transform itself is half-height and complex: its centered rows are labelled
-``k_\theta - \lceil\cdot\rceil``, which a per-point phase undoes, and the absent conjugate
-half is paid for by doubling every ``k_\theta > 0`` row on the way in.
+How the missing half is supplied splits into two cases. Both NUFFT libraries, through
+FlowTransformBindings, take the half-spectrum of a transform built for the full ``\theta`` axis and
+supply the rest themselves — with **real strengths**, so the spreading/interpolation halves too and
+the forward needs no weights. Direct summation's transform is half-height and complex: its centered
+rows are labelled ``k_\theta - \lceil\cdot\rceil``, which a per-point phase undoes, and the absent
+conjugate half is paid for by doubling every ``k_\theta > 0`` row on the way in.
 
-Measured for the real-data case against the same backend's unfolded path at the same points
+Measured with NonuniformFFTs' real-data transform against its unfolded path at the same points
 and modes, identical iteration counts, results agreeing to ``2 \times 10^{-16}``:
 
 | ``l_\text{max}``, ``M`` | synthesis | `nusht_solve!` |

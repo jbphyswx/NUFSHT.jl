@@ -5,6 +5,7 @@ ComputationalBackends = "5c6e2104-4040-447f-8fc0-66ec2223b019"
 Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 FINUFFT = "d8beea63-0952-562e-9c6a-8e8ef7364055"
 FastSphericalHarmonics = "d335c211-7587-445e-a753-f0b1fb7e445f"
+FlowTransformBindings = "73c6b5d6-1010-4337-8b9e-d550f02c124c"
 NonuniformFFTs = "cd96f58b-6017-4a02-bb9e-f4d81626177f"
 SpectralBackends = "289ded02-b044-41b2-8b2d-71f2a47755d1"
 GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
@@ -22,5 +23,6 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 julia = "1.11"
 
 [sources]
+FlowTransformBindings = { url = "https://github.com/jbphyswx/FlowTransformBindings.jl.git" }
 NUFSHT = { path = ".." }
 

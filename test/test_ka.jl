@@ -40,9 +40,9 @@ Test.@testset "KernelAbstractions extension: device scalar mode assembly on JLAr
     @info "KernelAbstractions ext: device scalar mode assembly matches CPU on JLArray (full + folded, real + complex)"
 end
 
-# The spin S-engine (Trapani–Navaza recurrence + bivariate-Fourier contraction) as KA kernels — the
-# device path for the whole spin transform (only the NUFFT is vendor-specific, via cuFINUFFT). Must
-# reproduce the CPU `_assemble_G!`/`_assemble_G_adjoint!` bit-for-bit on JLArray.
+# The spin S-engine (Trapani–Navaza recurrence + bivariate-Fourier contraction) as KA kernels, the
+# device spin transform with the NUFFT. Must match the CPU `_assemble_G!`/`_assemble_G_adjoint!` on
+# JLArray.
 Test.@testset "KernelAbstractions extension: device spin assembly (recurrence) on JLArray" begin
     Random.seed!(202)
     for (lmax, s, B) in ((8, 0, 1), (8, 2, 1), (12, 1, 3), (6, -1, 2))
@@ -100,34 +100,61 @@ Test.@testset "KernelAbstractions extension: device column primitives, complex (
     Test.@test Array(qj) ≈ qc
 end
 
-# A plan built from device node arrays must have ALL buffers device-resident. Only the spin path can
-# be checked here: building a scalar plan needs a NUFFT for the array type, and the only device NUFFT
-# is cuFINUFFT, which is `CuArray`-only. The scalar path's own device kernels are covered above
-# without a plan; end to end it is exercised on real hardware in test/gpu_cuda.jl.
+# A NUFFT for device plans where no device NUFFT library exists: the plan's buffers stay on the device
+# and each execution moves its input and output across in bulk, which the scalar-indexing guard allows.
+# Everything else a solve runs under that guard is NUFSHT's own device path.
+struct HostBounceNUFFT <: NUFSHT.SpectralBackends.AbstractNUFFTSpectralBackend end
+struct HostBouncePlan{P}
+    inner::P
+end
+NUFSHT._nufft_makeplan(::HostBounceNUFFT, nodes, type, n_modes, iflag, ntrans, tol; kwargs...) =
+    HostBouncePlan(NUFSHT._nufft_makeplan(NUFSHT.SpectralBackends.DirectSumSpectralBackend(),
+                                          map(Array, nodes), type, n_modes, iflag, ntrans, tol; kwargs...))
+NUFSHT._nufft_setpts!(p::HostBouncePlan, x, y) = (NUFSHT._nufft_setpts!(p.inner, Array(x), Array(y)); p)
+NUFSHT._nufft_destroy!(::HostBouncePlan) = nothing
+function NUFSHT._nufft_exec!(p::HostBouncePlan, input, output)
+    hout = Array(output)
+    NUFSHT._nufft_exec!(p.inner, Array(input), hout)
+    return copyto!(output, hout)
+end
+
+# A plan built from device node arrays holds every buffer on the device except `Fslice`, the host matrix
+# FastTransforms runs on. JLArray has no NUFFT library, so both plans take the host-bounce NUFFT above.
 Test.@testset "KernelAbstractions extension: device plan buffers are device-resident (JLArray)" begin
     isdev(x) = x isa GPUArraysCore.AbstractGPUArray
     Random.seed!(404)
     lmax = 6; M = 60; B = 2
     θ = JLArrays.JLArray(clamp.(π .* rand(M), 1e-9, π - 1e-9))
     φ = JLArrays.JLArray(2π .* rand(M))
+    nb = HostBounceNUFFT()
+    # The bidiagonalization's scalar recurrences run on the host, so those stay host vectors.
+    function check_workspace(ws)
+        for f in (:x, :v, :h, :hbar, :w, :u, :nrm, :cf)
+            Test.@test isdev(getfield(ws, f))
+        end
+        for f in (:α, :β, :ζbar, :rel, :colres)
+            Test.@test getfield(ws, f) isa Array
+        end
+    end
 
-    splan = NUFSHT.make_spin_plan(θ, φ, lmax, 2; tol = 1e-8, ntrans = B)
+    plan = NUFSHT.make_plan(Float64, θ, φ, lmax; tol = 1e-8, ntrans = B, nufft = nb)
+    Test.@test isdev(plan.F) && isdev(plan.Fhat)
+    Test.@test plan.Fslice isa Array
+    for f in (:θ_nodes, :φ_nodes, :θ_nufft, :θ_shift, :fbuf)
+        Test.@test isdev(getfield(plan.nodes, f))
+    end
+    check_workspace(NUFSHT.LSMRWorkspace(plan))
+    NUFSHT.close!(plan)
+
+    splan = NUFSHT.make_spin_plan(θ, φ, lmax, 2; tol = 1e-8, ntrans = B, nufft = nb)
     for f in (:dl_curr, :dl_prev, :G)
         Test.@test isdev(getfield(splan, f))
     end
     for f in (:θ_nodes, :φ_nodes, :θ_nufft, :fbuf)
         Test.@test isdev(getfield(splan.nodes, f))
     end
-    sws = NUFSHT.LSMRWorkspace(splan)
-    for f in (:x, :v, :h, :hbar, :w, :u, :nrm, :cf)
-        Test.@test isdev(getfield(sws, f))
-    end
-    # The bidiagonalization's scalar recurrences run on the host, so those stay host vectors.
-    for f in (:α, :β, :ζbar, :rel, :colres)
-        Test.@test getfield(sws, f) isa Array
-    end
+    check_workspace(NUFSHT.LSMRWorkspace(splan))
     NUFSHT.close!(splan)
-    @info "KernelAbstractions ext: spin device plan/workspace are device-resident"
 end
 
 # Device-generic solver column primitives on real data + the real↔complex field copy (so the *scalar*
@@ -242,25 +269,6 @@ Test.@testset "KernelAbstractions extension: device solver bookkeeping never sca
     Test.@test sort(ws.perm) == collect(1:B)
     Test.@test ws.colres[1] == 1e-9 && ws.colres[2] == 0.5
     Test.@test ws.rel[1:nlive] == [0.4, 0.3]       # survivors' state moved with them
-end
-
-# A NUFFT for device plans where no device NUFFT library exists: the plan's buffers stay on the device
-# and each execution moves its input and output across in bulk, which the scalar-indexing guard allows.
-# Everything else a solve runs under that guard is NUFSHT's own device path.
-struct HostBounceNUFFT <: NUFSHT.SpectralBackends.AbstractNUFFTSpectralBackend end
-struct HostBouncePlan{P}
-    inner::P
-end
-NUFSHT._nufft_makeplan(::HostBounceNUFFT, nodes, type, n_modes, iflag, ntrans, tol; kwargs...) =
-    HostBouncePlan(NUFSHT._nufft_makeplan(NUFSHT.SpectralBackends.DirectSumSpectralBackend(),
-                                          Array(nodes), type, n_modes, iflag, ntrans, tol; kwargs...))
-NUFSHT._nufft_setpts!(p::HostBouncePlan, x, y) = (NUFSHT._nufft_setpts!(p.inner, Array(x), Array(y)); p)
-NUFSHT._nufft_finalize!(p::HostBouncePlan) = p
-NUFSHT._nufft_destroy!(::HostBouncePlan) = nothing
-function NUFSHT._nufft_exec!(p::HostBouncePlan, input, output)
-    hout = Array(output)
-    NUFSHT._nufft_exec!(p.inner, Array(input), hout)
-    return copyto!(output, hout)
 end
 
 # `nusht_solve!` and `nusht_solve_spin!` end to end on device arrays with scalar indexing an error,

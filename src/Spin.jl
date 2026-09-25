@@ -15,12 +15,11 @@ bivariate Fourier series
 
     f(θ,φ) = Σ_{m',m} G_{m'm} e^{−im'θ} e^{imφ},   G_{m'm} = i^{m+s} Σ_ℓ ₛf_{ℓm} N_ℓ Δ^ℓ_{m'm} Δ^ℓ_{m',−s},
 
-evaluated at scattered points by one 2-D NUFFT. The `e^{−im'θ}` factor is absorbed by feeding FINUFFT
-the **negated** colatitudes `−θ` with `iflag = +1`, so the mode array `G` (CMCL-centered) maps
-directly to the NUFFT modes — no per-call axis-reversal. Analysis is the exact Euclidean adjoint
-(FINUFFT type 1 at `−θ`, `iflag = −1`, + the transpose Δ-contraction); `nusht_solve_spin!` inverts by
-LSMR on the bidiagonalization of `A`. Like the scalar plan, the FINUFFT guru plans are built
-once (points set once) so the solver's matvecs never re-plan.
+evaluated at scattered points by one 2-D NUFFT. The `e^{−im'θ}` factor is absorbed by feeding the
+NUFFT the negated colatitudes `−θ` with `iflag = +1`, so the centered mode array `G` maps directly to
+the NUFFT modes. Analysis is the exact Euclidean adjoint (type 1 at `−θ`, `iflag = −1`, and the
+transpose Δ-contraction); `nusht_solve_spin!` inverts by LSMR on the bidiagonalization of `A`. As for
+the scalar plan, the NUFFT plans are built once over the nodes, so the solver's matvecs never re-plan.
 
 Coefficients use a dense `(lmax+1) × (2lmax+1)` layout: `sf[ℓ+1, m+lmax+1]`. Spin `s = ±1` is the
 tangent-vector case (`U = u_θ + i u_φ`), enabling vector/Helmholtz operations at scattered points.
@@ -147,8 +146,8 @@ end
     SpinNUSHTplan{T}
 
 Plan for spin-`s` non-uniform spherical harmonic transforms at `M` scattered points up to degree
-`lmax`, transforming `B` co-located fields per call. Owns persistent FINUFFT guru plans (type 2
-`iflag=+1`, type 1 `iflag=−1`) whose points are set to `−θ` once. The Wigner `Δ^ℓ = d^ℓ(π/2)` planes
+`lmax`, transforming `B` co-located fields per call. Owns persistent NUFFT plans (type 2 `iflag=+1`,
+type 1 `iflag=−1`) over the nodes `(−θ, φ)`. The Wigner `Δ^ℓ = d^ℓ(π/2)` planes
 are generated **on the fly** by the Trapani–Navaza recurrence into two reused `(2lmax+1)²` buffers
 (`dl_curr`/`dl_prev`), so the plan is **O(lmax²) memory**, and the recurrence is numerically stable to
 `ℓ ≈ 1024` (the explicit-factorial `wigner_d` sum it replaced loses all accuracy above `ℓ ≈ 40`).
@@ -162,7 +161,7 @@ struct SpinNUSHTplan{T<:AbstractFloat, MT<:AbstractMatrix{T}, CT3<:AbstractArray
     s::Int
     B::Int
     tol::FT
-    nodes::ND              # points, (M,B) strengths and the FINUFFT guru plans; see AbstractNodeSet
+    nodes::ND              # points, (M,B) strengths and the NUFFT handles; see AbstractNodeSet
     dl_curr::MT            # (2lmax+1)² reused Wigner-d(π/2) plane for the current degree ℓ
     dl_prev::MT            # (2lmax+1)² reused plane for degree ℓ-1 (Trapani–Navaza recurrence)
     G::CT3                 # (L, L, B) bivariate-Fourier mode buffer, L = 2lmax+1
@@ -182,8 +181,7 @@ conjugate-symmetric and halves both the Δ-contraction and the NUFFT's θ axis �
 coefficients satisfy the reality condition.
 
 `tuning` ([`AbstractPlanTuning`](@ref)) and the `nthreads` / `upsampfac` overrides behave as in
-[`make_plan`](@ref); there are no FastTransforms plans here, so only the FINUFFT settings are
-searched.
+[`make_plan`](@ref); there are no FastTransforms plans here, so only the NUFFT settings are searched.
 """
 make_spin_plan(θ_nodes, φ_nodes, lmax::Integer, s::Integer; kwargs...) =
     make_spin_plan(Complex{float(eltype(θ_nodes))}, θ_nodes, φ_nodes, lmax, s; kwargs...)
@@ -237,8 +235,8 @@ function make_spin_plan(::Type{FE}, θ_nodes, φ_nodes, lmax::Integer, s::Intege
     θ_shift = (realfield && !r2c) ?
         _to_like(θ, Complex{T}.(cis.(T(Lθ ÷ 2) .* negθ))) : nothing
 
-    # NUFFT built through the backend seam: host nodes → FINUFFT, device nodes → cuFINUFFT (CUDA ext).
-    # `modeord = 0` (CMCL-centered) here, unlike the scalar plan — the G mode array is already centered.
+    # NUFFT built through the backend seam, on the device of the nodes. `modeord = 0` (centered): the G
+    # mode array is already centered.
     tol64 = Float64(tol)
     # A real transform covers the full θ axis and stores its half; a complex half-height one is built
     # at the stored size.
@@ -250,13 +248,11 @@ function make_spin_plan(::Type{FE}, θ_nodes, φ_nodes, lmax::Integer, s::Intege
     isnothing(upsampfac) || (uf2 = uf1 = Float64(upsampfac))
     # See `_nufft_share_directions`: where the backend's plan carries no direction, one object serves
     # both and the second is a handle onto it, already pointed at the same nodes.
-    nufft_type2 = _make_nufft(nub, negθ, 2, n_modes, +1, B, tol64, T, 0, nt2, uf2, ZS)
-    _nufft_setpts!(nufft_type2, negθ, φ)
-    _nufft_finalize!(nufft_type2)
+    nufft_type2 = _make_nufft(nub, (negθ, φ), 2, n_modes, +1, B, tol64, T, 0, nt2, uf2, ZS)
     nufft_type1 = _build_analysis(directions, nub, negθ, φ, n_modes, B, tol64, T, 0, nt1, uf1,
                                   ZS, nufft_type2)
-    # `negθ` is this plan's `θ_nufft`: a separate array, unlike the scalar plan's alias, because the
-    # e^{-im'θ} factor is absorbed by handing FINUFFT the negated colatitudes.
+    # `negθ` is this plan's `θ_nufft`, a separate array: the NUFFT is handed the negated colatitudes,
+    # which absorbs the e^{-im'θ} factor.
     nodes = _node_set(Val(variable_npts), θ, φ, negθ, θ_shift, fbuf, nufft_type2, nufft_type1)
 
     isnothing(wigner_table) || _check_table(wigner_table, (lmax = Int(lmax), s = Int(s)))
@@ -265,7 +261,7 @@ function make_spin_plan(::Type{FE}, θ_nodes, φ_nodes, lmax::Integer, s::Intege
         lmax, Int(s), B, tol64, nodes, dl_curr, dl_prev, G, wigner_table)
 end
 
-# Safe one-line `show` (see the NUSHTplan note): avoid recursing into stored FFTW/FINUFFT plan
+# Safe one-line `show` (see the NUSHTplan note): avoid recursing into stored FFTW/NUFFT plan
 # pointers, whose printers can segfault on an invalidated C state.
 @inline _shift_offset(plan::SpinNUSHTplan{T}) where {T} = T(size(plan.G, 1) ÷ 2)
 _copy_out!(f, fbuf, plan::SpinNUSHTplan) = _copy_out!(f, fbuf, _θshift(plan))

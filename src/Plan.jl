@@ -1,11 +1,10 @@
 """
     Plan.jl — Pre-allocated plan struct for NUFSHT transforms.
 
-A `NUSHTplan` pre-allocates every intermediate buffer **and** owns persistent FINUFFT *guru*
-plans (built once, points set once), so repeated transforms on the same node set — filtering many
-fields, or the hundreds of matvecs inside `nusht_solve!` — allocate nothing and never re-plan
-FINUFFT. All array/plan fields are type parameters so the same struct instantiates on host arrays
-today and device arrays later.
+A `NUSHTplan` pre-allocates every intermediate buffer **and** owns persistent NUFFT plans (built once
+over the nodes), so repeated transforms on the same node set — filtering many fields, or the hundreds
+of matvecs inside `nusht_solve!` — allocate nothing and never re-plan. All array/plan fields are type
+parameters, so the same struct instantiates on host and device arrays.
 """
 
 using AbstractFFTs: AbstractFFTs
@@ -18,25 +17,17 @@ export AbstractNodeSet, FixedCountNodes, VariableCountNodes
 export AbstractPlanTuning, NoTuning, AutoTuning, ThoroughTuning
 export AbstractPlanDirections, SynthesisOnly, SynthesisAndAnalysis
 
-# The NUFFT seam lives in NUFFT.jl. `_host` is a no-op for an `Array` and copies a device array's
-# coords to host; points are set once, so it is off the hot path.
-@inline _host(x::Array) = x
-@inline _host(x::AbstractArray) = Array(x)
-
-# `upsampfac` is omitted rather than passed as 0, so an untuned plan gets the library's own default.
-# These are FINUFFT options; backends without them ignore the keywords.
+# A NUFFT plan over `nodes = (x, y)` with its points set. The NUFFT seam lives in NUFFT.jl; an
+# `upsampfac` of `0` takes the library's own oversampling.
 #
-# `dtype` is the precision; `strengths` is the element type of the non-uniform data, which is what
-# selects a real-data transform on a backend that has one (`_real_capable`) — the same way
-# `NonuniformFFTs.PlanNUFFT` takes it. A backend without one ignores it.
-@inline _make_nufft(backend, nodes, type, n_modes, iflag, B, tol, ::Type{T}, modeord, nthreads,
-                    upsampfac, ::Type{Z} = Complex{T}) where {T,Z} =
-    upsampfac > 0 ?
+# `dtype` is the precision; `strengths` is the element type of the non-uniform data, and a real one
+# selects a real-data transform on a backend that has one (`_real_capable`). A backend without one
+# ignores it.
+@inline _make_nufft(backend, nodes::NTuple{2,AbstractVector}, type, n_modes, iflag, B, tol, ::Type{T},
+                    modeord, nthreads, upsampfac, ::Type{Z} = Complex{T}) where {T,Z} =
     _nufft_makeplan(backend, nodes, type, n_modes, iflag, B, tol;
                     dtype = T, strengths = Z, modeord = modeord, nthreads = nthreads,
-                    upsampfac = upsampfac) :
-    _nufft_makeplan(backend, nodes, type, n_modes, iflag, B, tol;
-                    dtype = T, strengths = Z, modeord = modeord, nthreads = nthreads)
+                    upsampfac = upsampfac)
 
 # Stored height of the θ mode axis for a plan whose non-uniform data has element type `Z`. A real `Z`
 # selects a real-data transform, which is handed only the `kθ ≥ 0` half — the r2c count `n÷2+1` — and
@@ -60,10 +51,8 @@ export AbstractPlanDirections, SynthesisOnly, SynthesisAndAnalysis
     copyto!(similar(ref, eltype(ref), n), src)
 
 # ── Planner ownership and plan tuning ─────────────────────────────────────────
-# FastTransforms and FFTW.jl share one libfftw3, so the FFTW *planner* thread count is a single
-# process global — and `FINUFFT.finufft_setpts!` resets it. It is baked into an FFTW plan when the
-# plan is BUILT (execution never re-reads it), so the sphere plans must be built with it pinned or
-# they silently inherit whatever the last foreign-library call left behind.
+# FastTransforms and FFTW.jl share one libfftw3, so the FFTW planner thread count is a single process
+# global, read into an FFTW plan when the plan is built; the sphere plans are built with it pinned.
 const _PLANNER_LOCK = ReentrantLock()
 
 # Tuning outcomes are memoized: the search is worth paying once per problem shape, not per plan.
@@ -194,31 +183,35 @@ function _pool_sizes(B::Integer)
 end
 
 """
-    _nufft_size_pool(backend, nufft_type2, nufft_type1, widths, build) -> pool
+    _nufft_size_pool(backend, nufft_type2, nufft_type1, widths) -> pool
 
-Seam: the store of reduced-width plan sets a batched solve narrows into, filled on demand through
-[`_pool_lookup!`](@ref). Its *shape* is the backend's, because what such a store can be depends on how
-that backend types its plans, which nothing in `src` can know.
+The store of reduced-width plan sets a batched solve narrows into, filled on demand through
+[`_with_pool_entry`](@ref). Where the backend's plans share one type at every width
+([`_width_polymorphic`](@ref)) it is an empty `Vector` typed from the plan's full-width pair. Otherwise
+it holds one slot per width, a `Ref` whose element type `FlowTransformBindings.plan_type` derives
+without building anything, so a width nobody uses is never built and never specialised.
 
-The default is an empty `Vector` typed from the plan's own full-width pair — correct for any backend
-that keeps the transform count out of its plan's type, since one element type then covers every width.
-A backend that puts the count in the type overrides this (see the NonuniformFFTs extension) with a
-store whose slots are typed per width.
-
-Either way nothing is built here: only a solve that actually narrows pays for a width, and `build(k)`
-is what it pays with. An empty `widths` disables narrowing and nothing is ever stored.
+Nothing is built here: only a solve that narrows pays for a width. An empty `widths` disables narrowing
+and nothing is ever stored.
 """
-function _nufft_size_pool(backend, nufft_type2, nufft_type1, widths::AbstractVector{Int}, build)
-    # The precondition this default rests on, checked rather than assumed: a backend that types its
-    # plans by width must override the seam, and without this it would instead fail later and obscurely,
-    # on a `push!` that cannot convert.
-    isempty(widths) || _width_polymorphic(backend) || throw(ArgumentError(
-        "$(nameof(typeof(backend))) types its plans by transform count, so the default width pool " *
-        "cannot hold them; its extension must define `_nufft_size_pool`."))
+function _nufft_size_pool(backend, nufft_type2, nufft_type1, widths::AbstractVector{Int})
+    (isempty(widths) || _width_polymorphic(backend)) ||
+        return _typed_width_slots(nufft_type2, nufft_type1, widths)
     E = @NamedTuple{k::Int, nufft_type2::typeof(nufft_type2), nufft_type1::typeof(nufft_type1)}
     pool = E[]
     sizehint!(pool, length(widths))   # final capacity is known, so filling it never regrows
     return pool
+end
+
+# One empty, concretely typed slot per width, the handle type read off `FTB.plan_type`.
+function _typed_width_slots(nufft_type2::_FTBNUFFT, nufft_type1, widths::AbstractVector{Int})
+    return ntuple(length(widths)) do i
+        k = widths[i]
+        H = _FTBNUFFT{FTB.plan_type(typeof(nufft_type2.plan), k)}
+        E = NamedTuple{(:k, :nufft_type2, :nufft_type1),
+                       Tuple{Int, H, nufft_type1 === nothing ? Nothing : H}}
+        (k = k, pair = Ref{Union{Nothing,E}}(nothing))
+    end
 end
 
 """
@@ -226,11 +219,8 @@ end
 
 The build inputs a narrower plan set needs that cannot be recovered from a plan: the resolved NUFFT
 backend and the tuned thread/upsampling settings. Everything else — mode counts, `modeord`, tolerance,
-nodes, realness — is read back off the plan when a width is built.
-
-`narrowable` asks only whether the backend can re-plan at a reduced width at all. *How* those plans are
-stored — grown on demand or built together — is [`_nufft_size_pool`](@ref)'s business, since it depends
-on the backend's own typing rather than on anything `src` can see.
+nodes, realness — is read back off the plan when a width is built. `narrowable` is
+[`_width_narrowable`](@ref) of the backend; how the widths are stored is [`_nufft_size_pool`](@ref)'s.
 """
 _pool_recipe(backend, nt2, uf2, nt1, uf1) =
     (backend = backend, nt2 = Int(nt2), uf2 = Float64(uf2), nt1 = Int(nt1), uf1 = Float64(uf1),
@@ -242,7 +232,7 @@ _pool_recipe(backend, nt2, uf2, nt1, uf1) =
 Build and cache the NUFFT plan pair for working width `k`, returning it.
 
 Mutates `plan.size_pool`, so it is not safe to call concurrently on a shared plan — the same
-restriction a plan already carries, since a FINUFFT guru plan cannot be executed concurrently either.
+restriction a plan already carries, since a NUFFT plan cannot be executed concurrently either.
 """
 function _build_width!(plan, k::Integer)
     r = plan.pool_recipe
@@ -254,16 +244,13 @@ function _build_width!(plan, k::Integer)
     # is built at the stored size.
     Z = eltype(_fbuf(plan))
     n_modes = Int64[Z <: Real ? 2plan.lmax + 3 : size(plan.Fhat, 1), plan.Nφ]
-    n2 = _make_nufft(r.backend, θn, 2, n_modes, +1, k, plan.tol, T, 0, r.nt2, r.uf2, Z)
-    _nufft_setpts!(n2, θn, φn); _nufft_finalize!(n2)
+    n2 = _make_nufft(r.backend, (θn, φn), 2, n_modes, +1, k, plan.tol, T, 0, r.nt2, r.uf2, Z)
     n1 = if plan.nodes.nufft_type1 === nothing
         nothing                                   # mirror the plan's own directions
     elseif _nufft_share_directions(r.backend)
-        _nufft_as_type1(n2)                       # same object, opposite direction — see the seam
+        _nufft_as_type1(n2)                       # same plan, opposite direction — see the seam
     else
-        p = _make_nufft(r.backend, θn, 1, n_modes, -1, k, plan.tol, T, 0, r.nt1, r.uf1, Z)
-        _nufft_setpts!(p, θn, φn); _nufft_finalize!(p)
-        p
+        _make_nufft(r.backend, (θn, φn), 1, n_modes, -1, k, plan.tol, T, 0, r.nt1, r.uf1, Z)
     end
     return (k = Int(k), nufft_type2 = n2, nufft_type1 = n1)
 end
@@ -271,26 +258,22 @@ end
 """
     _pool_lookup!(pool, k, build) -> entry
 
-The plan pair for working width `k`, built by `build(k)` and stored on a miss. Storing is the pool's
-own business because its shape is the backend's — see [`_nufft_size_pool`](@ref) — so this is a seam
-too: the default appends to a `Vector`, while a backend whose widths are distinct types overrides it.
+The plan pair for working width `k` in a `Vector` pool, built by `build(k)` and stored on a miss.
+`build(k)` returns the pool's element type.
 """
-function _pool_lookup!(pool::AbstractVector, k::Integer, build)
+function _pool_lookup!(pool::AbstractVector{E}, k::Integer, build) where {E}
     @inbounds for e in pool
         e.k == k && return e
     end
-    e = build(k)
+    e = build(k)::E
     push!(pool, e)
     return e
 end
 
-# A pool of one slot per width, each slot a `Ref` whose element type was *derived* rather than obtained
-# by building anything (see the NonuniformFFTs extension). Naming a type costs nothing, so a width
-# nobody uses is never built and never specialised, while the width that is used lands in a concretely
-# typed slot and stays there for the plan's life. The walk is over a tuple, so it unrolls.
-# The entry is handed to `f` rather than returned: slots of different widths hold *different* concrete
-# types, so a returned entry would be a `Union`, and a `Union` of a handle that wraps a large immutable
-# is boxed on the heap every call. Passing it in keeps each arm on one type.
+# A pool of one typed slot per width (`_typed_width_slots`): the width that is used lands in its slot
+# and stays there for the plan's life. The walk is over a tuple, so it unrolls. Slots of different
+# widths hold different concrete types, so the entry is passed to `f`, which each arm then calls on one
+# concrete type.
 #
 # Both arms reach `f` through something that strips `Nothing` — the `=== nothing` test on a hit, and
 # `something` after a miss has filled the slot — so `f` is specialised on the slot's own entry type.
@@ -304,8 +287,9 @@ end
 end
 _with_pool_entry(f::F, ::Tuple{}, k::Integer, build) where {F} = f(build(k))
 
-# One element type, so there is no union to split and the plain lookup serves.
-_with_pool_entry(f::F, pool::AbstractVector, k::Integer, build) where {F} =
+# One element type, so there is no union to split and the plain lookup serves. `build` only passes
+# through here, so it takes a type parameter to be specialized on.
+_with_pool_entry(f::F, pool::AbstractVector, k::Integer, build::B) where {F,B} =
     f(_pool_lookup!(pool, k, build))
 
 """
@@ -407,15 +391,14 @@ Pick the backend's thread count and oversampling factor by timing trial plans on
 `Z` is the non-uniform data element type, so a trial plan is built for the same transform the real
 plan will use — a real `Z` selects a real-data transform, whose cost is not the complex one's.
 Memoized on the problem shape with `M` bucketed to a power of two, so a stream of nearby point counts
-tunes once. Host `Array` nodes only: a device node set takes the library defaults, its plan being
-built through the cuFINUFFT seam that this host timing loop cannot exercise.
+tunes once. Host `Array` nodes only: a device node set takes the library defaults.
 """
 _tune_nufft(backend, ::AbstractArray, ::AbstractArray, n_modes, type, iflag, B, ::Type{T}, tol,
             modeord, ::AbstractPlanTuning, ::Type{Z} = Complex{T}) where {T,Z} = (0, 0.0)
 
-# Candidate `(nthreads, upsampfac)` pairs for FINUFFT. Both zeros are its sentinels: `nthreads = 0` is
-# "all cores", `upsampfac = 0.0` is "library chooses" (`finufft_opts.h`: 2.0 std, 1.25 small FFT, 0.0
-# auto). Auto is included because it is usually right — the search exists for the cases where it is not.
+# Candidate `(nthreads, upsampfac)` pairs for FINUFFT. Both zeros take the backend's own choice:
+# `nthreads = 0` the session's `Threads.nthreads()`, `upsampfac = 0.0` FINUFFT's (`finufft_opts.h`: 2.0
+# std, 1.25 small FFT, 0.0 auto), which is usually right; the search covers the cases where it is not.
 _nufft_candidates(::NoTuning) = Tuple{Int,Float64}[]
 _nufft_candidates(::AbstractPlanTuning) =
     [(nt, uf) for uf in (0.0, 2.0, 1.25) for nt in Int[0; _thread_candidates()]]
@@ -425,16 +408,16 @@ _nufft_candidates(::AbstractPlanTuning) =
 # choice: the half-support needed for a given `tol` is derived from σ analytically, so a smaller σ
 # shrinks the FFT and grows the spreading and the winner depends on how the point count compares with
 # the mode count. Accuracy is identical across the candidates by construction, so timing alone decides.
-_nufft_candidates(::NonuniformFFTsBackend, ::NoTuning) = Tuple{Int,Float64}[]
-_nufft_candidates(::NonuniformFFTsBackend, ::AbstractPlanTuning) =
+_nufft_candidates(::FTB.NonuniformFFTsBackend, ::NoTuning) = Tuple{Int,Float64}[]
+_nufft_candidates(::FTB.NonuniformFFTsBackend, ::AbstractPlanTuning) =
     [(0, uf) for uf in (2.0, 1.5, 1.25)]
 
-function _tune_nufft(backend::Union{FINUFFTBackend,NonuniformFFTsBackend}, θ::Array, φ::Array,
+function _tune_nufft(backend::_FTBLibrary, θ::Array, φ::Array,
                      n_modes, type::Integer, iflag::Integer, B::Integer, ::Type{T}, tol::Float64,
                      modeord::Integer, tuning::AbstractPlanTuning,
                      ::Type{Z} = Complex{T}) where {T,Z}
-    candidates = backend isa NonuniformFFTsBackend ? _nufft_candidates(backend, tuning) :
-                                                     _nufft_candidates(tuning)
+    candidates = backend isa FTB.NonuniformFFTsBackend ? _nufft_candidates(backend, tuning) :
+                                                         _nufft_candidates(tuning)
     isempty(candidates) && return (0, 0.0)
     M = length(θ)
     key = (Int(n_modes[1]), Int(n_modes[2]), Int(B), Int(type), T, tol,
@@ -448,9 +431,8 @@ function _tune_nufft(backend::Union{FINUFFTBackend,NonuniformFFTsBackend}, θ::A
     best_cfg = (0, 2.0)
     best_t = Inf
     for (nt, upsampfac) in candidates
-        p = _make_nufft(backend, θ, type, n_modes, iflag, B, tol, T, modeord, nt, upsampfac, Z)
+        p = _make_nufft(backend, (θ, φ), type, n_modes, iflag, B, tol, T, modeord, nt, upsampfac, Z)
         try
-            _nufft_setpts!(p, θ, φ)
             t = _time_candidate(() -> _nufft_exec!(p, inp, outp), best_t)
             if t < best_t * _TUNING_MARGIN
                 best_t = t
@@ -476,8 +458,7 @@ abstract type AbstractNUSHTplan end
     AbstractNodeSet
 
 The point-dependent half of a plan: the `M` scattered nodes, the `(M, B)` strengths buffer, and the
-two FINUFFT guru plans — which own the loaded point tables, so they belong with the points rather
-than with the bandlimit machinery.
+NUFFT handles, which own the loaded point tables and so belong with the points.
 
 Both concrete forms let the nodes **move** freely (that only rewrites array contents). They differ in
 whether the *count* may change, which is the only thing that requires rebinding a field:
@@ -506,8 +487,8 @@ end
     VariableCountNodes <: AbstractNodeSet
 
 Node set whose three point-sized fields are assignable, so [`set_nodes!`](@ref) also accepts a
-different number of points. The guru plans stay `const` — `finufft_setpts!` updates their point count
-in place. Request one with `make_plan(…; variable_npts = true)`.
+different number of points. The NUFFT handles stay `const`; setting their points updates the count in
+place. Request one with `make_plan(…; variable_npts = true)`.
 """
 mutable struct VariableCountNodes{RV,SV,CT2,N1,N2} <: AbstractNodeSet
     θ_nodes::RV
@@ -535,10 +516,7 @@ _build_analysis(::SynthesisOnly, backend, θ, φ, n_modes, B, tol, ::Type{T}, mo
 function _build_analysis(::SynthesisAndAnalysis, backend, θ, φ, n_modes, B, tol, ::Type{T}, modeord,
                          nt, uf, ::Type{Z}, p2) where {T,Z}
     _nufft_share_directions(backend) && return _nufft_as_type1(p2)
-    p1 = _make_nufft(backend, θ, 1, n_modes, -1, B, tol, T, modeord, nt, uf, Z)
-    _nufft_setpts!(p1, θ, φ)
-    _nufft_finalize!(p1)
-    return p1
+    return _make_nufft(backend, (θ, φ), 1, n_modes, -1, B, tol, T, modeord, nt, uf, Z)
 end
 
 # Internal accessors for the point-dependent fields, so the rest of the package is written against
@@ -564,11 +542,11 @@ Pre-computed plan for non-uniform spherical harmonic transforms at `M` scattered
 degree `lmax`, transforming `B` co-located fields per call (`ntrans = B`).
 
 Fields:
-- `lmax`, `Nθ = lmax+1`, `Nφ = 2lmax+1`, `B` (batch size / FINUFFT `ntrans`)
-- `tol`: FINUFFT accuracy tolerance
+- `lmax`, `Nθ = lmax+1`, `Nφ = 2lmax+1`, `B` (batch size / NUFFT `ntrans`)
+- `tol`: NUFFT accuracy tolerance
 - `nodes`: the [`AbstractNodeSet`](@ref) holding `θ_nodes`, `φ_nodes` (colatitudes ∈ [0,π] and
-  longitudes ∈ [0,2π) of the `M` points), the `(M, B)` strengths buffer `fbuf`, and the two FINUFFT
-  guru plans. [`set_nodes!`](@ref) re-points it.
+  longitudes ∈ [0,2π) of the `M` points), the `(M, B)` strengths buffer `fbuf`, and the two NUFFT
+  handles. [`set_nodes!`](@ref) re-points it.
 - `C`: filter scratch, **empty until the first filter call** — see [`_filter_scratch`](@ref).
   `F`: the bivariate Fourier coefficients `P·C`. Both `(Nθ, Nφ, B)` with
   eltype `FE`
@@ -583,8 +561,8 @@ Fields:
   slice. `P` alone is the whole S-step — its output is already the bivariate Fourier series, so
   synthesis is `P·C` → assemble → one NUFFT, with no equiangular grid in between.
 
-`nodes.nufft_type2` is the guru type-2 plan (`iflag = +1`, synthesis N) and `nodes.nufft_type1` the
-type-1 plan (`iflag = -1`, adjoint N†). `iflag = +1` supplies the reconstruction sign directly, so the
+`nodes.nufft_type2` is the type-2 handle (`iflag = +1`, synthesis N) and `nodes.nufft_type1` the
+type-1 handle (`iflag = -1`, adjoint N†). `iflag = +1` supplies the reconstruction sign directly, so the
 modes need no conjugate-transpose. The axis convention is `x = θ`, `y = φ`, and both mode axes are in
 centered order (`modeord = 0`) — which the signed wavenumber ranges above already are, so nothing has
 to be shifted per point.
@@ -672,20 +650,21 @@ end
     make_plan([FE = Float64,] θ_nodes, φ_nodes, lmax; tol=1e-8, ntrans=1, tuning=NoTuning(), …)
 
 `FE` is the field element type, positional as it is for `zeros(T, …)`. `Float64`/`Float32` assert the
-field VALUES are real, which makes the mode array conjugate-symmetric in `kθ`; on a NUFFT backend with
-a real-data transform (`NonuniformFFTsBackend`) only the `kθ ≥ 0` half is then built and only real
-strengths come back, halving the mode array, the upsampled FFT *and* the spreading.
+field values are real, which makes the mode array conjugate-symmetric in `kθ`; on a NUFFT backend with
+a real-data transform (either FlowTransformBindings library) only the `kθ ≥ 0` half is then built and
+only real strengths come back, halving the mode array, the upsampled FFT and the spreading.
 `ComplexF64`/`ComplexF32` build the full array. Both are the same spherical harmonic transform; only
 the symmetry exploited differs.
 
 Construct a `NUSHTplan` for `M` scattered points at colatitudes `θ_nodes ∈ [0,π]` and longitudes
 `φ_nodes ∈ [0,2π)`, up to spherical harmonic degree `lmax`, transforming `ntrans` co-located fields
-per call. Builds the FINUFFT guru plans and sets the nonuniform points once; they are freed by a
-finalizer (or eagerly via [`close!`](@ref)).
+per call. Builds the NUFFT plans over the nodes once; [`close!`](@ref) frees them.
 
 Keyword arguments:
-- `tol`: FINUFFT accuracy tolerance.
-- `T`: floating-point type (`Float64`/`Float32`).
+- `tol`: NUFFT accuracy tolerance, raised to `eps(T)`.
+- `nufft`: `SpectralBackends.AutoSpectralBackend()` (default),
+  `FlowTransformBindings.NonuniformFFTsBackend()`, `FlowTransformBindings.FINUFFTBackend()` or
+  `SpectralBackends.DirectSumSpectralBackend()`.
 - `ntrans`: batch size `B` — transform `B` co-located fields (same nodes) per call.
 - `tuning`: an [`AbstractPlanTuning`](@ref) — [`NoTuning`](@ref) (default), [`AutoTuning`](@ref) or
   [`ThoroughTuning`](@ref). The default already pins the settings that matter most; the searching
@@ -694,16 +673,13 @@ Keyword arguments:
   shape, so building many plans of one size pays the search once.
 - `ft_fftw_nthreads`, `ft_fftw_flags`: override the FFTW planner thread count / flags used for the
   sphere synthesis and analysis plans.
-- `nthreads`, `upsampfac`: override the NUFFT backend's thread count (`0` is "let the backend choose")
+- `nthreads`, `upsampfac`: override the NUFFT backend's thread count (`0` takes `Threads.nthreads()`)
   and upsampling factor. What a backend can reach differs: FINUFFT takes any count, while
   NonuniformFFTs parallelises over Julia's own threads and so reaches only `1` and `Threads.nthreads()`
   — a count it cannot deliver is an error, never silently something else.
 
 Each override keyword defaults to `nothing`, meaning "whatever `tuning` decides". An explicit value
 is honoured exactly and skips the search for that setting.
-
-FINUFFT accepts coordinates in `[-3π, 3π]`, so natural `[0,π]`/`[0,2π)` coordinates are passed
-directly.
 """
 function make_plan(
     ::Type{FE},
@@ -800,28 +776,16 @@ function make_plan(
     # Where a backend's plan carries no direction, one object serves both and the second is a handle
     # onto it — that halves the oversampled grid and the sorted point copy the plan owns, and its
     # points are already set.
-    nufft_type2 = _make_nufft(nub, θ, 2, n_modes, +1, B, tol64, T, modeord, nt2, uf2, ZS)
-    _nufft_setpts!(nufft_type2, θ, φ)
-    _nufft_finalize!(nufft_type2)
+    nufft_type2 = _make_nufft(nub, (θ, φ), 2, n_modes, +1, B, tol64, T, modeord, nt2, uf2, ZS)
     # Deferred unless the backend serves both directions from one plan, in which case it already
     # exists. A synthesis-only caller then holds no type-1 grid at all.
     nufft_type1 = _build_analysis(directions, nub, θ, φ, n_modes, B, tol64, T, modeord, nt1, uf1, ZS,
                                   nufft_type2)
-    # A scalar plan hands FINUFFT the colatitudes unchanged, so `θ_nufft` aliases `θ_nodes` and costs
+    # A scalar plan hands the NUFFT the colatitudes unchanged, so `θ_nufft` aliases `θ_nodes` and costs
     # no extra storage; a spin plan negates them and owns a separate array.
-    # How the narrower plan sets are stored is the backend's call, through `_nufft_size_pool` — whether
-    # a width can be added on demand depends on that backend's own typing. `_width_pair` is the builder
-    # it uses, so an override never has to reach back into a half-built plan.
-    _width_pair(k) = let
-        n2 = _make_nufft(nub, θ, 2, n_modes, +1, k, tol64, T, modeord, nt2, uf2, ZS)
-        n1 = _make_nufft(nub, θ, 1, n_modes, -1, k, tol64, T, modeord, nt1, uf1, ZS)
-        _nufft_setpts!(n2, θ, φ); _nufft_setpts!(n1, θ, φ)
-        _nufft_finalize!(n2); _nufft_finalize!(n1)
-        (k = Int(k), nufft_type2 = n2, nufft_type1 = n1)
-    end
     pool_recipe = _pool_recipe(nub, nt2, uf2, nt1, uf1)
     size_pool = _nufft_size_pool(nub, nufft_type2, nufft_type1,
-                                 pool_recipe.narrowable ? _pool_sizes(B) : Int[], _width_pair)
+                                 pool_recipe.narrowable ? _pool_sizes(B) : Int[])
 
     nodes = _node_set(Val(variable_npts), θ, φ, θ, θ_shift, fbuf, nufft_type2, nufft_type1)
 
@@ -985,17 +949,13 @@ function _set_nodes!(nd::VariableCountNodes, θ_nodes, φ_nodes)
     return _sync_θnufft!(nd)
 end
 
-# The narrower plan sets `_build_width!` caches own NUFFT plans of their own, so `close!` has to reach
-# them; a spin plan has no pool. Leaving them to their finalizers is not merely untidy: FINUFFT's
-# destructor calls back into Julia to take its FFTW lock, and acquiring a contended lock yields, which
-# a GC finalizer may not do ("task switch not allowed from inside gc finalizer"). Destroying eagerly
-# means the finalizer later finds an already-destroyed plan and returns without entering C.
+# The narrower plan sets `_build_width!` caches own NUFFT plans of their own, so `close!` reaches them;
+# a spin plan has no pool.
 _close_pool!(::AbstractNUSHTplan) = nothing
 _close_pool!(plan::NUSHTplan) = _close_pool!(plan.size_pool)
 
-# A `Vector` pool is emptied; any other shape is the backend's, so releasing an entry is delegated to
-# `_release_width!` and the container itself is left alone (a `Tuple` of slots cannot be emptied — its
-# slots are cleared instead, which is what makes `close!` idempotent there too).
+# A `Vector` pool is emptied; a `Tuple` of typed slots has its slots cleared, which keeps `close!`
+# idempotent there too.
 function _close_pool!(pool::AbstractVector)
     for e in pool
         _nufft_destroy!(e.nufft_type2)
@@ -1015,14 +975,8 @@ end
 """
     close!(plan::NUSHTplan)
 
-Eagerly free every FINUFFT guru plan the plan owns — its own pair and any narrower pair
-[`_build_width!`](@ref) cached for a compacted solve — rather than leaving them to their finalizers.
-Safe to call more than once (`finufft_destroy!` is idempotent).
-
-Eager destruction is not just tidiness. FINUFFT's destructor re-enters Julia to take its FFTW lock,
-and acquiring that lock when contended yields; a GC finalizer cannot yield, so a pooled plan collected
-under contention raises `task switch not allowed from inside gc finalizer`. A solve supplies both
-halves of that on its own: it grows the pool as it narrows the batch width, and it allocates.
+Free every NUFFT plan the plan owns: its own and any narrower set [`_build_width!`](@ref) cached for a
+compacted solve. No finalizer frees them. Safe to call more than once.
 """
 function close!(plan::AbstractNUSHTplan)
     _nufft_destroy!(_nufft2(plan))

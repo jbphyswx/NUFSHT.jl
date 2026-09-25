@@ -36,7 +36,7 @@ Test.@testset "Euclidean adjoint, zero-allocation, and batching" begin
         # backend that is itself allocation-free — FINUFFT is, NonuniformFFTs spawns tasks in its
         # deconvolution. NUFSHT's own stages are asserted zero on *both* in `test_allocs.jl`; here the
         # other backends are measured and reported so a regression in their share is still visible.
-        fp = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-12, nthreads = 1, nufft = NUFSHT.FINUFFTBackend())
+        fp = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-12, nthreads = 1, nufft = FTB.FINUFFTBackend())
         C = randn(Nθ, Nφ); f = randn(M); out = zeros(M)
         Cout = zeros(Nθ, Nφ); Aty = zeros(Nθ, Nφ)
         filt = NUFSHT.gaussian_from_scale(2000e3)
@@ -87,7 +87,8 @@ Test.@testset "Euclidean adjoint, zero-allocation, and batching" begin
 
     Test.@testset "spin: zero-allocation + batched == looped" begin
         s = 1
-        splan = NUFSHT.make_spin_plan(θ, φ, lmax, s; tol = 1e-12)
+        splan = NUFSHT.make_spin_plan(θ, φ, lmax, s; tol = 1e-12, nthreads = 1,
+                                      nufft = FTB.FINUFFTBackend())
         sf = zeros(ComplexF64, Nθ, Nφ)
         for ℓ in abs(s):lmax, m in -ℓ:ℓ
             sf[NUFSHT.spin_coeff_index(ℓ, m, lmax)] = randn(ComplexF64)
@@ -101,7 +102,8 @@ Test.@testset "Euclidean adjoint, zero-allocation, and batching" begin
         end
 
         B = 2
-        splanB = NUFSHT.make_spin_plan(θ, φ, lmax, s; tol = 1e-12, ntrans = B)
+        splanB = NUFSHT.make_spin_plan(θ, φ, lmax, s; tol = 1e-12, ntrans = B, nthreads = 1,
+                                       nufft = FTB.FINUFFTBackend())
         sfB = zeros(ComplexF64, Nθ, Nφ, B)
         for b in 1:B, ℓ in abs(s):lmax, m in -ℓ:ℓ
             sfB[NUFSHT.spin_coeff_index(ℓ, m, lmax), b] = randn(ComplexF64)

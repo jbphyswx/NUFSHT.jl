@@ -318,7 +318,7 @@ Test.@testset "set_nodes! moves every plan a solve narrows into" begin
     θa, φa = iid_points(M, 21)
     θb, φb = iid_points(M, 22)
     C_true = rand_coeffs(lmax, 23)
-    for nufft in (NUFSHT.FINUFFTBackend(), NUFSHT.NonuniformFFTsBackend())
+    for nufft in (FTB.FINUFFTBackend(), FTB.NonuniformFFTsBackend())
         p = NUFSHT.make_plan(Float64, θa, φa, lmax; ntrans = B, nufft = nufft, nthreads = 1)
         # Columns 2:B are zero, so they retire before the first iteration and the solve runs at
         # width 1 throughout.

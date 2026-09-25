@@ -71,15 +71,18 @@ Pkg.add(url="https://github.com/jbphyswx/NUFSHT.jl")
 Everything below is dependency-light by default — the accelerators are **package extensions**, loaded
 only when you load their trigger package, so a plain `using NUFSHT` never pulls in MPI/CUDA/etc.
 
-- **Persistent guru plans, zero allocation.** A plan builds its NUFFT plans once (points set once) and
+- **Persistent plans, zero allocation.** A plan builds its NUFFT plans once (points set once) and
   pre-allocates every buffer, so warmed-up `nusht_type2!`/`nusht_type1!` and the hundreds of solver
-  matvecs inside `nusht_solve!` allocate **nothing** in NUFSHT's own code and never re-plan. What the
-  backend does inside its own exec is its own: single-threaded FINUFFT adds nothing, its all-cores
-  default adds a small planner-lock allocation, and NonuniformFFTs spawns tasks in its deconvolution.
-- **`nthreads` is honoured or refused, never dropped.** FINUFFT takes any count; direct summation
-  splits the axis each direction writes and gives bit-identical output at any count; NonuniformFFTs
-  parallelises over Julia's threads and so reaches `1` (serial spreading) and `Threads.nthreads()`,
-  erroring on anything else. Use `nthreads = 1` when two runs must agree bit for bit.
+  matvecs inside `nusht_solve!` allocate **nothing** in NUFSHT's own code and never re-plan. The NUFFT
+  comes from [FlowTransformBindings](https://github.com/jbphyswx/FlowTransformBindings.jl): at
+  `nthreads = 1` a FINUFFT execution allocates nothing and a NonuniformFFTs one a fixed amount,
+  independent of the point count.
+- **`nthreads` is honoured or refused.** The default is `Threads.nthreads()`. FINUFFT takes any count;
+  direct summation splits the axis each direction writes and gives bit-identical output at any count;
+  NonuniformFFTs parallelises over Julia's threads and so reaches `1` (serial spreading) and
+  `Threads.nthreads()`, raising an error for any other count. Use `nthreads = 1` when two runs must agree
+  bit for bit: a multi-threaded type 1 (the adjoint) can differ in the last bit between runs on both
+  libraries, while type 2 and every single-threaded transform return the same bits.
 - **Batching (`ntrans = B`).** Transform `B` co-located fields (same points) in one call —
   `make_plan(θ, φ, lmax; ntrans = B)`, coefficients/fields carry a trailing batch axis. FFTW and
   FINUFFT parallelize *across the batch* internally (measured ~4.5× / ~2.8× on small transforms), which
@@ -113,21 +116,22 @@ only when you load their trigger package, so a plain `using NUFSHT` never pulls 
   double-precision slice buffer and everything else at the requested precision.
 - **Parallel extensions** (each keyed on its trigger package):
   - `using OhMyThreads` — thread-parallel over independent problems (one plan per task).
-  - `using Distributed` — farm independent problems across worker **processes** (`addprocs`); falls
-    back to serial when there are none.
+  - `using Distributed` — farm independent problems across worker **processes** (`addprocs`), each
+    worker at the thread count it was started with; serial when there are none.
   - `using MPI` — point-decomposition: partition the `M` points across ranks; `A` needs no
     communication, `A†` and the point-space norm are `Allreduce`d.
   > FastTransforms runs its S-step in OpenMP regions. NUFSHT loads FlowTransformBindings first, which
   > on macOS selects the OpenMP runtime's thread-local mode (`KMP_GTID_MODE=2`) before FastTransforms
   > loads it, so calls from Julia tasks are exact; in a session that loaded FastTransforms earlier with
-  > that variable unset, calls from tasks run on one OpenMP thread. The farms above run FastTransforms
-  > on one thread per task.
-- **GPU** (`using CUDA`, with `using KernelAbstractions`). The array-indexed steps (the spin Wigner-`d`
-  recurrence + bivariate-Fourier assembly, and the per-column solver primitives) are KA `@kernel`s —
-  **written once, run on any backend** — and the NUFFT is bound to cuFINUFFT. A device node set yields a
-  device-resident plan (buffers `similar` to the nodes). The device kernels are validated bit-for-bit
-  against the CPU path on `JLArrays`; end-to-end GPU parity (incl. cuFINUFFT) is in `test/gpu_cuda.jl`,
-  to run on NVIDIA hardware.
+  > that variable unset, calls from tasks run on one OpenMP thread. The OhMyThreads farm runs
+  > FastTransforms on one thread per task, a Distributed worker at its own thread count.
+- **GPU** (`using KernelAbstractions` with the device array package). The array-indexed steps (the spin
+  Wigner-`d` recurrence + bivariate-Fourier assembly, and the per-column solver primitives) are KA
+  `@kernel`s — **written once, run on any backend**. FlowTransformBindings builds the NUFFT on the nodes'
+  device: NonuniformFFTs on their KernelAbstractions backend, FINUFFT as cuFINUFFT on `CuArray` nodes
+  (`using CUDA, FINUFFT`). A device node set yields a device-resident plan (buffers `similar` to the
+  nodes). The device kernels are validated against the CPU path on `JLArrays`; end-to-end GPU parity is
+  in `test/gpu_cuda.jl`, to run on NVIDIA hardware.
 
 ## Algorithm
 
@@ -143,7 +147,7 @@ Type 1 (adjoint):     A† = S† · F† · N†
 |------|-----------|---------|---------|
 | **S** | SH coefficients → DFS bivariate Fourier series | `plan_sph2fourier` (P) | `P'` |
 | **F** | cos/sin basis → complex exponential mode array | `_assemble_modes!` | `_assemble_modes_adjoint!` |
-| **N** | NUFFT: evaluate the Fourier series at scattered points | guru type-2 plan | guru type-1 plan |
+| **N** | NUFFT: evaluate the Fourier series at scattered points | type-2 NUFFT | type-1 NUFFT |
 
 `plan_sph2fourier` already produces the DFS series — that is what it is for — so there is no
 equiangular grid in the pipeline and nothing is doubled. For order `m`, the θ basis is
@@ -159,18 +163,18 @@ the device S-engine.)
 The field element type is positional, as in `zeros(T, …)`, and it is a statement about the data:
 `make_plan(Float64, …)` asserts the field **values** are real, which makes the mode array Hermitian in
 `kθ`. Only the `kθ ≥ 0` half is then stored — on **every** backend, since halving the θ axis halves
-the deconvolution and the upsampled FFT and leaves the interpolation alone. On a backend with a
-genuine real-data transform (`NonuniformFFTsBackend`; FINUFFT has none) the strengths come back real
-too, so the spreading/interpolation halves as well:
+the deconvolution and the upsampled FFT and leaves the interpolation alone. Both NUFFT libraries take
+real strengths for it through FlowTransformBindings, so the spreading/interpolation halves as well:
 
 ```julia
-make_plan(Float64,    θ, φ, lmax)   # kθ ≥ 0, real strengths, if a real-capable backend is loaded
+make_plan(Float64,    θ, φ, lmax)   # kθ ≥ 0, real strengths
 make_plan(ComplexF64, θ, φ, lmax)   # full array
 ```
 
-Backend selection follows the field: with no `nufft` given, a real `FE` prefers a loaded real-capable
-backend, and a complex `FE` keeps the usual order. Naming a backend explicitly overrides that and is
-never swapped — `nufft = FINUFFTBackend()` on a real field still folds, but with complex strengths.
+With no `nufft` given, a plan takes the first loaded of NonuniformFFTs and FINUFFT, then direct
+summation. A backend named with `nufft = FlowTransformBindings.FINUFFTBackend()`,
+`FlowTransformBindings.NonuniformFFTsBackend()` or `SpectralBackends.DirectSumSpectralBackend()` is
+used as given.
 
 With a real-data transform the forward is free: writing the half and letting the complex-to-real
 transform imply the conjugate is exact, no weights. Its **transpose** is not — the embedding
@@ -178,9 +182,9 @@ transform imply the conjugate is exact, no weights. Its **transpose** is not —
 row (`{1, 2, 2, …}`, one at `kθ = 0` because that row is its own partner). There is no third case at
 the top: the θ axis has odd length `2·lmax+3` and so has no self-paired Nyquist row.
 
-Without a real-data transform the half-height transform is complex, so the conjugate half is not
-implied by anything and the same `{1, 2, 2, …}` is applied on the **forward** as well; a per-point
-phase undoes the centered row labelling, and the field is the real part of the result.
+Direct summation has no real-data transform. Its half-height transform is complex, so the conjugate
+half is implied by nothing and the same `{1, 2, 2, …}` is applied on the **forward** as well; a
+per-point phase undoes the centered row labelling, and the field is the real part of the result.
 
 ### Adjoint vs inverse
 
@@ -375,5 +379,7 @@ irreducibles but never whole ones, so fitting it gives a frame-dependent answer.
 - Belkner, S. et al. (2024): cunuSHT – GPU Accelerated Spherical Harmonic Transforms
   on Arbitrary Pixelizations. *arXiv:2406.14542*.
 - [FastSphericalHarmonics.jl](https://github.com/eschnett/FastSphericalHarmonics.jl)
+- [FlowTransformBindings.jl](https://github.com/jbphyswx/FlowTransformBindings.jl)
 - [FINUFFT.jl](https://github.com/ludvigak/FINUFFT.jl)
+- [NonuniformFFTs.jl](https://github.com/jipolanco/NonuniformFFTs.jl)
 - [FastTransforms.jl](https://github.com/JuliaApproximation/FastTransforms.jl)
