@@ -657,7 +657,7 @@ end
 **Exact inversion:** solve `min ‖A c − f‖` for coefficients `C` by LSMR on the Golub–Kahan
 bidiagonalization of `A`. Batched (`B > 1`) runs the columns as independent single-column solves.
 
-Returns `(C, iters, rel_res, converged)` with `rel_res = max_k ‖A†r_k‖/‖A†f_k‖` and
+Returns `(;C, iterations = iters, residual = rel_res, converged = converged)` with `rel_res = max_k ‖A†r_k‖/‖A†f_k‖` and
 `converged = rel_res < rtol`; `ws.colres` carries the same residual per column. `rel_res` is LSMR's
 own recurrence value for `‖A†r‖`, floored at `eps(T)` since a relative residual is not resolvable
 below that — so an `rtol` under machine precision never reports convergence.
@@ -841,7 +841,7 @@ function _lsmr!(
         ws.colres[ws.perm[s]] = ws.rel[s]
     end
     worst = maximum(ws.colres)
-    return C, iters, worst, worst < rtol
+    return (; C = C, iterations = iters, residual = worst, converged = worst < rtol)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────

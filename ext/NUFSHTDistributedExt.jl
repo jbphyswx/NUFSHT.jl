@@ -238,7 +238,7 @@ function _part_solve(f, f_block, inbox, outbox, k::Int, kwargs)
     end
     put!(inbox, (k, nothing))
     _, iters, rel, converged = result
-    return (k == 1 ? _to_host(C) : nothing, iters, rel, converged)
+    return (C = k == 1 ? _to_host(C) : nothing, iterations = iters, residual = rel, converged = converged)
 end
 
 # Sum each round of the workers' parts in worker order and return the total to every worker, until they
@@ -265,7 +265,7 @@ function _coordinate(inbox, outboxes, ::Type{T}, ::Type{CE}, nw::Int) where {T,C
 end
 
 """
-    nusht_solve!(C, f, plan::DistributedNUSHTplan; maxiter, rtol, conlim, verbose) -> (C, iters, rel_res, converged)
+    nusht_solve!(C, f, plan::DistributedNUSHTplan; maxiter, rtol, conlim, verbose) -> (; C, iterations = iters, residual = rel_res, converged = converged)
 
 The least-squares fit over every worker's points: [`nusht_solve!`](@ref)'s recurrence on every worker at
 once, the sums over points added across the workers. `f` holds every point, in the plan's order.
@@ -284,7 +284,7 @@ function NUFSHT.nusht_solve!(C, f, p::DistributedNUSHTplan{FE,CE}; ws::Nothing =
     foreach(wait, solves)
     Cw, iters, rel, converged = fetch(solves[1])
     copyto!(C, Cw)
-    return C, iters, rel, converged
+    return (; C = C, iterations = iters, residual = rel, converged = converged)
 end
 
 end # module NUFSHTDistributedExt
