@@ -34,17 +34,6 @@ NUFSHT.FixedCountNodes
 NUFSHT.VariableCountNodes
 ```
 
-### Plan tuning
-
-How hard plan construction searches for the library settings the problem does not fix.
-
-```@docs
-NUFSHT.AbstractPlanTuning
-NUFSHT.NoTuning
-NUFSHT.AutoTuning
-NUFSHT.ThoroughTuning
-```
-
 ## Core transforms
 
 ```@docs

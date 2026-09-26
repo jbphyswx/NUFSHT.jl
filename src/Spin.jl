@@ -180,15 +180,13 @@ general, hence the default. A real `FE` asserts the field VALUES are real, which
 conjugate-symmetric and halves both the Δ-contraction and the NUFFT's θ axis — correct only if the
 coefficients satisfy the reality condition.
 
-`tuning` ([`AbstractPlanTuning`](@ref)) and the `nthreads` / `upsampfac` overrides behave as in
-[`make_plan`](@ref); there are no FastTransforms plans here, so only the NUFFT settings are searched.
+`nthreads` and `upsampfac` are as in [`make_plan`](@ref).
 """
 make_spin_plan(θ_nodes, φ_nodes, lmax::Integer, s::Integer; kwargs...) =
     make_spin_plan(Complex{float(eltype(θ_nodes))}, θ_nodes, φ_nodes, lmax, s; kwargs...)
 
 function make_spin_plan(::Type{FE}, θ_nodes, φ_nodes, lmax::Integer, s::Integer;
                         tol = 1e-10, ntrans::Integer = 1,
-                        tuning::AbstractPlanTuning = NoTuning(),
                         nufft::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
                         variable_npts::Bool = false,
                         directions::AbstractPlanDirections = SynthesisAndAnalysis(),
@@ -242,14 +240,12 @@ function make_spin_plan(::Type{FE}, θ_nodes, φ_nodes, lmax::Integer, s::Intege
     # at the stored size.
     n_modes = Int64[r2c ? L : Lθ, L]
     _warn_if_directsum(nufft, nub, M, Lθ * L)
-    nt2, uf2 = _tune_nufft(nub, negθ, φ, n_modes, 2, +1, B, T, tol64, 0, tuning, ZS)
-    nt1, uf1 = _tune_nufft(nub, negθ, φ, n_modes, 1, -1, B, T, tol64, 0, tuning, ZS)
-    isnothing(nthreads) || (nt2 = nt1 = Int(nthreads))
-    isnothing(upsampfac) || (uf2 = uf1 = Float64(upsampfac))
+    nt = nthreads === nothing ? 0 : Int(nthreads)
+    uf = upsampfac === nothing ? 0.0 : Float64(upsampfac)
     # See `_nufft_share_directions`: where the backend's plan carries no direction, one object serves
     # both and the second is a handle onto it, already pointed at the same nodes.
-    nufft_type2 = _make_nufft(nub, (negθ, φ), 2, n_modes, +1, B, tol64, T, 0, nt2, uf2, ZS)
-    nufft_type1 = _build_analysis(directions, nub, negθ, φ, n_modes, B, tol64, T, 0, nt1, uf1,
+    nufft_type2 = _make_nufft(nub, (negθ, φ), 2, n_modes, +1, B, tol64, T, 0, nt, uf, ZS)
+    nufft_type1 = _build_analysis(directions, nub, negθ, φ, n_modes, B, tol64, T, 0, nt, uf,
                                   ZS, nufft_type2)
     # `negθ` is this plan's `θ_nufft`, a separate array: the NUFFT is handed the negated colatitudes,
     # which absorbs the e^{-im'θ} factor.

@@ -1049,7 +1049,7 @@ nusht_solve_spin!(sfs, fs, plans::AbstractVector, b::ComputationalBackends.Abstr
 # Takes node sets rather than plans, so it serves backends a plan cannot reach — see the header note.
 
 """
-    nusht_type2(θs, φs, Cs, lmax, backend = AutoBackend(); tol, ntrans, tuning) -> fs
+    nusht_type2(θs, φs, Cs, lmax, backend = AutoBackend(); tol, ntrans, …) -> fs
 
 Synthesize `N` independent problems given their node sets: for each `i` a plan is built from
 `(θs[i], φs[i])`, `Cs[i]` is evaluated, and the field is returned as `fs[i]`.

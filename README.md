@@ -109,8 +109,7 @@ only when you load their trigger package, so a plain `using NUFSHT` never pulls 
   `upsampfac` (σ) sizes. `tol`, σ and the kernel half-support are exchangeable by construction, so
   lowering σ meets the same tolerance on a smaller grid and pays for it in spreading: `σ = 1.25`
   roughly halves the NUFFT's memory against the default `2.0` and costs synthesis ~1.1-1.5×, while
-  making analysis slightly *faster*. Use it when a dataset does not otherwise fit; `AutoTuning` times
-  the candidates and picks per plan.
+  making analysis slightly *faster*. Use it when a dataset does not otherwise fit.
 - **Mixed precision.** `Float32` and `ComplexF32` are supported. The sphere plans FastTransforms
   provides are `Float64`/`ComplexF64` only, so single-precision plans run their S-step through a
   double-precision slice buffer and everything else at the requested precision.

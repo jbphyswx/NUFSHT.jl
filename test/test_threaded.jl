@@ -118,3 +118,20 @@ Test.@testset "threaded sphere loops agree with serial" begin
     Test.@test maximum(abs, fT .- fS) / maximum(abs, fS) < 1e-10
     foreach(NUFSHT.close!, (pS, pT, pA))
 end
+
+# FastTransforms plans on the libfftw3 FFTW.jl loads, so the sphere plans are built under FFTW.jl's own
+# planner lock, and a plan build leaves the planner thread count as it found it.
+Test.@testset "sphere plans are built on FFTW.jl's planner and leave its count as found" begin
+    FFTW = NUFSHT.FFTW
+    prev = FFTW.get_num_threads()
+    NUFSHT.FastTransforms.ft_fftw_plan_with_nthreads(5)
+    Test.@test FFTW.get_num_threads() == 5                 # one planner count, both libraries
+    FFTW.set_num_threads(3)
+    Random.seed!(5)
+    θ = acos.(2 .* rand(200) .- 1); φ = 2π .* rand(200)
+    p = NUFSHT.make_plan(Float64, θ, φ, 8; ntrans = 2)
+    Test.@test FFTW.get_num_threads() == 3
+    Test.@test !islocked(FFTW.fftwlock)
+    NUFSHT.close!(p)
+    FFTW.set_num_threads(prev)
+end
