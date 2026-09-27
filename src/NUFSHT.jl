@@ -216,12 +216,10 @@ end
 @inline _pfx(A::AbstractArray{<:Any,3}, k::Integer) = view(A, :, :, 1:k)
 @inline _pfx(A::AbstractMatrix, k::Integer) = view(A, :, 1:k)
 
-# The reduced-width plan pair for `k`, built and stored on a miss (see `_pool_lookup!`). Kept out of
-# the full-width path entirely: a backend that carries the transform count in its plan's *type* — which
-# is why [`_width_polymorphic`](@ref) exists — has no one type spanning widths, so a binding that could
-# hold either the full-width handle or a narrowed one is a `Union`, and a `Union` of a large immutable
-# is boxed on the heap once per transform. Each width is therefore only ever read where its own type is
-# concrete, which is inside the branch that selected it.
+# The reduced-width plan pair for `k`, built and stored on a miss (see `_pool_lookup!`). A backend
+# whose plan type carries the transform count (`_width_polymorphic` false) has one plan type per width,
+# and a binding holding either width is a `Union` that boxes a large immutable on every transform, so
+# each width is read only inside the branch that selected it, where its type is concrete.
 @inline _with_narrowed(f::F, plan::NUSHTplan, k::Integer) where {F} =
     _with_pool_entry(f, plan.size_pool, k, kk -> _build_width!(plan, kk))
 
@@ -293,9 +291,8 @@ end
     nusht_type1!(C, f, plan)
 
 **Type 1 (adjoint):** given field values `f` at the `M` scattered points, apply `A†` and write the
-result to `C`. This is the exact Euclidean adjoint of [`nusht_type2!`](@ref) — the transpose, not an
-inverse — so `A†A` is symmetric positive definite and usable by an iterative solver. Use
-[`nusht_solve!`](@ref) to invert.
+result to `C`. This is the exact Euclidean adjoint of [`nusht_type2!`](@ref), its transpose, so `A†A`
+is Hermitian positive semidefinite and usable by an iterative solver; [`nusht_solve!`](@ref) inverts.
 
 For exact analysis of a field already sampled on the Clenshaw-Curtis grid, use
 `FastSphericalHarmonics.sph_transform`: that is quadrature, needs no scattered-point machinery, and
@@ -324,9 +321,8 @@ function _nusht_true_adjoint!(C, f, plan::NUSHTplan{T}, k::Integer = plan.B,
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Filtering
+# Synthesis of filtered coefficients
 # ─────────────────────────────────────────────────────────────────────────────
-# `nusht_filter!` and `nusht_filter_renorm!` fit coefficients first, and follow the solver.
 
 """
     nusht_synthesize!(f_out, C, filter, plan) -> f_out
@@ -510,7 +506,7 @@ function _solve!(C, f, op, ws::FTB.LSMRWorkspace{T}; maxiter::Integer = 500, rto
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Filtering that fits coefficients first (see the note above `nusht_synthesize!`)
+# Filtering scattered data: a fit, then the synthesis of the filtered coefficients
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
@@ -521,10 +517,9 @@ Apply a spectral filter to `f_in` at the scattered points, writing to `f_out` (b
 `kwargs` (`rtol`, `maxiter`, …) go to the solve. Uses the plan's coefficient scratch, and is
 allocation-free when a `ws` is supplied.
 
-The fit is what makes this a filter. `A H A†` — the adjoint in place of a fit — is a smoothing
-operator, not `A H A⁺`: at scattered points `A†` is the transpose of the synthesis, not its inverse,
-and only on a quadrature grid do the two coincide. So filtering scattered data is iterative; hold a
-`ws` and reuse it across calls.
+The filter is `A H A⁺`, with `A⁺` the least-squares fit. At scattered points the adjoint `A†` is the
+transpose of the synthesis, and `A H A†` is a smoothing; the two agree only on a quadrature grid. The
+fit is iterative, so hold a `ws` and reuse it across calls.
 """
 function nusht_filter!(f_out, f_in, filter, plan::NUSHTplan;
                        ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan), kwargs...)
@@ -546,8 +541,8 @@ function nusht_filter_renorm!(f_out, mask, filter, plan::NUSHTplan{T};
                               mask_filt = similar(f_out),
                               ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan),
                               C_mask = nothing) where {T}
-    # `C_mask` lets a multi-scale caller fit the scale-independent mask once and pass its coefficients
-    # to every call; without it the mask is fitted here, which is the expensive half.
+    # `C_mask` holds the mask's coefficients, which do not depend on the filter's scale, so a multi-scale
+    # caller fits them once; `nothing` fits the mask here.
     if C_mask === nothing
         scratch = _filter_scratch(plan)
         nusht_solve!(scratch, mask, plan; ws = ws)
@@ -711,7 +706,8 @@ nusht_solve_spin!(sfs, fs, plans::AbstractVector, b::ComputationalBackends.Abstr
     _backend_unavailable(b, "a collection of spin solves")
 
 # ── Node-set form: build the plans internally ─────────────────────────────────
-# Takes node sets rather than plans, so it serves backends a plan cannot reach — see the header note.
+# Each problem's plan is built where it runs, so a `DistributedBackend` worker builds its own: a plan
+# holding C pointers cannot be serialized.
 
 """
     nusht_type2(θs, φs, Cs, lmax, backend = AutoBackend(); tol, ntrans, …) -> fs
@@ -719,9 +715,8 @@ nusht_solve_spin!(sfs, fs, plans::AbstractVector, b::ComputationalBackends.Abstr
 Synthesize `N` independent problems given their node sets: for each `i` a plan is built from
 `(θs[i], φs[i])`, `Cs[i]` is evaluated, and the field is returned as `fs[i]`.
 
-Use this instead of the plan-collection [`nusht_type2!`](@ref) when the backend is a
-`DistributedBackend`. When you already hold plans and are on a local backend, prefer the in-place
-form — it reuses them.
+A `DistributedBackend` takes this form, each worker building its own plans. On a local backend with the
+plans already built, the plan-collection [`nusht_type2!`](@ref) reuses them.
 """
 nusht_type2(θs, φs, Cs, lmax; kwargs...) = nusht_type2(θs, φs, Cs, lmax, ComputationalBackends.AutoBackend(); kwargs...)
 nusht_type2(θs, φs, Cs, lmax, b::ComputationalBackends.AbstractAutoBackend; kwargs...) =
