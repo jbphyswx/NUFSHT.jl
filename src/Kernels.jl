@@ -1,14 +1,9 @@
-"""
-    Kernels.jl — Spectral filter transfer functions H(ℓ) for spherical harmonic filtering.
-
-A spectral filter on the sphere multiplies each harmonic coefficient c_ℓm by H(ℓ),
-where ℓ is the angular degree. The physical-space interpretation is convolution with
-a kernel whose Legendre spectrum is H(ℓ).
-
-References:
-- Aluie et al. (2018): Coarse-graining as a measurement operator on fields over the sphere
-- Lilly & Gascard (2006): Wavelet ridge diagnosis of time-varying elliptical signals
-"""
+# Spectral filter transfer functions H(ℓ) for spherical harmonic filtering. A spectral filter on the
+# sphere multiplies each harmonic coefficient c_ℓm by H(ℓ), ℓ the angular degree: a convolution with a
+# kernel whose Legendre spectrum is H(ℓ).
+#
+# References: Aluie et al. (2018), coarse-graining as a measurement operator on fields over the
+# sphere; Lilly & Gascard (2006), wavelet ridge diagnosis of time-varying elliptical signals.
 
 export TopHatTransfer, GaussianTransfer, SharpSpectralTransfer
 export kernel_transfer, cutoff_degree, gaussian_from_scale
@@ -59,9 +54,8 @@ end
 """
     gaussian_from_scale(scale_m, R_m=6.371e6)
 
-Construct a GaussianTransfer from a physical filter scale in meters.
-Use this instead of `GaussianTransfer(scale_m)` to avoid ambiguity
-with the struct constructor which takes σ² directly.
+Construct a GaussianTransfer from a physical filter scale in meters, with `σ = scale_m / R_m`;
+`GaussianTransfer(σ²)` takes the squared dimensionless width itself.
 """
 function gaussian_from_scale(scale_m, R_m=6.371e6)
     σ = Float64(scale_m) / Float64(R_m)
@@ -90,8 +84,8 @@ function kernel_transfer(f::GaussianTransfer, ℓ)
 end
 
 # Degree held by scalar slot `(i, j)`. Inverting `sph_mode(ℓ,m) = (ℓ-|m|+1, 2|m|+(m≥0))` gives
-# `|m| = j÷2`, `ℓ = i + |m| - 1`. Every slot carries a real mode — the array is square and invertible,
-# so rows past `ℓ = lmax` hold degrees `lmax < ℓ ≤ lmax+|m|` rather than padding.
+# `|m| = j÷2`, `ℓ = i + |m| - 1`. Every slot carries a mode: the array is square and invertible, and
+# rows past `ℓ = lmax` hold degrees `lmax < ℓ ≤ lmax+|m|`.
 @inline _slot_degree(i::Int, j::Int) = i + (j ÷ 2) - 1
 
 """
@@ -104,9 +98,8 @@ across the batch dimension).
 function apply_transfer!(C, filter, lmax)
     RT = real(eltype(C))
     n1, n2 = size(C, 1), size(C, 2)
-    # Sweep by degree, not by slot: `_slot_degree(i,j) = ℓ` inverts to `i = ℓ - j÷2 + 1`, so each
-    # degree is one diagonal and `kernel_transfer` is evaluated `2lmax+1` times rather than once per
-    # slot. `2lmax` is the largest degree the array holds. No table, so no allocation.
+    # By degree: `_slot_degree(i, j) = ℓ` inverts to `i = ℓ - j÷2 + 1`, so each degree is one diagonal,
+    # and `kernel_transfer` runs once per degree up to `2lmax`, the largest the array holds.
     @inbounds for ℓ in 0:(2lmax)
         h = RT(kernel_transfer(filter, ℓ))
         for j in 1:n2

@@ -31,10 +31,8 @@ function NUFSHT._backend_plan(::Type{FE}, θ, φ, lmax, b::ComputationalBackends
     return NUFSHT.make_plan(FE, on_device(θ), on_device(φ), lmax; kwargs...)
 end
 
-# GPU kernel launches are asynchronous on real device backends (CUDA/ROCm/…), so results must be
-# synchronized before the host reads them; JLArrays' reference backend is synchronous and defines no
-# `synchronize`, so guard the call. (For chained on-device ops this is conservative; it can be relaxed
-# once validated on real hardware.)
+# Kernel launches are asynchronous on device backends (CUDA/ROCm/…), so results are synchronized before
+# the host reads them; JLArrays' reference backend is synchronous and defines no `synchronize`.
 @inline function _sync(backend)
     applicable(KernelAbstractions.synchronize, backend) && KernelAbstractions.synchronize(backend)
     return nothing
@@ -337,11 +335,9 @@ function NUFSHT._add_field!(f, fbuf::GPUArraysCore.AbstractGPUArray,       # f[:
 end
 
 # ── Device spectral filter (× H(ℓ)) ─────────────────────────────────────────────
-# `C` is `(lmax+1, 2lmax+1, B)`; build the host transfer matrix once, move it to `C`'s backend, and
-# broadcast-multiply across the batch (the `src` version is a scalar mode loop).
-# `nusht_filter!` applies this once per field, and the transfer matrix depends only on
-# (filter, lmax, element type, array type) — so build it, upload it and reshape it once rather than
-# allocating a host matrix plus a device copy on every call.
+# `C` is `(lmax+1, 2lmax+1, B)`, multiplied by the transfer matrix broadcast across the batch. The
+# matrix depends only on the filter, `lmax`, the element type and the array type, so each is built and
+# moved to the device once and kept here.
 const _TRANSFER_CACHE = Dict{Tuple{Any,Int,DataType,DataType},Any}()
 const _TRANSFER_LOCK = ReentrantLock()
 
@@ -361,8 +357,8 @@ function NUFSHT.apply_transfer!(C::GPUArraysCore.AbstractGPUArray, filter, lmax)
     return C
 end
 
-# A precomputed WignerTable is a host array read elementwise; contracting against it from a device
-# array would fall back to scalar indexing. Refuse explicitly rather than silently crawling.
+# A precomputed WignerTable is a host array read elementwise, which a device contraction cannot read,
+# so a device plan refuses one.
 _no_device_table() = throw(ArgumentError(
     "a device spin plan cannot use a precomputed WignerTable; build it with wigner_table = nothing " *
     "so the Δ planes are generated on device by the recurrence kernels."))

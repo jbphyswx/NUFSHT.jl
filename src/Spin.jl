@@ -1,29 +1,21 @@
-"""
-    Spin.jl — Spin-weighted (spin-s) non-uniform spherical harmonic transforms.
-
-Self-contained spin-weighted synthesis/analysis at arbitrary scattered points, built from the
-Wigner-d "Fourier factorization" + a 2-D nonuniform FFT — independent of any spin convention in
-FastTransforms.
-
-A spin-`s` band-limited field is
-
-    f(θ,φ) = Σ_{ℓ,m} ₛf_{ℓm} ₛY_{ℓm}(θ,φ),   ₛY_{ℓm}(θ,φ) = N_ℓ d^ℓ_{m,−s}(θ) e^{imφ},
-
-with `N_ℓ = √((2ℓ+1)/4π)` and `d^ℓ` the Wigner small-d. Using
-`d^ℓ_{mn}(θ) = i^{m−n} Σ_{m'} Δ^ℓ_{m'm} Δ^ℓ_{m'n} e^{−im'θ}` (`Δ^ℓ ≡ d^ℓ(π/2)`), the field is a
-bivariate Fourier series
-
-    f(θ,φ) = Σ_{m',m} G_{m'm} e^{−im'θ} e^{imφ},   G_{m'm} = i^{m+s} Σ_ℓ ₛf_{ℓm} N_ℓ Δ^ℓ_{m'm} Δ^ℓ_{m',−s},
-
-evaluated at scattered points by one 2-D NUFFT. The `e^{−im'θ}` factor is absorbed by feeding the
-NUFFT the negated colatitudes `−θ` with `iflag = +1`, so the centered mode array `G` maps directly to
-the NUFFT modes. Analysis is the exact Euclidean adjoint (type 1 at `−θ`, `iflag = −1`, and the
-transpose Δ-contraction); `nusht_solve_spin!` inverts by LSMR on the bidiagonalization of `A`. As for
-the scalar plan, the NUFFT plans are built once over the nodes, so the solver's matvecs never re-plan.
-
-Coefficients use a dense `(lmax+1) × (2lmax+1)` layout: `sf[ℓ+1, m+lmax+1]`. Spin `s = ±1` is the
-tangent-vector case (`U = u_θ + i u_φ`), enabling vector/Helmholtz operations at scattered points.
-"""
+# Spin-weighted (spin-s) non-uniform spherical harmonic transforms at arbitrary scattered points, from
+# the Wigner-d Fourier factorization and a 2-D nonuniform FFT. A spin-`s` band-limited field is
+#
+#     f(θ,φ) = Σ_{ℓ,m} ₛf_{ℓm} ₛY_{ℓm}(θ,φ),   ₛY_{ℓm}(θ,φ) = N_ℓ d^ℓ_{m,−s}(θ) e^{imφ},
+#
+# with `N_ℓ = √((2ℓ+1)/4π)` and `d^ℓ` the Wigner small-d. With
+# `d^ℓ_{mn}(θ) = i^{m−n} Σ_{m'} Δ^ℓ_{m'm} Δ^ℓ_{m'n} e^{−im'θ}` (`Δ^ℓ ≡ d^ℓ(π/2)`) the field is the
+# bivariate Fourier series
+#
+#     f(θ,φ) = Σ_{m',m} G_{m'm} e^{−im'θ} e^{imφ},   G_{m'm} = i^{m+s} Σ_ℓ ₛf_{ℓm} N_ℓ Δ^ℓ_{m'm} Δ^ℓ_{m',−s},
+#
+# which one 2-D NUFFT evaluates at the points. The NUFFT is handed the negated colatitudes `−θ` with
+# `iflag = +1`, which absorbs `e^{−im'θ}`, so the centered mode array `G` is the NUFFT's modes. Analysis
+# is the exact Euclidean adjoint (type 1 at `−θ`, `iflag = −1`, and the transpose Δ-contraction), and
+# `nusht_solve_spin!` inverts by LSMR.
+#
+# Coefficients are a dense `(lmax+1) × (2lmax+1)` array, `sf[ℓ+1, m+lmax+1]`. Spin `s = ±1` is the
+# tangent-vector case, `U = u_θ + i u_φ`.
 
 using LinearAlgebra: LinearAlgebra
 using SpecialFunctions: loggamma
@@ -55,9 +47,8 @@ end
 
 @inline _Nℓ(ℓ) = sqrt((2ℓ + 1) / (4π))
 
-# i^k for integer k ∈ ℤ, by its period-4 cycle 1, i, −1, −i. `Complex^Integer` goes through
-# exp(k·log z) and costs ~56 ns; this appears once per (degree, order) in the spin contraction, and is
-# also the form the GPU kernels need (no generic complex power on device).
+# i^k for integer k, by its period-4 cycle 1, i, −1, −i: exact, and a form a device kernel evaluates
+# (`Complex^Integer` goes through `exp(k log z)`).
 @inline function _im_pow(::Type{CT}, k::Integer) where {CT}
     r = mod(k, 4)
     return r == 0 ? CT(1, 0) : r == 1 ? CT(0, 1) : r == 2 ? CT(-1, 0) : CT(0, -1)
@@ -87,14 +78,10 @@ combination of the Wigner-d(π/2) planes that the spin contraction reads. It dep
 `(lmax, s, T)`, so one table is **read-only and shareable**: hand the same one to any number of plans,
 on any number of threads.
 
-Without a table the whole `O(lmax³)` Trapani–Navaza sweep is regenerated on every transform — twice
-per solver iteration in [`nusht_solve_spin!`](@ref), where the planes are identical every time. With one,
-that sweep is paid once and the contraction additionally runs `ℓ`-innermost, keeping each output
-column of `G` hot across the degree sum instead of re-streaming `G` once per degree.
-
-The cost is `O(lmax³)` memory — roughly 2.8 MiB at `lmax = 64`, 22 MiB at 128, 175 MiB at 256 and
-1.4 GiB at 512 in `Float64`. These are the same two modes s2fft exposes as "precompute" and "on the
-fly"; choose per problem rather than globally.
+Without a table a transform regenerates the planes by the `O(lmax³)` Trapani–Navaza sweep, twice per
+iteration of [`nusht_solve_spin!`](@ref). With one the sweep runs once, and the contraction runs
+`ℓ`-innermost, keeping each output column of `G` in cache across the degree sum. The table holds
+`Σ_ℓ (2ℓ+1)² ≈ (4/3) lmax³` values: 2.8 MiB at `lmax = 64`, 175 MiB at 256 in `Float64`.
 
     tbl = WignerTable(64, 1)
     plans = [make_spin_plan(θs[i], φs[i], 64, 1; wigner_table = tbl) for i in eachindex(θs)]
@@ -147,13 +134,13 @@ end
 
 Plan for spin-`s` non-uniform spherical harmonic transforms at `M` scattered points up to degree
 `lmax`, transforming `B` co-located fields per call. Owns persistent NUFFT plans (type 2 `iflag=+1`,
-type 1 `iflag=−1`) over the nodes `(−θ, φ)`. The Wigner `Δ^ℓ = d^ℓ(π/2)` planes
-are generated **on the fly** by the Trapani–Navaza recurrence into two reused `(2lmax+1)²` buffers
-(`dl_curr`/`dl_prev`), so the plan is **O(lmax²) memory**, and the recurrence is numerically stable to
-`ℓ ≈ 1024` (the explicit-factorial `wigner_d` sum it replaced loses all accuracy above `ℓ ≈ 40`).
+type 1 `iflag=−1`) over the nodes `(−θ, φ)`. The Wigner `Δ^ℓ = d^ℓ(π/2)` planes are generated by the
+Trapani–Navaza recurrence into two reused `(2lmax+1)²` buffers (`dl_curr`/`dl_prev`), so the plan holds
+O(lmax²) memory; the recurrence is numerically stable to `ℓ ≈ 1024`, where the explicit sum of
+[`wigner_d`](@ref) loses its accuracy above `ℓ ≈ 40`.
 
-Pass a [`WignerTable`](@ref) as `wigner_table` to precompute those planes instead: faster per
-transform, at O(lmax³) memory.
+A [`WignerTable`](@ref) passed as `wigner_table` precomputes the planes: faster per transform, at
+O(lmax³) memory.
 """
 struct SpinNUSHTplan{T<:AbstractFloat, MT<:AbstractMatrix{T}, CT3<:AbstractArray{Complex{T},3},
                      ND<:AbstractNodeSet, W<:Union{Nothing,WignerTable}, FT} <: AbstractNUSHTplan
@@ -177,7 +164,7 @@ end
 Build a `SpinNUSHTplan`. Colatitudes `θ ∈ [0,π]`, longitudes `φ ∈ [0,2π)`.
 
 `FE` is the field element type, positional as in [`make_plan`](@ref); a spin field is complex in
-general, hence the default. A real `FE` asserts the field VALUES are real, which makes the mode array
+general, hence the default. A real `FE` asserts the field's values are real, which makes the mode array
 conjugate-symmetric and halves both the Δ-contraction and the NUFFT's θ axis — correct only if the
 coefficients satisfy the reality condition.
 
@@ -222,8 +209,8 @@ function make_spin_plan(::Type{FE}, θ_nodes, φ_nodes, lmax::Integer, s::Intege
     φ = T.(φ_nodes)
     negθ = -θ                                  # absorbs the e^{-im'θ} factor into iflag=+1
 
-    # Buffers are shaped like the nodes, so device nodes ⇒ device-resident plan. Reused Wigner-d(π/2)
-    # recurrence buffers are O(lmax²), not the O(lmax³) of a dense per-ℓ store.
+    # Buffers are allocated like the nodes, so device nodes give a device-resident plan; the two
+    # Wigner-d(π/2) recurrence buffers are O(lmax²).
     dl_curr = _zeros_like(θ, T, L, L)
     dl_prev = _zeros_like(θ, T, L, L)
     G    = _zeros_like(θ, Complex{T}, Lθ, L, B)
@@ -259,8 +246,6 @@ function make_spin_plan(::Type{FE}, θ_nodes, φ_nodes, lmax::Integer, s::Intege
         Base.RefValue{Union{Nothing,typeof(G)}}(nothing))
 end
 
-# Safe one-line `show` (see the NUSHTplan note): avoid recursing into stored FFTW/NUFFT plan
-# pointers, whose printers can segfault on an invalidated C state.
 @inline _shift_offset(plan::SpinNUSHTplan{T}) where {T} = T(size(plan.G, 1) ÷ 2)
 _copy_out!(f, fbuf, plan::SpinNUSHTplan) = _copy_out!(f, fbuf, _θshift(plan))
 _copy_out!(f, fbuf, ::Nothing) = _copy_field!(f, fbuf)
@@ -271,11 +256,10 @@ _copy_out!(f, fbuf, ::AbstractVector) = _copy_real!(f, fbuf)
 
 Which Hermitian treatment a spin plan's mode array needs. A complex field has no symmetry to exploit
 ([`FullModes`](@ref)); a real one stores only `m' ≥ 0` either way, and the two folded kinds differ in
-**who supplies the absent `m' < 0` half** — which is what fixes the row indexing and the weights.
+who supplies the absent `m' < 0` half, which fixes the row indexing and the weights.
 
-The kind is read off the plan rather than stored: only a half-height *complex* transform needs a
-`θ_shift`, and only a real-data transform has real strengths, so the pair `(θ_shift, fbuf)` names all
-three without a further plan parameter.
+The kind is read off the plan: only a half-height complex transform has a `θ_shift`, and only a
+real-data transform has real strengths, so the pair `(θ_shift, fbuf)` names all three.
 """
 struct FullModes end
 struct FoldedComplex end
@@ -304,15 +288,15 @@ _fold_weights!(G, ::SpinNUSHTplan, ::Union{FullModes,FoldedReal}) = G
 function _fold_weights!(G, plan::SpinNUSHTplan{T}, ::FoldedComplex) where {T}
     lmax = plan.lmax
     G .*= T(2)
-    # Views, not element writes: a GPU array rejects scalar indexing.
+    # Views, which a GPU array takes; it rejects scalar indexing.
     @views fill!(G[1, 1:lmax, :], zero(eltype(G)))
     @views G[1, lmax + 1, :] ./= T(2)
     return G
 end
 
 # The transpose of the forward. `FoldedComplex` is self-adjoint in its weights, so it repeats them.
-# `FoldedReal` has no forward weight, but its embedding `G[-m',-m] = conj(G[m',m])` is R-linear and not
-# C-linear, so the transpose picks up a factor 2 on every `m' > 0` row; the `m' = 0` row is stored whole
+# `FoldedReal` has no forward weight, but its embedding `G[-m',-m] = conj(G[m',m])` is linear over the
+# reals only, so its transpose takes a factor 2 on every `m' > 0` row; the `m' = 0` row is stored whole
 # and is its own conjugate, so it keeps weight 1.
 _fold_weights_adjoint!(G, plan::SpinNUSHTplan) = _fold_weights_adjoint!(G, plan, _fold_kind(plan))
 _fold_weights_adjoint!(G, ::SpinNUSHTplan, ::FullModes) = G
@@ -333,15 +317,14 @@ Base.show(io::IO, plan::SpinNUSHTplan{T}) where {T} =
     _wigner_d_halfpi_step!(dl, dlp, ℓ, off) -> dl
 
 Overwrite `dl` with the degree-`ℓ` Wigner-d plane at β = π/2, from the degree-`(ℓ-1)` plane `dlp`, via
-the **Trapani–Navaza** recurrence (Trapani & Navaza 2006; ssht `ssht_dl.c`; s2fft `trapani.py`). Both
-`dl`/`dl_prev` are `(2lmax+1)²`, `off = lmax+1`. O(ℓ²) work, one previous plane — so a full sweep
-ℓ = 0…lmax is O(lmax³) work in O(lmax²) memory, numerically stable to ℓ ≈ 1024 (double).
+the Trapani–Navaza recurrence (Trapani & Navaza 2006). Both `dl`/`dl_prev` are `(2lmax+1)²`,
+`off = lmax+1`. O(ℓ²) work from one previous plane, so a sweep ℓ = 0…lmax is O(lmax³) work in O(lmax²)
+memory, numerically stable to ℓ ≈ 1024 in double precision.
 
-**Layout is `n`-major: `dl[n+off, m+off] = d^ℓ_{m,n}(π/2)`** (McEwen–Wiaux/ssht convention,
-transposed). The recurrence runs downward in `m`, so storing `n` first makes every inner loop
-contiguous and independent — Stage A, Stage B and the `n → −n` fill all vectorize — and it is also
-the order the contraction reads, since `Δ^ℓ_{m',m} = dl[m'+off, m+off]`. So the relation to
-[`wigner_d`](@ref) is transposed: `wigner_d(ℓ, m, n, π/2) == dl[n+off, m+off]`.
+The layout is `n`-major, `dl[n+off, m+off] = d^ℓ_{m,n}(π/2)` (McEwen & Wiaux 2011, transposed). The
+recurrence runs downward in `m`, so with `n` first every inner loop is contiguous and independent
+(Stage A, Stage B and the `n → −n` fill all vectorize), and it is the order the contraction reads,
+`Δ^ℓ_{m',m} = dl[m'+off, m+off]`. So `wigner_d(ℓ, m, n, π/2) == dl[n+off, m+off]`.
 
 Only the eighth `0 ≤ n ≤ m ≤ ℓ` is recurred; the rest is filled by the d(π/2) symmetries (transpose,
 m→−m, n→−n).
@@ -359,8 +342,8 @@ function _wigner_d_halfpi_step!(dl::AbstractMatrix{T}, dlp::AbstractMatrix{T}, �
                 sqrt(T(ℓ) * T(2ℓ - 1) / (T(2) * T(ℓ + n) * T(ℓ + n - 1))) * dlp[(n - 1) + off, (ℓ - 1) + off]
         end
         # Stage B — three-term downward recurrence in m (T&N Eqn 11), eighth 0 ≤ n ≤ m ≤ ℓ. The two
-        # square roots depend only on (ℓ, m), so hoisting them out of the n loop makes the sqrt count
-        # O(ℓ) per degree instead of O(ℓ²), and leaves the n loop a dependency-free axpy.
+        # square roots depend only on (ℓ, m), so they are formed once per `m`, and the n loop is a
+        # dependency-free axpy.
         for m in (ℓ - 1):-1:0
             c1 = T(2) / sqrt(T(ℓ - m) * T(ℓ + m + 1))
             if m == ℓ - 1                                  # second term vanishes
@@ -375,9 +358,8 @@ function _wigner_d_halfpi_step!(dl::AbstractMatrix{T}, dlp::AbstractMatrix{T}, �
                 end
             end
         end
-        # Symmetry fill to the full (2ℓ+1)² plane. Serial on purpose: one multiply per element makes
-        # these streaming rather than compute, and threading them measurably loses. The contraction has
-        # arithmetic per element and is the part worth threading.
+        # Symmetry fill to the full (2ℓ+1)² plane, serially: one multiply per element, bound by memory
+        # traffic.
         for m in 0:ℓ, n in (m + 1):ℓ                       # S1 transpose: eighth → quarter
             dl[n + off, m + off] = ifelse(iseven(m + n), one(T), -one(T)) * dl[m + off, n + off]
         end
@@ -411,18 +393,15 @@ end
 _assemble_G!(G, sf, plan::SpinNUSHTplan) =
     _fold_weights!(_assemble_G_impl!(G, sf, plan, plan.wigner), plan)
 
-# Precomputed path: Δ is already contracted into Q, so ℓ can run innermost and each output column of
-# G stays hot across the whole degree sum.
-# Work, in fused multiply-adds, an assembly must carry before threading it is worth a `@sync` barrier —
-# roughly an order of magnitude more than a barrier costs. Counted in FMAs rather than orders so it
-# scales with the batch.
+# Precomputed path: Δ is already contracted into Q, so ℓ runs innermost and each output column of G
+# stays in cache across the degree sum.
+# Work, in fused multiply-adds over orders × degrees × batch, below which an assembly runs on one
+# thread: about ten times the cost of a `@sync` barrier.
 const _CONTRACT_MIN_WORK = 30_000
 
-# With a table there is no recurrence to sequence, so orders run outermost over the whole range and
-# split with no per-degree barrier — one `@sync` for the entire assembly, which is why this pays where
-# the on-the-fly path (barrier per degree) does not. Each order owns its own column of `G` / entry of
-# `sf`, so the ranges need no synchronisation. One thread spawns nothing, keeping the transform
-# allocation-free.
+# With a table there is no recurrence to sequence, so the orders split over the whole range under one
+# `@sync` for the entire assembly. Each order owns its column of `G` and its entries of `sf`, so the
+# ranges need no synchronisation; one thread spawns nothing, so the transform allocates nothing.
 @inline function _thread_all_orders(f::F, lmax::Int, B::Int) where {F}
     nord = 2lmax + 1
     nt = min(Threads.nthreads(), max(1, (nord * nord * lmax * B) ÷ _CONTRACT_MIN_WORK))
@@ -467,10 +446,8 @@ function _assemble_G_impl!(G, sf, plan::SpinNUSHTplan{T}, tbl::WignerTable) wher
     return G
 end
 
-# One degree's contraction over a subrange of orders. Split out so one body serves the serial and the
-# threaded path, and so a spawned task captures a concrete range rather than a loop variable.
-# `m` outermost so the i^{m+s}·N_ℓ phase is formed once per order rather than once per (batch, order);
-# `mp` innermost so both Δ reads and the G write run down contiguous columns.
+# One degree's contraction over a subrange of orders. `m` outermost, so the phase `i^{m+s}·N_ℓ` is
+# formed once per order; `mp` innermost, so both Δ reads and the `G` write run down contiguous columns.
 @inline function _contract_orders!(G, sf, plan::SpinNUSHTplan{T}, dl, ℓ::Int, ms,
                                    Nℓ::T, s::Int, off::Int, lmax::Int) where {T}
     @inbounds for m in ms
@@ -489,7 +466,7 @@ end
 end
 
 # On-the-fly path: regenerate each Δ^ℓ plane by the Trapani–Navaza recurrence into the reused
-# `dl_curr`/`dl_prev` buffers, ℓ ascending, ping-ponged — O(lmax²) memory instead of O(lmax³).
+# `dl_curr`/`dl_prev` buffers, ℓ ascending, ping-ponged, in O(lmax²) memory.
 function _assemble_G_impl!(G, sf, plan::SpinNUSHTplan{T}, ::Nothing) where {T}
     lmax = plan.lmax; s = plan.s; off = lmax + 1
     dl = plan.dl_curr; dlp = plan.dl_prev
@@ -501,10 +478,8 @@ function _assemble_G_impl!(G, sf, plan::SpinNUSHTplan{T}, ::Nothing) where {T}
             _wigner_d_halfpi_step!(dl, dlp, ℓ, off)
         end
         ℓ < abs(s) && continue
-        # Serial over orders. They are independent, but the on-the-fly path can only split *within* a
-        # degree — the recurrence sequences the degrees — and a barrier per degree costs more than the
-        # split returns. Measured neutral on the forward and a clear loss on the adjoint. The table
-        # path has no such barrier and is threaded.
+        # Serial over orders: the recurrence sequences the degrees, so a split can run only within one
+        # degree, at one barrier per degree.
         _contract_orders!(G, sf, plan, dl, ℓ, -ℓ:ℓ, T(_Nℓ(ℓ)), s, off, lmax)
     end
     return G
@@ -678,13 +653,10 @@ _add_out!(f, fbuf, ::AbstractVector, n) = _add_real!(f, fbuf, n)
 
 Whether the plan's field is real, and so whether its coefficients are constrained.
 
-A real field's coefficients are Hermitian — `sf[ℓ,-m] = (-1)^m conj(sf[ℓ,m])`, from
-`conj(Y_ℓm) = (-1)^m Y_ℓ,-m` — which is `(lmax+1)²` real numbers rather than the `(lmax+1)(2lmax+1)`
-complex ones the array holds. Synthesis needs no such restriction: it is handed coefficients and
-evaluates them. A *solve* does. Searching the unrestricted space asks a question with no unique
-answer, and the operator's continuation off the Hermitian subspace is arbitrary — it is fixed by
-whichever fold the backend uses, not by the mathematics — so the search lands wherever that
-continuation happens to point.
+A real field's coefficients are Hermitian, `sf[ℓ,-m] = (-1)^m conj(sf[ℓ,m])` from
+`conj(Y_ℓm) = (-1)^m Y_ℓ,-m`: `(lmax+1)²` real numbers, of the `(lmax+1)(2lmax+1)` complex ones the
+array holds. A solve runs on that subspace. Off it the operator's values are set by the backend's fold,
+so a fit over the whole array has no unique answer.
 """
 @inline _hermitian_domain(plan::SpinNUSHTplan) = _hermitian_domain(_fold_kind(plan))
 @inline _hermitian_domain(::FullModes) = false
@@ -801,14 +773,12 @@ Exact inversion of the spin-weighted synthesis at arbitrary scattered points: so
 `min ‖A sf − f‖` by LSMR on the Golub–Kahan bidiagonalization of `A`. Batched (`B > 1`) runs the
 columns as independent single-column solves. Same contract and return as [`nusht_solve!`](@ref).
 
-On a real-field plan the fit runs over the `(lmax+1)²` real degrees a real field's coefficients have
-rather than the full complex array — see [`_hermitian_domain`](@ref) — which is both the well-posed
-problem and a quarter of the unknowns.
+On a real-field plan the fit runs over the `(lmax+1)²` real degrees of a real field's coefficients (see
+[`_hermitian_domain`](@ref)), a quarter of the unknowns.
 
-That restriction exists only at `s = 0`. Conjugating a spin-`s` field flips its spin weight
-(`conj(ₛY_ℓm) = (-1)^{m+s} ₋ₛY_ℓ,-m`), so for `s ≠ 0` no reality condition closes, no subspace makes
-the fit well-posed, and this raises rather than returning one of the arbitrarily many coefficient sets
-that reproduce the samples. Synthesis and the adjoint are unaffected and stay exact there.
+That subspace exists only at `s = 0`: conjugation maps spin `s` to `-s`
+(`conj(ₛY_ℓm) = (-1)^{m+s} ₋ₛY_ℓ,-m`), so a real-field plan at `s ≠ 0` has no subspace on which the fit
+is determined, and the solve throws. Its synthesis and adjoint are exact.
 """
 function nusht_solve_spin!(sf, f, plan::SpinNUSHTplan;
                            ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan), kwargs...)
