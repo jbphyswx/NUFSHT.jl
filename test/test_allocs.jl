@@ -1,6 +1,6 @@
 # Comprehensive allocation audit: EVERY mutating / hot-path method that is meant to run allocation-free is
 # asserted `@allocated == 0` here — no cherry-picking. Covers both batch shapes (B=1 and B=2), the scalar
-# and spin transforms, their DFS/S-engine/filter steps, all CG reductions, and both CG solvers.
+# and spin transforms, their DFS/S-engine/filter steps, and both solves.
 #
 # Measurement methodology (important — this is what makes the numbers trustworthy): each method is measured
 # INSIDE a small barrier function whose parameters carry the concrete buffer types. A bare top-level
@@ -31,15 +31,11 @@ _a_renorm(o, m, ft, p, s, w) = (NUFSHT.nusht_filter_renorm!(o, m, ft, p; mask_fi
 _a_sphev(p)              = (NUFSHT._sph_evaluate!(p); @allocated NUFSHT._sph_evaluate!(p); @allocated NUFSHT._sph_evaluate!(p))
 _a_asmM(Z, G, l)         = (NUFSHT._assemble_modes!(Z, G, l); @allocated NUFSHT._assemble_modes!(Z, G, l); @allocated NUFSHT._assemble_modes!(Z, G, l))
 _a_asmMa(G, Z, l)        = (NUFSHT._assemble_modes_adjoint!(G, Z, l); @allocated NUFSHT._assemble_modes_adjoint!(G, Z, l); @allocated NUFSHT._assemble_modes_adjoint!(G, Z, l))
-_a_caxpy(y, al, x, s)    = (NUFSHT._col_axpy!(y, al, x, s); @allocated NUFSHT._col_axpy!(y, al, x, s); @allocated NUFSHT._col_axpy!(y, al, x, s))
-_a_cpbp(p, r, be)        = (NUFSHT._col_pbp!(p, r, be); @allocated NUFSHT._col_pbp!(p, r, be); @allocated NUFSHT._col_pbp!(p, r, be))
-_a_cscale(y, s)          = (NUFSHT._col_scale!(y, s); @allocated NUFSHT._col_scale!(y, s); @allocated NUFSHT._col_scale!(y, s))
 _a_solve(C, f, p, ws)    = (NUFSHT.nusht_solve!(C, f, p; ws = ws, maxiter = 60, rtol = 1e-8); @allocated NUFSHT.nusht_solve!(C, f, p; ws = ws, maxiter = 60, rtol = 1e-8); @allocated NUFSHT.nusht_solve!(C, f, p; ws = ws, maxiter = 60, rtol = 1e-8))
 _a_type2s(f, sf, p)      = (NUFSHT.nusht_type2_spin!(f, sf, p); @allocated NUFSHT.nusht_type2_spin!(f, sf, p); @allocated NUFSHT.nusht_type2_spin!(f, sf, p))
 _a_type1s(sf, f, p)      = (NUFSHT.nusht_type1_spin!(sf, f, p); @allocated NUFSHT.nusht_type1_spin!(sf, f, p); @allocated NUFSHT.nusht_type1_spin!(sf, f, p))
 _a_asmG(G, sf, p)        = (NUFSHT._assemble_G!(G, sf, p); @allocated NUFSHT._assemble_G!(G, sf, p); @allocated NUFSHT._assemble_G!(G, sf, p))
 _a_asmGa(sf, G, p)       = (NUFSHT._assemble_G_adjoint!(sf, G, p); @allocated NUFSHT._assemble_G_adjoint!(sf, G, p); @allocated NUFSHT._assemble_G_adjoint!(sf, G, p))
-_a_chdot(d, a, b)        = (NUFSHT._col_hdot!(d, a, b); @allocated NUFSHT._col_hdot!(d, a, b); @allocated NUFSHT._col_hdot!(d, a, b))
 _a_solves(sf, f, p, ws)  = (NUFSHT.nusht_solve_spin!(sf, f, p; ws = ws, maxiter = 60, rtol = 1e-8); @allocated NUFSHT.nusht_solve_spin!(sf, f, p; ws = ws, maxiter = 60, rtol = 1e-8); @allocated NUFSHT.nusht_solve_spin!(sf, f, p; ws = ws, maxiter = 60, rtol = 1e-8))
 
 Test.@testset "allocation: full hot-path surface is allocation-free" begin
@@ -59,7 +55,7 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
     # does not, so it is the one that isolates NUFSHT's contribution; the stage-by-stage assertions
     # further down hold on every backend and are the backend-independent half of the guarantee.
     for B in (1, 2)
-        Test.@testset "scalar transform + CG (B=$B)" begin
+        Test.@testset "scalar transform + solve (B=$B)" begin
             plan = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-10, ntrans = B, nthreads = 1,
                                     nufft = FTB.FINUFFTBackend())
             C = randn(Nθ, Nφ, B); f = zeros(M, B); Cout = zeros(Nθ, Nφ, B); out = zeros(M, B)
@@ -70,7 +66,7 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
                 C_true[FastSphericalHarmonics.sph_mode(ℓ, m), b] = randn()
             end
             ftrue = zeros(M, B); NUFSHT.nusht_type2!(ftrue, C_true, plan)
-            Csol = similar(plan.F); ws = NUFSHT.LSMRWorkspace(plan)
+            Csol = similar(plan.F); ws = FTB.LSMRWorkspace(plan)
             # Warm the whole pipeline on this plan: the first real use of the adjoint / solve path builds
             # FastTransforms' lazy adjoint plan (a one-time ~few-hundred-byte per-plan setup cost, not a
             # per-call allocation). After warmup, steady-state is zero.
@@ -102,10 +98,6 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
                     Test.@test _a_asmMa(q.F, q.Fhat, lmax) == 0
                     NUFSHT.close!(q)
                 end
-                Test.@test _a_chdot(ws.nrm, ws.v, ws.v)   == 0
-                Test.@test _a_caxpy(ws.x, ws.cf, ws.hbar, 1.0) == 0
-                Test.@test _a_cpbp(ws.h, ws.v, ws.cf)     == 0
-                Test.@test _a_cscale(ws.u, ws.cf)         == 0
                 Test.@test _a_solve(Csol, ftrue, plan, ws) == 0
                 if B == 2
                     # Column 2 is zero and retires at once, so the solve narrows to width 1.
@@ -117,7 +109,7 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
             NUFSHT.close!(plan)
         end
 
-        Test.@testset "spin transform + CG (B=$B)" begin
+        Test.@testset "spin transform + solve (B=$B)" begin
             s = 1
             plan = NUFSHT.make_spin_plan(θ, φ, lmax, s; tol = 1e-10, ntrans = B, nthreads = 1,
                                          nufft = FTB.FINUFFTBackend())
@@ -127,7 +119,7 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
             end
             NUFSHT.nusht_type2_spin!(fs, sf, plan)
             Ghat = randn(ComplexF64, Nφ, Nφ, B)
-            sws = NUFSHT.LSMRWorkspace(plan)
+            sws = FTB.LSMRWorkspace(plan)
             for _ in 1:3   # warm the plan's full pipeline (one-time per-plan init; see scalar block)
                 NUFSHT.nusht_type1_spin!(sfo, fs, plan)
                 NUFSHT.nusht_solve_spin!(sfo, fs, plan; ws = sws, maxiter = 60, rtol = 1e-8)
@@ -137,10 +129,6 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
                 Test.@test _a_type1s(sfo, fs, plan)         == 0
                 Test.@test _a_asmG(plan.G, sf, plan)        == 0
                 Test.@test _a_asmGa(sf, Ghat, plan)         == 0
-                Test.@test _a_chdot(sws.nrm, sws.v, sws.v)  == 0
-                Test.@test _a_caxpy(sws.x, sws.cf, sws.hbar, 1.0) == 0
-                Test.@test _a_cpbp(sws.h, sws.v, sws.cf)    == 0
-                Test.@test _a_cscale(sws.u, sws.cf)         == 0
                 Test.@test _a_solves(sfo, fs, plan, sws)    == 0
             end
             NUFSHT.close!(plan)

@@ -9,6 +9,7 @@ and referenced from README.md and docs/ markdown.
 """
 
 using NUFSHT: NUFSHT
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FastSphericalHarmonics: FastSphericalHarmonics
 using CairoMakie: CairoMakie
 using LinearAlgebra: LinearAlgebra
@@ -174,7 +175,7 @@ function figure_spectral_filtering()
     end
 
     # A fit, not an adjoint: `A†f` is not the coefficient vector at scattered points.
-    ws_f = NUFSHT.LSMRWorkspace(plan_f)
+    ws_f = FTB.LSMRWorkspace(plan_f)
     C_full = NUFSHT.allocate_coefficients(plan_f);   NUFSHT.nusht_solve!(C_full, f_full, plan_f; ws=ws_f, rtol=1e-10)
     C_gauss = NUFSHT.allocate_coefficients(plan_f);  NUFSHT.nusht_solve!(C_gauss, f_gauss, plan_f; ws=ws_f, rtol=1e-10)
     C_tophat = NUFSHT.allocate_coefficients(plan_f); NUFSHT.nusht_solve!(C_tophat, f_tophat, plan_f; ws=ws_f, rtol=1e-10)

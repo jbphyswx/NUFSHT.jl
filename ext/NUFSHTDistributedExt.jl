@@ -103,7 +103,7 @@ _at_part_threads(f, nthreads::Int) = Base.ScopedValues.with(f, FTB.FASTTRANSFORM
 function _part_plan(::Type{FE}, θ, φ, lmax, inner, kwargs) where {FE}
     n = _worker_threads(inner)
     plan = _at_part_threads(() -> NUFSHT.make_plan(FE, θ, φ, lmax; nthreads = n, kwargs...), n)
-    return (; plan, ws = NUFSHT.LSMRWorkspace(plan), nthreads = n)
+    return (; plan, ws = FTB.LSMRWorkspace(plan), nthreads = n)
 end
 _part_info(f) = (p = fetch(f).plan; (NUFSHT.coefficient_size(p), p.B, eltype(p.F), p.tol))
 
@@ -134,9 +134,6 @@ end
 
 NUFSHT.allocate_coefficients(p::DistributedNUSHTplan{FE,CE}) where {FE,CE} = zeros(CE, p.coefficient_size...)
 NUFSHT.coefficient_size(p::DistributedNUSHTplan) = p.coefficient_size
-
-# The workers hold their workspaces.
-NUFSHT.LSMRWorkspace(::DistributedNUSHTplan) = nothing
 
 _part_close(f) = (NUFSHT.close!(fetch(f).plan); nothing)
 function NUFSHT.close!(p::DistributedNUSHTplan)
@@ -231,7 +228,8 @@ function _part_solve(f, f_block, inbox, outbox, k::Int, kwargs)
         copyto!(A, total)
     end
     result = try
-        _at_part_threads(() -> NUFSHT._lsmr!(C, f_block, p.plan, p.ws; reduce! = reduce!, kwargs...), p.nthreads)
+        _at_part_threads(() -> NUFSHT._solve!(C, f_block, NUFSHT._PointShare(p.plan, reduce!), p.ws; kwargs...),
+                         p.nthreads)
     catch err
         put!(inbox, (k, err isa Exception ? err : ErrorException(sprint(showerror, err))))
         rethrow()
@@ -265,7 +263,7 @@ function _coordinate(inbox, outboxes, ::Type{T}, ::Type{CE}, nw::Int) where {T,C
 end
 
 """
-    nusht_solve!(C, f, plan::DistributedNUSHTplan; maxiter, rtol, conlim, verbose) -> (; C, iterations = iters, residual = rel_res, converged = converged)
+    nusht_solve!(C, f, plan::DistributedNUSHTplan; maxiter, rtol, conlim) -> (; C, iterations, residual, converged)
 
 The least-squares fit over every worker's points: [`nusht_solve!`](@ref)'s recurrence on every worker at
 once, the sums over points added across the workers. `f` holds every point, in the plan's order.

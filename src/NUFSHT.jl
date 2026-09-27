@@ -40,7 +40,7 @@ include("NUFFT.jl")
 include("Plan.jl")
 include("Kernels.jl")
 
-export make_plan, NUSHTplan, close!, LSMRWorkspace, plan_memory
+export make_plan, NUSHTplan, close!, plan_memory
 export nusht_type1!, nusht_type2!, nusht_synthesize!, nusht_filter!, nusht_filter_renorm!, nusht_solve!
 export TopHatTransfer, GaussianTransfer, SharpSpectralTransfer
 export kernel_transfer, cutoff_degree, gaussian_from_scale
@@ -326,8 +326,7 @@ end
 # ─────────────────────────────────────────────────────────────────────────────
 # Filtering
 # ─────────────────────────────────────────────────────────────────────────────
-# `nusht_filter!` and `nusht_filter_renorm!` need `LSMRWorkspace` in a signature, so they live below
-# the solver; the two that do not are here.
+# `nusht_filter!` and `nusht_filter_renorm!` fit coefficients first, and follow the solver.
 
 """
     nusht_synthesize!(f_out, C, filter, plan) -> f_out
@@ -355,89 +354,17 @@ function nusht_synthesize!(f_out, C, filter, plan::NUSHTplan)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Exact inversion: batched LSMR on min ‖A c − f‖
+# Exact inversion: least squares on min ‖A c − f‖ by FlowTransformBindings' LSMR
 # ─────────────────────────────────────────────────────────────────────────────
-# LSMR (Fong & Saunders, SISC 33(5), 2011) applies Golub–Kahan bidiagonalization to `A` itself rather
-# than solving the normal equations, so it works at cond(A) where CG on `A†A` works at cond(A)² — for
-# the same one `A` and one `A†` per iteration, and the same buffer count. Measured on this operator:
-# identical iteration counts to a given tolerance, 25-250x better coefficient accuracy, and `‖A†r‖`
-# (the quantity this package reports and stops on) monotone by construction where CG's rises to 7.9x
-# its running best on a square point set and diverges outright on a rank-deficient one.
+# A plan is the operator of its own fit: synthesis is `A`, the exact adjoint `A†`, through the methods
+# `FTB.lsmr!` calls. A scalar plan's fit runs over the `(lmax+1)²` slots holding degrees `l ≤ lmax`,
+# packed (see `_valid_indices`): the array's supernumerary slots carry degrees up to `lmax+|m|`, and the
+# degrees `l ≤ lmax` span the subspace invariant under rotation, so the fit is independent of the
+# coordinate frame. The adjoint lands in the plan's full layout, `plan.F`, and gathering it into the
+# packed vector is the projection onto those slots. `plan.F` is free from that gather to the next forward
+# step, which refills it.
 
-# Host view of a per-column scalar vector. Retirement and the bidiagonalization's scalar recurrences
-# are host control flow, so the values they read cannot be scalar-indexed out of a device array. On a
-# host plan the mirror IS the vector, so `_mirror!` copies nothing.
-_host_mirror(v::Array) = v
-_host_mirror(v::AbstractVector) = Array(v)
-@inline _mirror!(h, v) = h === v ? h : copyto!(h, v)
-
-"""
-    LSMRWorkspace(plan)
-
-Reusable scratch for [`nusht_solve!`](@ref). Holding one across solves makes the solve
-allocation-free. Per-column scalars are length-`B` vectors so the `B` columns run as `B` independent
-single-column solves (batched result == looping single transforms).
-
-After a solve, `colres[b]` is the relative residual `‖A†r‖/‖A†f‖` of the coefficients delivered for
-column `b`, in the caller's column order — the per-column form of the scalar `rel_res` returned.
-
-Only `nrm` and `cf` live on the plan's device: everything else the bidiagonalization tracks is scalar
-recurrence, which is cheaper and clearer on the host than as a chain of length-`B` kernel launches.
-"""
-struct LSMRWorkspace{AT3<:AbstractArray, WT<:AbstractArray, FT2<:AbstractMatrix, VT<:AbstractVector,
-                     HV<:AbstractVector, VM, PV<:AbstractVector{<:Integer}}
-    x::AT3                # iterate
-    v::AT3                # right bidiagonalization vector
-    h::AT3
-    hbar::AT3
-    # `A†u`. Not `AT3`: the scalar solver keeps the four vectors above packed to the `l ≤ lmax` slots
-    # while this aliases the plan's full-layout buffer. The spin solver's share a layout.
-    w::WT
-    u::FT2                # left bidiagonalization vector, in point space
-    # `1` on the (lmax+1)^2 slots holding degrees l ≤ lmax, `0` on the supernumerary ones. The array is
-    # a square, invertible representation carrying degrees up to `lmax+|m|`, so the transform needs all
-    # of it — but a least-squares fit must name its space, and only `l ≤ lmax` is SO(3)-invariant.
-    # Fitting the ragged set instead makes the answer depend on the coordinate frame.
-    valid::VM
-    # Slot -> original column. Compaction moves live columns to the front, so a slot's identity is
-    # only recoverable through this; it is what keeps a result from being written to the wrong column.
-    perm::PV
-    nrm::VT               # device scratch: per-column ⟨·,·⟩
-    cf::VT                # device scratch: the per-column coefficient of the moment
-    nrm_h::HV
-    cf_h::HV
-    α::HV
-    β::HV
-    αbar::HV
-    ζbar::HV              # |ζbar| is LSMR's ‖A†r‖, available with no extra transform
-    ρ::HV
-    ρbar::HV
-    cbar::HV
-    sbar::HV
-    normA2::HV            # Σ(α² + β²): ‖A‖_F², which bounds ‖A‖
-    maxrbar::HV
-    minrbar::HV           # extreme ρbar, giving LSMR's cond(A) estimate
-    atb::HV               # ‖A†f‖ per column, the residual's denominator
-    rel::HV
-    done::HV
-    colres::HV
-end
-
-# `valid` is `nothing` for a spin plan: that coefficient array is dense, with no supernumerary slots
-# to project away.
-# Fold the adjoint's output into `v`. The scalar solver keeps `v` packed while `w` is the plan's full
-# layout, so this gathers — which is also the projection onto `l ≤ lmax`; the spin solver's two already
-# share a layout and it is a plain axpy. Same distinction for the initial `v = A†u`.
-_lsmr_fold_v!(ws, plan::NUSHTplan, n::Integer) =
-    _col_pbp_pack!(ws.v, ws.w, ws.cf, ws.valid, _fulllen(plan), n)
-_lsmr_fold_v!(ws, plan::AbstractNUSHTplan, n::Integer) = _col_pbp!(ws.v, ws.w, ws.cf, n)
-
-_lsmr_init_v!(ws, plan::NUSHTplan) =
-    _pack_coeffs!(ws.v, ws.w, ws.valid, _fulllen(plan), plan.B)
-_lsmr_init_v!(ws, plan::AbstractNUSHTplan) = copyto!(ws.v, ws.w)
-
-# Length of one solver column. The solver works packed — only the `(lmax+1)²` slots that hold degrees
-# `l ≤ lmax` — so this is not the plan's `Nθ·Nφ` coefficient stride. See `_valid_indices`.
+# Length of one packed solver column, and of one column of the plan's full layout.
 @inline _coefflen(plan::NUSHTplan) = (plan.lmax + 1)^2
 @inline _fulllen(plan::NUSHTplan) = plan.Nθ * plan.Nφ
 
@@ -446,90 +373,84 @@ _lsmr_init_v!(ws, plan::AbstractNUSHTplan) = copyto!(ws.v, ws.w)
 @inline _lsmr_widths(plan::NUSHTplan, nlive::Integer) =
     (nlive, plan.pool_recipe.narrowable ? _fit_width(max(nlive, 1), plan.B) : plan.B)
 
-@inline _assert_solve(C, f, plan::NUSHTplan) = (_assert_coeffs(C, plan); _assert_field(f, plan))
+# The packed slots, built by the first solve and kept on the plan.
+@inline function _valid(plan::NUSHTplan)
+    v = plan.valid[]
+    v === nothing || return v
+    return _build_valid!(plan)
+end
+@noinline _build_valid!(plan::NUSHTplan) = (plan.valid[] = _valid_indices(plan.F, plan.lmax))
 
-function LSMRWorkspace(plan::NUSHTplan{T,FE}) where {T,FE}
-    B = plan.B
-    M = _npts(plan)
-    K = _coefflen(plan)
-    # Packed to the `(lmax+1)²` real degrees rather than the plan's `Nθ×Nφ` layout: the supernumerary
-    # slots are excluded from the fit anyway, so carrying them meant half of every vector was zeros the
-    # iteration then multiplied by a mask. Packing removes both the storage and that multiply.
-    z3() = _zeros_like(plan.F, FE, K, B)
-    vB() = _zeros_like(_θnodes(plan), T, B)
-    hB() = zeros(T, B)
-    nrm, cf = vB(), vB()
-    # `w` holds `A†u` in the plan's full layout, live only between `_lsmr_Atu!` writing it and the
-    # `_col_pbp!` that folds it into `v`. `plan.F` is free across exactly that window — the forward
-    # step refills it from `v` at the top of the next iteration — so `w` aliases it rather than being
-    # another array. The spin workspace cannot: its plan owns no coefficient-shaped buffer.
-    return LSMRWorkspace(z3(), z3(), z3(), z3(), plan.F, _zeros_like(_fbuf(plan), FE, M, B),
-                         _valid_indices(plan.F, plan.lmax), collect(1:B),
-                         nrm, cf, _host_mirror(nrm), _host_mirror(cf),
-                         hB(), hB(), hB(), hB(), hB(), hB(), hB(), hB(),
-                         hB(), hB(), hB(), hB(), hB(), hB(), hB())
+FTB.lsmr_ncolumns(plan::AbstractNUSHTplan) = plan.B
+FTB.lsmr_allocate_domain(plan::NUSHTplan{T,FE}) where {T,FE} =
+    (_valid(plan); _zeros_like(plan.F, FE, _coefflen(plan), plan.B))
+FTB.lsmr_allocate_range(plan::NUSHTplan{T,FE}) where {T,FE} = _zeros_like(_fbuf(plan), FE, _npts(plan), plan.B)
+FTB.lsmr_check_solution(C, plan::NUSHTplan, ws) = _assert_coeffs(C, plan)
+
+# `u ← A v + c u`: `u` is scaled first and the synthesis, which lands in the plan's strengths buffer,
+# is added to it.
+function FTB.lsmr_forward!(u, plan::NUSHTplan, v, c, n)
+    k, kdfn = _lsmr_widths(plan, n)
+    FTB.colscale!(u, c, n, plan.B)
+    _unpack_coeffs!(plan.F, v, _valid(plan), _fulllen(plan), plan.B)
+    _sph_evaluate!(plan, k)
+    _dfn_synthesis!(plan, kdfn)
+    return _add_out!(u, _fbuf(plan), plan, n)
 end
 
-# Per-column primitives address a batch buffer by its linear column stride, so one method serves a
-# point-space `(M, B)` buffer and a coefficient-space `(Nθ, Nφ, B)` one alike. `n` bounds the columns
-# visited, so a compacted solve touches only its live prefix; taken as a count rather than a view,
-# since a `SubArray` per call would put allocation back on the hot path.
+FTB.lsmr_adjoint!(v, plan::AbstractNUSHTplan, u, c, n) = _fold!(v, plan, _adjoint_full!(plan, u, n), c, n)
+
+# `A†u` in the plan's full coefficient layout.
+function _adjoint_full!(plan::NUSHTplan, u, n::Integer)
+    k, kdfn = _lsmr_widths(plan, n)
+    return _nusht_true_adjoint!(plan.F, u, plan, k, kdfn)
+end
+
+# `v ← P w + c v` for the full-layout `w`, `P` the gather onto the packed slots.
+_fold!(v, plan::NUSHTplan, w, ::Nothing, n::Integer) = _pack_coeffs!(v, w, _valid(plan), _fulllen(plan), n)
+_fold!(v, plan::NUSHTplan, w, c, n::Integer) = _col_pbp_pack!(v, w, c, _valid(plan), _fulllen(plan), n)
+
+FTB.lsmr_write!(C, plan::NUSHTplan, x, k, j) = _write_solution!(C, x, _valid(plan), _fulllen(plan), k, j)
+
+"""
+    _PointShare(plan, reduce!)
+
+`plan` over one share of the points, as the operator of the fit over every share: `reduce!(A)` sums
+`A` in place across the shares, and is applied to the two sums over points LSMR takes, the per-column
+`‖u‖²` and `A†u`. The coefficients are the same on every share, so every share runs the same recurrence
+and stops on the same iteration.
+"""
+struct _PointShare{P<:AbstractNUSHTplan, R}
+    plan::P
+    reduce!::R
+end
+
+FTB.lsmr_ncolumns(s::_PointShare) = FTB.lsmr_ncolumns(s.plan)
+FTB.lsmr_allocate_domain(s::_PointShare) = FTB.lsmr_allocate_domain(s.plan)
+FTB.lsmr_allocate_range(s::_PointShare) = FTB.lsmr_allocate_range(s.plan)
+FTB.lsmr_check_solution(C, s::_PointShare, ws) = FTB.lsmr_check_solution(C, s.plan, ws)
+FTB.lsmr_write!(C, s::_PointShare, x, k, j) = FTB.lsmr_write!(C, s.plan, x, k, j)
+FTB.lsmr_forward!(u, s::_PointShare, v, c, n) = FTB.lsmr_forward!(u, s.plan, v, c, n)
+
+function FTB.lsmr_range_norm2!(out, s::_PointShare, u, n)
+    FTB.lsmr_range_norm2!(out, s.plan, u, n)
+    s.reduce!(view(out, 1:n))
+    return out
+end
+
+function FTB.lsmr_adjoint!(v, s::_PointShare, u, c, n)
+    w = _adjoint_full!(s.plan, u, n)
+    s.reduce!(w)
+    return _fold!(v, s.plan, w, c, n)
+end
+
+# A batch buffer's linear column stride: one column of a point-space `(M, B)` buffer or of a
+# coefficient-space `(Nθ, Nφ, B)` one.
 @inline _colstride(A) = length(A) ÷ size(A, ndims(A))
 
-# dst[k] = Re Σ conj(a)·b over column k. For real arrays `conj` and `real` are identities, so this is
-# the plain dot product and the real and complex paths need only this one method.
-function _col_hdot!(dst, a, b, n::Integer = size(a, ndims(a)))
-    len = _colstride(a)
-    @inbounds for k in 1:n
-        s = zero(real(eltype(a)))
-        o = (k - 1) * len
-        @simd for i in 1:len
-            s += real(conj(a[o + i]) * b[o + i])
-        end
-        dst[k] = s
-    end
-    return dst
-end
-
-function _col_axpy!(y, α, x, σ, n::Integer = size(y, ndims(y)))   # y[:,k] += σ·α[k]·x[:,k]
-    len = _colstride(y)
-    @inbounds for k in 1:n
-        c = σ * α[k]
-        o = (k - 1) * len
-        @simd for i in 1:len
-            y[o + i] += c * x[o + i]
-        end
-    end
-    return y
-end
-
-function _col_pbp!(p, r, β, n::Integer = size(p, ndims(p)))       # p[:,k] = r[:,k] + β[k]·p[:,k]
-    len = _colstride(p)
-    @inbounds for k in 1:n
-        c = β[k]
-        o = (k - 1) * len
-        @simd for i in 1:len
-            p[o + i] = r[o + i] + c * p[o + i]
-        end
-    end
-    return p
-end
-
-function _col_scale!(y, s, n::Integer = size(y, ndims(y)))        # y[:,k] *= s[k]
-    len = _colstride(y)
-    @inbounds for k in 1:n
-        c = s[k]
-        o = (k - 1) * len
-        @simd for i in 1:len
-            y[o + i] *= c
-        end
-    end
-    return y
-end
-
-# `v[:,k] = gather(wfull[:,k]) + β[k]·v[:,k]` — the packed counterpart of `_col_pbp!`, for the step
+# `v[:,k] = gather(wfull[:,k]) + β[k]·v[:,k]` — the packed counterpart of `FTB.colxpby!`, for the step
 # where the adjoint has written the plan's full layout and the iterate is packed. The gather is the
-# projection onto `l ≤ lmax`, so it replaces a mask multiply rather than adding a pass.
+# projection onto `l ≤ lmax`.
 function _col_pbp_pack!(v, wfull, β, idx, fulllen::Integer, n::Integer)
     K = length(idx)
     @inbounds for k in 1:n
@@ -543,12 +464,10 @@ function _col_pbp_pack!(v, wfull, β, idx, fulllen::Integer, n::Integer)
     return v
 end
 
-# Write one finished column of the packed iterate out to the caller's array. The scalar solver works
-# packed, so this scatters and zeroes the supernumerary slots; the spin solver already matches its
-# coefficient layout and copies straight across.
-function _write_solution!(C, ws::LSMRWorkspace, plan::NUSHTplan, slot::Integer, dstcol::Integer)
-    K = length(ws.valid)
-    full = _fulllen(plan)
+# Write column `slot` of the packed iterate `x` into column `dstcol` of the caller's full-layout `C`,
+# the supernumerary slots zeroed.
+function _write_solution!(C, x, idx, full::Integer, slot::Integer, dstcol::Integer)
+    K = length(idx)
     so = (slot - 1) * K
     do_ = (dstcol - 1) * full
     @inbounds begin
@@ -556,292 +475,38 @@ function _write_solution!(C, ws::LSMRWorkspace, plan::NUSHTplan, slot::Integer, 
             C[do_ + i] = zero(eltype(C))
         end
         @simd for t in 1:K
-            C[do_ + ws.valid[t]] = ws.x[so + t]
+            C[do_ + idx[t]] = x[so + t]
         end
     end
     return C
 end
 
-_write_solution!(C, ws::LSMRWorkspace, plan::AbstractNUSHTplan, slot::Integer, dstcol::Integer) =
-    _copy_col!(C, dstcol, ws.x, slot, _coefflen(plan))
-
-# Largest of the first `n` entries of a host vector, without a view (which would allocate).
-@inline function _max_prefix(v, n::Integer)
-    m = zero(eltype(v))
-    @inbounds for i in 1:n
-        v[i] > m && (m = v[i])
-    end
-    return m
-end
-
-# Working width for `n` live columns: the next power of two, capped at `B`. Computed rather than looked
-# up in a ladder, so it allocates nothing on the hot path — `_build_width!` builds any width on demand,
-# so the powers of two exist only to bound how many distinct plan sets a solve can create.
+# Working width for `n` live columns: the next power of two, capped at `B`. `_build_width!` builds any
+# width on demand, and the powers of two bound how many distinct plan sets a solve can create.
 @inline _fit_width(n::Integer, B::Integer) = min(Int(B), Int(nextpow(2, max(n, 1))))
 
-# Column `ssl` of `src` → column `dsl` of `dst`, addressed by linear offset so it works on a 2-D or 3-D
-# batch buffer alike. `copyto!` rather than an elementwise loop: it is a `memmove` on a host array and a
-# device-to-device copy on a GPU one, where the loop would be a scalar-indexing error.
-@inline _copy_col!(dst, dsl::Integer, src, ssl::Integer, len::Integer) =
-    copyto!(dst, (dsl - 1) * len + 1, src, (ssl - 1) * len + 1, len)
-
-# Load `cf_h[1:n]` onto the device coefficient vector. On a host plan the two alias, so filling `cf_h`
-# already filled `cf` and this copies nothing.
-@inline _push_cf!(ws::LSMRWorkspace) = _mirror!(ws.cf, ws.cf_h)
-
 """
-    _retire_and_compact!(C, ws, plan, rtol, nlive, len, mlen) -> nlive′
+    nusht_solve!(C, f, plan; ws = FlowTransformBindings.LSMRWorkspace(plan), maxiter = 500, rtol = 1e-6,
+                 conlim = 0) -> (; C, iterations, residual, converged)
 
-Write out every live slot that is finished — converged (`rel < rtol`) or stopped by LSMR's own
-condition/exact-termination tests — into `C` at its *original* column, then close the gaps so the
-survivors occupy slots `1:nlive′`. Every per-slot quantity that survives an iteration moves with its
-slot: the four coefficient buffers, the point-space `u`, and the bidiagonalization scalars.
+**Exact inversion:** solve `min ‖A c − f‖` for the coefficients `C` of each of the `B` columns by LSMR
+(`FlowTransformBindings.lsmr!`), `ws` holding the solver's arrays so a solve that reuses it allocates
+nothing.
 
-`plan` is needed only to write a finished column out, since the scalar solver's vectors are packed to
-the `l ≤ lmax` slots while `C` is in the plan's full layout — see [`_write_solution!`](@ref).
+A column stops once `‖A†r‖ ≤ rtol ‖A†f‖`, when LSMR's estimate of `cond(A)` reaches `conlim` (`1/eps(T)`
+at `0`), or when its Krylov process ends exactly; `residual` is the largest `‖A†r‖/‖A†f‖`, at least
+`eps(T)`, and `ws.residual` and `ws.status` hold each column's. Points that do not determine the
+coefficients (`M` below `(lmax+1)²`, or clustered) make `A` rank deficient, and a column then stops on
+`conlim` with `converged == false`.
 """
-function _retire_and_compact!(C, ws::LSMRWorkspace, plan::AbstractNUSHTplan, rtol,
-                              nlive::Integer, len::Integer, mlen::Integer)
-    w = 0
-    @inbounds for s in 1:nlive
-        if ws.done[s] != 0
-            _write_solution!(C, ws, plan, s, ws.perm[s])  # final answer, to its own column
-            ws.colres[ws.perm[s]] = ws.rel[s]
-            continue
-        end
-        w += 1
-        if w != s
-            _copy_col!(ws.x, w, ws.x, s, len)
-            _copy_col!(ws.v, w, ws.v, s, len)
-            _copy_col!(ws.h, w, ws.h, s, len)
-            _copy_col!(ws.hbar, w, ws.hbar, s, len)
-            _copy_col!(ws.u, w, ws.u, s, mlen)
-            for f in (ws.α, ws.β, ws.αbar, ws.ζbar, ws.ρ, ws.ρbar, ws.cbar, ws.sbar,
-                      ws.normA2, ws.maxrbar, ws.minrbar, ws.atb, ws.rel)
-                f[w] = f[s]
-            end
-            # Swap rather than assign: retired originals stay in the tail, keeping `perm` a bijection
-            # over 1:B. Assigning would leave duplicates, and two slots sharing a destination.
-            ws.perm[w], ws.perm[s] = ws.perm[s], ws.perm[w]
-        end
-    end
-    return w
-end
+nusht_solve!(C, f, plan::NUSHTplan; ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan), kwargs...) =
+    _solve!(C, f, plan, ws; kwargs...)
 
-# One `A` and one `A†`, at the live width. `k` is the live column count the per-column sphere loop
-# narrows to; `kdfn` is the NUFFT plan width, which can only narrow where the backend's plans are
-# able to re-plan at a reduced width (`_width_narrowable`) and otherwise stays at `B`.
-#
-# `A v` lands in the plan's own strengths buffer, so `u ← A v − α u` needs no second point-space array:
-# scale `u` first, then accumulate the synthesis onto it.
-function _lsmr_Av_axpy!(ws::LSMRWorkspace, plan::NUSHTplan, k::Integer, kdfn::Integer, n::Integer)
-    _col_scale!(ws.u, ws.cf, n)
-    # Scatter the packed iterate into the plan's full layout, zeroing the supernumerary slots. This
-    # replaces the `copyto!` the unpacked workspace did, and moves no more memory.
-    _unpack_coeffs!(plan.F, ws.v, ws.valid, _fulllen(plan), plan.B)
-    _sph_evaluate!(plan, k)
-    _dfn_synthesis!(plan, kdfn)
-    return _add_out!(ws.u, _fbuf(plan), plan, n)
-end
-
-# `P A† u`. `ws.w` is the plan's full-layout buffer; gathering it into a packed vector *is* the
-# projection onto the SO(3)-invariant `l ≤ lmax` subspace, so no separate mask multiply is needed.
-function _lsmr_Atu!(ws::LSMRWorkspace, plan::NUSHTplan, k::Integer, kdfn::Integer)
-    _nusht_true_adjoint!(ws.w, ws.u, plan, k, kdfn)
-    return ws.w
-end
-
-"""
-    nusht_solve!(C, f, plan; ws=LSMRWorkspace(plan), maxiter=500, rtol=1e-6, conlim=0, verbose=false)
-
-**Exact inversion:** solve `min ‖A c − f‖` for coefficients `C` by LSMR on the Golub–Kahan
-bidiagonalization of `A`. Batched (`B > 1`) runs the columns as independent single-column solves.
-
-Returns `(;C, iterations = iters, residual = rel_res, converged = converged)` with `rel_res = max_k ‖A†r_k‖/‖A†f_k‖` and
-`converged = rel_res < rtol`; `ws.colres` carries the same residual per column. `rel_res` is LSMR's
-own recurrence value for `‖A†r‖`, floored at `eps(T)` since a relative residual is not resolvable
-below that — so an `rtol` under machine precision never reports convergence.
-
-A column also stops when LSMR's condition estimate exceeds `conlim` (default `1/eps(T)`), or when the
-bidiagonalization terminates exactly. That matters when the points do not determine the coefficients —
-`M` below `(lmax+1)²`, or clustered so that they effectively do not — where `A` is rank deficient and
-the iteration has nothing left to resolve. `converged == false` is the signal that the point set, not
-the budget, was the limit.
-"""
-nusht_solve!(C, f, plan::NUSHTplan; ws::LSMRWorkspace = LSMRWorkspace(plan), kwargs...) =
-    _lsmr!(C, f, plan, ws; kwargs...)
-
-# The solve itself, shared by the scalar and spin paths: they differ only in `_lsmr_Av_axpy!`,
-# `_lsmr_Atu!`, `_lsmr_widths` and `_coefflen`, all of which dispatch on the plan.
-#
-# `reduce!(A)` sums `A` in place over the processes that each hold a plan over a share of the points, and
-# is applied to the two sums over points the recurrence takes: the per-column `‖u‖²` and `A†u`. The
-# coefficient-space vectors are the same on every process, so every process runs the same recurrence and
-# stops on the same iteration.
-function _lsmr!(
-    C, f, plan::AbstractNUSHTplan, ws::LSMRWorkspace;
-    maxiter::Int = 500,
-    rtol::Real = 1e-6,
-    conlim::Real = 0,
-    verbose::Bool = false,
-    reduce!::R = identity,
-) where {R}
-    T = real(eltype(ws.x))
-    FE = eltype(ws.x)
-    _assert_solve(C, f, plan)
-    B = plan.B
-    len = _coefflen(plan)
-    mlen = _npts(plan)
-    clim = conlim > 0 ? T(conlim) : one(T) / eps(T)
-
-    # β₁u₁ = f ; α₁v₁ = P A†u₁
-    _copy_field!(ws.u, f)
-    _col_hdot!(ws.nrm, ws.u, ws.u, B)
-    _mirror!(ws.nrm_h, ws.nrm)
-    reduce!(ws.nrm_h)
-    @inbounds for k in 1:B
-        ws.β[k] = sqrt(ws.nrm_h[k])
-        ws.cf_h[k] = ws.β[k] > 0 ? inv(ws.β[k]) : zero(T)
-    end
-    _push_cf!(ws)
-    _col_scale!(ws.u, ws.cf, B)
-
-    kB, kdfnB = _lsmr_widths(plan, B)
-    reduce!(_lsmr_Atu!(ws, plan, kB, kdfnB))
-    _lsmr_init_v!(ws, plan)
-    _col_hdot!(ws.nrm, ws.v, ws.v, B)
-    _mirror!(ws.nrm_h, ws.nrm)
-    @inbounds for k in 1:B
-        ws.α[k] = sqrt(ws.nrm_h[k])
-        ws.cf_h[k] = ws.α[k] > 0 ? inv(ws.α[k]) : zero(T)
-    end
-    _push_cf!(ws)
-    _col_scale!(ws.v, ws.cf, B)
-
-    fill!(ws.x, zero(FE))
-    fill!(ws.hbar, zero(FE))
-    copyto!(ws.h, ws.v)
-    @inbounds for k in 1:B
-        ws.αbar[k] = ws.α[k]
-        ws.ζbar[k] = ws.α[k] * ws.β[k]
-        ws.atb[k] = ws.α[k] * ws.β[k]
-        ws.ρ[k] = one(T); ws.ρbar[k] = one(T); ws.cbar[k] = one(T); ws.sbar[k] = zero(T)
-        ws.normA2[k] = ws.α[k]^2
-        ws.maxrbar[k] = zero(T); ws.minrbar[k] = T(Inf)
-        ws.rel[k] = ws.atb[k] > 0 ? one(T) : zero(T)
-        ws.done[k] = ws.atb[k] > 0 ? zero(T) : one(T)   # A†f = 0 ⟹ c = 0 already solves it
-        ws.colres[k] = ws.rel[k]
-        ws.perm[k] = k
-    end
-
-    nlive = B
-    iters = 0
-    # Columns that were already finished at setup never enter the loop; retire them first.
-    nlive = _retire_and_compact!(C, ws, plan, rtol, nlive, len, mlen)
-    for i in 1:maxiter
-        nlive == 0 && break
-        iters = i
-
-        # Bidiagonalization: u ← A v − α u, β = ‖u‖, u /= β
-        @inbounds for k in 1:nlive
-            ws.cf_h[k] = -ws.α[k]
-        end
-        k, kdfn = _lsmr_widths(plan, nlive)
-        _push_cf!(ws)
-        _lsmr_Av_axpy!(ws, plan, k, kdfn, nlive)
-        _col_hdot!(ws.nrm, ws.u, ws.u, nlive)
-        _mirror!(ws.nrm_h, ws.nrm)
-        reduce!(ws.nrm_h)
-        @inbounds for k in 1:nlive
-            ws.β[k] = sqrt(max(ws.nrm_h[k], zero(T)))
-            ws.cf_h[k] = ws.β[k] > 0 ? inv(ws.β[k]) : zero(T)
-        end
-        _push_cf!(ws)
-        _col_scale!(ws.u, ws.cf, nlive)
-
-        # v ← P A†u − β v, α = ‖v‖, v /= α
-        @inbounds for k in 1:nlive
-            ws.cf_h[k] = -ws.β[k]
-        end
-        _push_cf!(ws)
-        reduce!(_lsmr_Atu!(ws, plan, k, kdfn))
-        _lsmr_fold_v!(ws, plan, nlive)
-        _col_hdot!(ws.nrm, ws.v, ws.v, nlive)
-        _mirror!(ws.nrm_h, ws.nrm)
-        @inbounds for k in 1:nlive
-            ws.α[k] = sqrt(max(ws.nrm_h[k], zero(T)))
-            ws.cf_h[k] = ws.α[k] > 0 ? inv(ws.α[k]) : zero(T)
-        end
-        _push_cf!(ws)
-        _col_scale!(ws.v, ws.cf, nlive)
-
-        # Plane rotations (scalar per column) and the update coefficients they produce.
-        @inbounds for k in 1:nlive
-            ρold = ws.ρ[k]
-            ρbarold = ws.ρbar[k]
-            r = hypot(ws.αbar[k], ws.β[k])
-            c = r > 0 ? ws.αbar[k] / r : one(T)
-            s = r > 0 ? ws.β[k] / r : zero(T)
-            θnew = s * ws.α[k]
-            ws.αbar[k] = c * ws.α[k]
-            ws.ρ[k] = r
-
-            θbar = ws.sbar[k] * r
-            ρtemp = ws.cbar[k] * r
-            rb = hypot(ρtemp, θnew)
-            ws.cbar[k] = rb > 0 ? ρtemp / rb : one(T)
-            ws.sbar[k] = rb > 0 ? θnew / rb : zero(T)
-            ws.ρbar[k] = rb
-            ζ = ws.cbar[k] * ws.ζbar[k]
-            ws.ζbar[k] = -ws.sbar[k] * ws.ζbar[k]
-
-            # ‖A‖ and cond(A) estimates from the bidiagonal entries (Fong & Saunders §5.2).
-            ws.normA2[k] += ws.β[k]^2
-            ws.maxrbar[k] = max(ws.maxrbar[k], ρbarold)
-            i > 1 && (ws.minrbar[k] = min(ws.minrbar[k], ρbarold))
-            condA = max(ws.maxrbar[k], ρtemp) / max(min(ws.minrbar[k], ρtemp), eps(T))
-            ws.normA2[k] += ws.α[k]^2
-
-            # Reported floored at `eps(T)`: a relative residual is not resolvable below it, and `ζbar`
-            # — a running product of factors `|s̄| ≤ 1` — underflows to exactly zero long before the
-            # true residual does, which would otherwise report convergence at any `rtol` whatsoever.
-            raw = ws.atb[k] > 0 ? abs(ws.ζbar[k]) / ws.atb[k] : zero(T)
-            ws.rel[k] = ws.atb[k] > 0 ? max(raw, eps(T)) : zero(T)
-            # Reaching that floor is itself a stopping condition: there is nothing further to extract,
-            # whatever `rtol` asked for. Without it an `rtol` below `eps(T)` runs the whole budget.
-            degenerate = !(r > 0) || !(rb > 0) || ws.α[k] == 0 || ws.β[k] == 0 || raw <= eps(T)
-            ws.done[k] = (ws.rel[k] < rtol || condA >= clim || degenerate) ? one(T) : zero(T)
-
-            # hbar and x update coefficients; h's is θnew/ρ = β·α/ρ², recoverable from stored state.
-            ws.cf_h[k] = ρold * ρbarold > 0 ? -(θbar * r / (ρold * ρbarold)) : zero(T)
-            ws.nrm_h[k] = r * rb > 0 ? ζ / (r * rb) : zero(T)
-        end
-
-        # hbar ← h − c₁·hbar ; x ← x + c₂·hbar ; h ← v − c₃·h
-        _push_cf!(ws)
-        _col_pbp!(ws.hbar, ws.h, ws.cf, nlive)
-        @inbounds for k in 1:nlive
-            ws.cf_h[k] = ws.nrm_h[k]
-        end
-        _push_cf!(ws)
-        _col_axpy!(ws.x, ws.cf, ws.hbar, one(FE), nlive)
-        @inbounds for k in 1:nlive
-            ws.cf_h[k] = ws.ρ[k] > 0 ? -(ws.β[k] * ws.α[k] / ws.ρ[k]^2) : zero(T)
-        end
-        _push_cf!(ws)
-        _col_pbp!(ws.h, ws.v, ws.cf, nlive)
-
-        verbose && @info "nusht_solve! iter $i: rel_res=$(_max_prefix(ws.rel, nlive)) live=$nlive"
-        nlive = _retire_and_compact!(C, ws, plan, rtol, nlive, len, mlen)
-    end
-
-    # Whatever is still live at exit ran out of budget rather than finishing.
-    @inbounds for s in 1:nlive
-        _write_solution!(C, ws, plan, s, ws.perm[s])
-        ws.colres[ws.perm[s]] = ws.rel[s]
-    end
-    worst = maximum(ws.colres)
-    return (; C = C, iterations = iters, residual = worst, converged = worst < rtol)
+# The fit through `op`: a plan, or a plan's share of the points (`_PointShare`).
+function _solve!(C, f, op, ws::FTB.LSMRWorkspace{T}; maxiter::Integer = 500, rtol::Real = 1e-6,
+                 conlim::Real = 0) where {T}
+    info = FTB.lsmr!(C, op, f, ws; maxiter, rtol, conlim = conlim > 0 ? conlim : inv(eps(T)))
+    return (; C, iterations = info.iterations, residual = info.residual, converged = info.converged)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -849,7 +514,7 @@ end
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
-    nusht_filter!(f_out, f_in, filter, plan; ws=LSMRWorkspace(plan), kwargs...)
+    nusht_filter!(f_out, f_in, filter, plan; ws = FlowTransformBindings.LSMRWorkspace(plan), kwargs...)
 
 Apply a spectral filter to `f_in` at the scattered points, writing to `f_out` (both length-`M` /
 `(M, B)`): fit coefficients with [`nusht_solve!`](@ref) → `apply_transfer!` (× H(ℓ)) → `nusht_type2!`.
@@ -862,7 +527,7 @@ and only on a quadrature grid do the two coincide. So filtering scattered data i
 `ws` and reuse it across calls.
 """
 function nusht_filter!(f_out, f_in, filter, plan::NUSHTplan;
-                       ws::LSMRWorkspace = LSMRWorkspace(plan), kwargs...)
+                       ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan), kwargs...)
     scratch = _filter_scratch(plan)
     nusht_solve!(scratch, f_in, plan; ws = ws, kwargs...)
     nusht_synthesize!(f_out, scratch, filter, plan)
@@ -879,7 +544,7 @@ are set to 0. Pass a reusable `mask_filt` scratch (shaped like `f_out`) to run a
 """
 function nusht_filter_renorm!(f_out, mask, filter, plan::NUSHTplan{T};
                               mask_filt = similar(f_out),
-                              ws::LSMRWorkspace = LSMRWorkspace(plan),
+                              ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan),
                               C_mask = nothing) where {T}
     # `C_mask` lets a multi-scale caller fit the scale-independent mask once and pass its coefficients
     # to every call; without it the mask is fitted here, which is the expensive half.

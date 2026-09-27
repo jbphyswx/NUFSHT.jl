@@ -10,6 +10,7 @@ Run from the package directory:
 """
 
 using NUFSHT: NUFSHT
+using FlowTransformBindings: FlowTransformBindings as FTB
 using Random: Random
 
 function best_time(f!, n)
@@ -49,7 +50,7 @@ end
 
 # LSMR solve (reuses the two guru plans across every matvec — no re-planning).
 Csolve = zeros(Nθ, Nφ)
-ws = NUFSHT.LSMRWorkspace(plan)
+ws = FTB.LSMRWorkspace(plan)
 tsolve = best_time(() -> NUFSHT.nusht_solve!(Csolve, f, plan; ws = ws, rtol = 1e-6, maxiter = 400), 3)
 _, iters, rel = NUFSHT.nusht_solve!(Csolve, f, plan; ws = ws, rtol = 1e-6, maxiter = 400)
 println("\nnusht_solve!  $iters LSMR iters, rel_res=$(round(rel; sigdigits = 2))  ->  ",

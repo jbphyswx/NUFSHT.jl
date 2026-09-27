@@ -368,7 +368,7 @@ to be shifted per point.
 struct NUSHTplan{T<:AbstractFloat, FE<:Number, AT3<:AbstractArray{FE,3},
                  AT2<:AbstractMatrix, CT3<:AbstractArray{Complex{T},3},
                  ND<:AbstractNodeSet, SP, SPADJ, SPL, SZP, RCP,
-                 FT} <: AbstractNUSHTplan
+                 FT, IV<:AbstractVector{Int}} <: AbstractNUSHTplan
     lmax::Int
     Nθ::Int
     Nφ::Int
@@ -384,6 +384,7 @@ struct NUSHTplan{T<:AbstractFloat, FE<:Number, AT3<:AbstractArray{FE,3},
     sph_pool::SPL                 # per-task slice + plans for the threaded column loops; see _sph_pool
     size_pool::SZP                # narrower plan sets, filled on demand; see _nufft_size_pool
     pool_recipe::RCP              # what building one needs that the plan cannot supply
+    valid::Base.RefValue{Union{Nothing,IV}}   # the fit's packed slots, built by the first solve; see _valid_indices
 end
 
 """
@@ -440,8 +441,9 @@ function plan_memory(plan::NUSHTplan)
     nodes  = Base.summarysize(_θnodes(plan)) + Base.summarysize(_φnodes(plan))
     pool   = Base.summarysize(plan.size_pool)
     sph    = Base.summarysize(plan.sph_pool)
-    return (; C, F, Fhat, Fslice, fbuf, nodes, size_pool = pool, sph_pool = sph,
-            total = C + F + Fhat + Fslice + fbuf + nodes + pool + sph)
+    valid  = slot(plan.valid)
+    return (; C, F, Fhat, Fslice, fbuf, nodes, size_pool = pool, sph_pool = sph, valid,
+            total = C + F + Fhat + Fslice + fbuf + nodes + pool + sph + valid)
 end
 
 """
@@ -571,11 +573,13 @@ function make_plan(
 
     nodes = _node_set(Val(variable_npts), θ, φ, θ, θ_shift, fbuf, nufft_type2, nufft_type1)
 
+    IV = typeof(similar(θ, Int, 0))
     return NUSHTplan{T, FE, typeof(F), typeof(Fslice), typeof(Fhat), typeof(nodes),
                      typeof(sph_plan), typeof(sph_plan_adj),
-                     typeof(sph_pool), typeof(size_pool), typeof(pool_recipe), typeof(tol64)}(
+                     typeof(sph_pool), typeof(size_pool), typeof(pool_recipe), typeof(tol64), IV}(
         lmax, Nθ, Nφ, B, tol64, nodes, C, F, Fhat, Fslice,
         sph_plan, sph_plan_adj, sph_pool, size_pool, pool_recipe,
+        Base.RefValue{Union{Nothing,IV}}(nothing),
     )
 end
 

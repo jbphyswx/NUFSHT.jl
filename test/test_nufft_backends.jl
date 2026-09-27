@@ -123,18 +123,21 @@ Test.@testset "plan_memory accounts for every buffer, empty ones included" begin
     p = NUFSHT.make_plan(Float64, θ, φ, lmax; tol = 1e-10, nthreads = 1)
     pm = NUFSHT.plan_memory(p)
     Test.@test pm.total == pm.C + pm.F + pm.Fhat + pm.Fslice + pm.fbuf + pm.nodes +
-                           pm.size_pool + pm.sph_pool
-    # Only filtering needs a coefficient scratch, so a plan that has never filtered holds none.
+                           pm.size_pool + pm.sph_pool + pm.valid
+    # Only filtering needs a coefficient scratch and only a solve the packed slots, so a plan that has
+    # done neither holds neither.
     Test.@test p.C[] === nothing && pm.C == 0
+    Test.@test p.valid[] === nothing && pm.valid == 0
     Test.@test pm.F > 0 && pm.Fhat > 0 && pm.fbuf > 0
 
     C = rand_coeffs(lmax, 73)
     f = zeros(M); NUFSHT.nusht_type2!(f, C, p)
     Test.@test p.C[] === nothing
-    out = zeros(M); ws = NUFSHT.LSMRWorkspace(p)
+    out = zeros(M); ws = FTB.LSMRWorkspace(p)
     NUFSHT.nusht_filter!(out, f, NUFSHT.gaussian_from_scale(2000e3), p; ws = ws)
     Test.@test p.C[] !== nothing
     Test.@test NUFSHT.plan_memory(p).C > 0
+    Test.@test NUFSHT.plan_memory(p).valid > 0
     Test.@test NUFSHT.plan_memory(p).total > pm.total
     NUFSHT.close!(p)
 end

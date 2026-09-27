@@ -42,7 +42,7 @@ Test.@testset "Euclidean adjoint, zero-allocation, and batching" begin
         filt = NUFSHT.gaussian_from_scale(2000e3)
         # Filtering fits coefficients, so it needs a solver workspace; supplying one is what makes it
         # allocation-free, exactly as the docstring says.
-        ws = NUFSHT.LSMRWorkspace(fp)
+        ws = FTB.LSMRWorkspace(fp)
         NUFSHT.nusht_type2!(out, C, fp)          # warmup
         NUFSHT.nusht_type1!(Cout, f, fp)
         NUFSHT._nusht_true_adjoint!(Aty, f, fp)
@@ -61,7 +61,7 @@ Test.@testset "Euclidean adjoint, zero-allocation, and batching" begin
         end
         NUFSHT.close!(fp)
 
-        aws = NUFSHT.LSMRWorkspace(plan)
+        aws = FTB.LSMRWorkspace(plan)
         NUFSHT.nusht_type2!(out, C, plan); NUFSHT.nusht_type1!(Cout, f, plan)
         NUFSHT._nusht_true_adjoint!(Aty, f, plan); NUFSHT.nusht_filter!(out, f, filt, plan; ws = aws)
         @info "default-backend per-call allocation (backend exec included): type2=$(_alloc_t2(out, C, plan)) B, type1=$(_alloc_t1(Cout, f, plan)) B, adjoint=$(_alloc_adj(Aty, f, plan)) B"

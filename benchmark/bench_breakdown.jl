@@ -77,7 +77,7 @@ function run(lmax, M, FE, be, tol = 1e-8)
     _, t2 = timed(() -> NUFSHT.nusht_type2!(f, C, p), 5)
 
     NUFSHT.nusht_type2!(f, C, p)
-    S = zeros(FE, N, Nf); ws = NUFSHT.LSMRWorkspace(p)
+    S = zeros(FE, N, Nf); ws = FTB.LSMRWorkspace(p)
     _, tsolve = timed(() -> NUFSHT.nusht_solve!(S, f, p; ws = ws, rtol = 1e-6, maxiter = 20), 2)
     _, iters, = NUFSHT.nusht_solve!(S, f, p; ws = ws, rtol = 1e-6, maxiter = 20)
 

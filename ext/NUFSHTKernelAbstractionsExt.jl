@@ -224,40 +224,12 @@ function NUFSHT._assemble_G_adjoint_impl!(sf::GPUArraysCore.AbstractGPUArray, Ĝ
     return sf
 end
 
-# ── Device solver column primitives ─────────────────────────────────────────────
-# The per-column workspace ops as device-generic broadcasts/reductions (the `src` versions are CPU
-# scalar loops), dispatched on the data array being a device array, so `nusht_solve!` and
-# `nusht_solve_spin!` run on the GPU. One set serves both paths: `_col_hdot!` degenerates to the plain
-# dot product on a real array, since `conj` and `real` are identities there.
-#
-# `_cols` flattens a batch buffer to (stride, columns) so one method serves point space and
-# coefficient space, matching the linear-column addressing the `src` versions use.
+# ── Device solver steps ─────────────────────────────────────────────────────────
+# The column-wise steps of `nusht_solve!` and `nusht_solve_spin!` that are NUFSHT's own, as broadcasts
+# over the first `n` columns; FlowTransformBindings supplies the generic column updates and norms.
+# `_cols` flattens a batch buffer to (stride, columns), so one method serves point space and
+# coefficient space.
 @inline _cols(A, n) = view(reshape(A, :, size(A, ndims(A))), :, 1:n)
-#
-# The trailing `n` is the live column count a compacted solve narrows to; the solver passes it on
-# every call, so these must accept it or they are not the methods it selects. `src` takes a count
-# rather than a view to stay allocation-free; here a view costs nothing against the kernel launch.
-function NUFSHT._col_hdot!(dst, a::GPUArraysCore.AbstractGPUArray, b,      # dst[k] = Re Σ conj(a)·b
-                           n::Integer = size(a, ndims(a)))
-    av = _cols(a, n); bv = _cols(b, n)
-    view(dst, 1:n) .= dropdims(sum(real.(conj.(av) .* bv); dims = 1); dims = 1)
-    return dst
-end
-function NUFSHT._col_axpy!(y::GPUArraysCore.AbstractGPUArray, α, x, σ,     # y[:,k] += σ·α[k]·x[:,k]
-                           n::Integer = size(y, ndims(y)))
-    _cols(y, n) .+= σ .* reshape(view(α, 1:n), 1, :) .* _cols(x, n)
-    return y
-end
-function NUFSHT._col_pbp!(p::GPUArraysCore.AbstractGPUArray, r, β,         # p[:,k] = r[:,k] + β[k]·p[:,k]
-                          n::Integer = size(p, ndims(p)))
-    _cols(p, n) .= _cols(r, n) .+ reshape(view(β, 1:n), 1, :) .* _cols(p, n)
-    return p
-end
-function NUFSHT._col_scale!(y::GPUArraysCore.AbstractGPUArray, s,          # y[:,k] *= s[k]
-                            n::Integer = size(y, ndims(y)))
-    _cols(y, n) .*= reshape(view(s, 1:n), 1, :)
-    return y
-end
 
 # ── Device pack/unpack between the packed solver vectors and the plan's full layout ──────────────
 # The scalar solver carries its vectors packed to the `l ≤ lmax` slots, so crossing to and from the
@@ -284,12 +256,11 @@ function NUFSHT._col_pbp_pack!(v::GPUArraysCore.AbstractGPUArray, wfull, β, idx
     return v
 end
 
-function NUFSHT._write_solution!(C::GPUArraysCore.AbstractGPUArray, ws::NUFSHT.LSMRWorkspace,
-                                 plan::NUFSHT.NUSHTplan, slot::Integer, dstcol::Integer)
-    full = NUFSHT._fulllen(plan)
+function NUFSHT._write_solution!(C::GPUArraysCore.AbstractGPUArray, x, idx, full::Integer,
+                                 slot::Integer, dstcol::Integer)
     col = view(reshape(C, full, :), :, dstcol)
     fill!(col, zero(eltype(C)))
-    view(col, ws.valid) .= view(reshape(ws.x, length(ws.valid), :), :, slot)
+    view(col, idx) .= view(reshape(x, length(idx), :), :, slot)
     return C
 end
 
@@ -329,12 +300,12 @@ function NUFSHT._pack_herm!(p::GPUArraysCore.AbstractGPUArray, g, lmax::Integer,
     return p
 end
 
-function NUFSHT._write_solution!(C::GPUArraysCore.AbstractGPUArray, ws::NUFSHT.LSMRWorkspace,
-                                 plan::NUFSHT.SpinNUSHTplan, slot::Integer, dstcol::Integer,
+function NUFSHT._write_solution!(C::GPUArraysCore.AbstractGPUArray, x, plan::NUFSHT.SpinNUSHTplan,
+                                 slot::Integer, dstcol::Integer,
                                  ::Union{NUFSHT.FoldedComplex,NUFSHT.FoldedReal})
     lmax = plan.lmax
     backend = KernelAbstractions.get_backend(C)
-    _unpack_herm_kern!(backend)(_as3(C, lmax), ws.x, lmax, NUFSHT._herm_len(lmax), Int(slot) - 1,
+    _unpack_herm_kern!(backend)(_as3(C, lmax), x, lmax, NUFSHT._herm_len(lmax), Int(slot) - 1,
                                 Int(dstcol) - 1; ndrange = (lmax + 1, 2lmax + 1, 1))
     _sync(backend)
     return C

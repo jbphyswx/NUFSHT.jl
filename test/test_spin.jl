@@ -296,7 +296,8 @@ Test.@testset "real-field spin solve fits the Hermitian degrees" begin
 
     for be in (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend())
         p = NUFSHT.make_spin_plan(Float64, θ, φ, lmax, 0; tol = 1e-13, nthreads = 1, nufft = be)
-        Test.@test NUFSHT._coefflen(p) == K            # the fit runs over the real degrees
+        x = FTB.LSMRWorkspace(p).x                     # the fit runs over the real degrees
+        Test.@test length(x) == K && eltype(x) == Float64
         f = zeros(M); NUFSHT.nusht_type2_spin!(f, sf, p)
         S = zeros(ComplexF64, N, Nf)
         _, it, relres, conv = NUFSHT.nusht_solve_spin!(S, f, p; rtol = 1e-11, maxiter = 500)
@@ -307,7 +308,7 @@ Test.@testset "real-field spin solve fits the Hermitian degrees" begin
 
     # A complex plan carries the full array and is unaffected by any of the above.
     pc = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 0; tol = 1e-13, nthreads = 1)
-    Test.@test NUFSHT._coefflen(pc) == N * Nf
+    Test.@test length(FTB.LSMRWorkspace(pc).x) == N * Nf
     fc = zeros(ComplexF64, M); NUFSHT.nusht_type2_spin!(fc, sf, pc)
     Sc = zeros(ComplexF64, N, Nf)
     _, itc, _, convc = NUFSHT.nusht_solve_spin!(Sc, fc, pc; rtol = 1e-11, maxiter = 500)

@@ -23,6 +23,7 @@ module NUFSHTMPIExt
 
 using NUFSHT: NUFSHT
 using ComputationalBackends: ComputationalBackends
+using FlowTransformBindings: FlowTransformBindings as FTB
 using MPI: MPI
 
 # A custom MPI backend must carry the communicator the same way `ComputationalBackends.MPIBackend`
@@ -43,7 +44,7 @@ function NUFSHT.nusht_type1!(C, f_local, plan::NUFSHT.NUSHTplan, backend::Comput
 end
 
 """
-    nusht_solve!(C, f_local, plan, MPIBackend(; comm); ws = LSMRWorkspace(plan), maxiter, rtol, conlim, verbose)
+    nusht_solve!(C, f_local, plan, MPIBackend(; comm); ws = FlowTransformBindings.LSMRWorkspace(plan), maxiter, rtol, conlim)
     nusht_solve_spin!(sf, f_local, plan, MPIBackend(; comm); …)
 
 MPI point-decomposed **exact inversion**: the least-squares fit over the points of every rank, each
@@ -51,17 +52,19 @@ rank's `plan` over its own points. Same contract and return as the single-proces
 [`nusht_solve!`](@ref) and [`nusht_solve_spin!`](@ref), with the coefficients replicated on every rank.
 """
 function NUFSHT.nusht_solve!(C, f_local, plan::NUFSHT.NUSHTplan, backend::ComputationalBackends.AbstractMPIBackend;
-                             ws::NUFSHT.LSMRWorkspace = NUFSHT.LSMRWorkspace(plan), kwargs...)
-    comm = _comm(backend)
-    return NUFSHT._lsmr!(C, f_local, plan, ws; reduce! = A -> MPI.Allreduce!(A, +, comm), kwargs...)
+                             ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan), kwargs...)
+    return NUFSHT._solve!(C, f_local, _ranks(plan, _comm(backend)), ws; kwargs...)
 end
 
 function NUFSHT.nusht_solve_spin!(sf, f_local, plan::NUFSHT.SpinNUSHTplan,
                                   backend::ComputationalBackends.AbstractMPIBackend;
-                                  ws::NUFSHT.LSMRWorkspace = NUFSHT.LSMRWorkspace(plan), kwargs...)
-    comm = _comm(backend)
-    return NUFSHT.nusht_solve_spin!(sf, f_local, plan; ws = ws, reduce! = A -> MPI.Allreduce!(A, +, comm), kwargs...)
+                                  ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan), kwargs...)
+    NUFSHT._check_spin_solvable(plan)
+    return NUFSHT._solve!(sf, f_local, _ranks(plan, _comm(backend)), ws; kwargs...)
 end
+
+# `plan` over this rank's points, its sums over points added across the ranks of `comm`.
+_ranks(plan, comm) = NUFSHT._PointShare(plan, A -> MPI.Allreduce!(A, +, comm))
 
 # ── A plan over every point, divided among the ranks ─────────────────────────────────────────────────
 
@@ -102,7 +105,7 @@ end
 
 NUFSHT.allocate_coefficients(p::MPINUSHTplan) = NUFSHT.allocate_coefficients(p.plan)
 NUFSHT.coefficient_size(p::MPINUSHTplan) = NUFSHT.coefficient_size(p.plan)
-NUFSHT.LSMRWorkspace(p::MPINUSHTplan) = NUFSHT.LSMRWorkspace(p.plan)
+FTB.LSMRWorkspace(p::MPINUSHTplan) = FTB.LSMRWorkspace(p.plan)
 NUFSHT.close!(p::MPINUSHTplan) = NUFSHT.close!(p.plan)
 
 # This rank's rows of a whole field, a vector or a column per transform.
@@ -135,13 +138,12 @@ function NUFSHT.nusht_type1!(C, f, p::MPINUSHTplan)
     return MPI.Allreduce!(C, +, p.comm)
 end
 
-function NUFSHT.nusht_solve!(C, f, p::MPINUSHTplan; ws::NUFSHT.LSMRWorkspace = NUFSHT.LSMRWorkspace(p), kwargs...)
-    comm = p.comm
-    return NUFSHT._lsmr!(C, _own(_checked(f, p), p), p.plan, ws; reduce! = A -> MPI.Allreduce!(A, +, comm), kwargs...)
+function NUFSHT.nusht_solve!(C, f, p::MPINUSHTplan; ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(p), kwargs...)
+    return NUFSHT._solve!(C, _own(_checked(f, p), p), _ranks(p.plan, p.comm), ws; kwargs...)
 end
 
 function NUFSHT.nusht_filter!(f_out, f_in, filter, p::MPINUSHTplan;
-                              ws::NUFSHT.LSMRWorkspace = NUFSHT.LSMRWorkspace(p), kwargs...)
+                              ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(p), kwargs...)
     C = NUFSHT._filter_scratch(p.plan)
     NUFSHT.nusht_solve!(C, f_in, p; ws = ws, kwargs...)
     return NUFSHT.nusht_synthesize!(f_out, C, filter, p)

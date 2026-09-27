@@ -316,7 +316,7 @@ nusht_filter_renorm!(f_out, mask, filt, plan)   # divide by filtered mask
 | `allocate_coefficients(plan)` | A zeroed coefficient array of `coefficient_size(plan)`, on the plan's device |
 | `nusht_type2!(f, C, plan)` | Synthesis: SH coefficients → scattered field values |
 | `nusht_type1!(C, f, plan)` | Adjoint `A†` (the transpose, not an inverse) |
-| `nusht_solve!(C, f, plan; maxiter, rtol, verbose)` | Exact LSMR inversion at any scattered points |
+| `nusht_solve!(C, f, plan; ws, maxiter, rtol, conlim)` | Exact LSMR inversion at any scattered points |
 | `nusht_filter!(f_out, f_in, filter, plan; ws)` | Spectral filter: solve → multiply → type2 |
 | `nusht_filter_renorm!(f_out, mask, filter, plan)` | Correct land-mask bias after `nusht_filter!` |
 | `GaussianTransfer(σ²)` | Gaussian filter `H(ℓ) = exp(-ℓ(ℓ+1)σ²/2)` |
@@ -333,9 +333,8 @@ C, iters, rel_res, converged = nusht_solve!(C, f, plan; rtol=1e-6, maxiter=500)
 
 - `C`: output coefficient array (overwritten in-place)
 - `iters`: number of solver iterations performed
-- `rel_res`: relative residual `‖A†r‖/‖A†f‖` of the coefficients in `C` — the worst column when
-  `ntrans > 1`, with `ws.colres` carrying them per column. Floored at `eps(T)`, since a relative
-  residual is not resolvable below machine precision.
+- `rel_res`: relative residual `‖A†r‖/‖A†f‖` of the coefficients in `C`, at least `eps(T)`: the worst
+  column when `ntrans > 1`, with `ws.residual` holding each column's and `ws.status` its stopping test.
 - `converged`: `rel_res < rtol`
 
 `‖A†r‖` decreases monotonically under LSMR, so a larger `maxiter` never returns a worse answer. A

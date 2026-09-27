@@ -148,7 +148,7 @@ Test.@testset "batched solve retires columns independently" begin
 
     pB = NUFSHT.make_plan(Float64, θ, φ, lmax; ntrans = B)
     fB = zeros(M, B); NUFSHT.nusht_type2!(fB, Ct, pB)
-    ws = NUFSHT.LSMRWorkspace(pB)
+    ws = FTB.LSMRWorkspace(pB)
     CB = zeros(N, Nf, B)
     _, _, relB, convB = NUFSHT.nusht_solve!(CB, fB, pB; ws = ws, rtol = 1e-6, maxiter = 500)
     Test.@test convB
@@ -168,9 +168,9 @@ Test.@testset "batched solve retires columns independently" begin
     # written out through it, so it must remain a permutation of 1:B — if it ever repeats an entry, two
     # columns share a destination and one result is silently lost.
     Test.@test sort(collect(ws.perm)) == collect(1:B)
-    # `colres` is per column, in the caller's order — the scalar return is its worst entry.
-    Test.@test relB == maximum(ws.colres)
-    Test.@test all(<(1e-6), ws.colres)
+    # `residual` is per column, in the caller's order — the scalar return is its worst entry.
+    Test.@test relB == maximum(ws.residual)
+    Test.@test all(<(1e-6), ws.residual)
     NUFSHT.close!(pB); NUFSHT.close!(p1)
 end
 
@@ -365,15 +365,15 @@ Test.@testset "batched solve retires a stalled column cleanly" begin
     θ = acos.(2 .* rand(M) .- 1); φ = 2π .* rand(M)
     F = randn(M, B)
     pB = NUFSHT.make_plan(Float64, θ, φ, lmax; ntrans = B, nthreads = 1)
-    ws = NUFSHT.LSMRWorkspace(pB)
+    ws = FTB.LSMRWorkspace(pB)
     CB = zeros(N, Nf, B)
     _, itB, relB, _ = NUFSHT.nusht_solve!(CB, F, pB; ws = ws, rtol = 1e-14, maxiter = 400)
 
     Test.@test all(isfinite, CB)
     Test.@test itB < 400                                  # every column stopped on its own
     Test.@test sort(collect(ws.perm)) == collect(1:B)
-    Test.@test relB == maximum(ws.colres)
-    Test.@test all(<(1), ws.colres)                       # every column beat the x₀ = 0 iterate
+    Test.@test relB == maximum(ws.residual)
+    Test.@test all(<(1), ws.residual)                     # every column beat the x₀ = 0 iterate
     p1 = NUFSHT.make_plan(Float64, θ, φ, lmax; nthreads = 1)
     for b in 1:B
         fr = zeros(M); NUFSHT.nusht_type2!(fr, CB[:, :, b], p1)
