@@ -1,20 +1,18 @@
-"""
-    NUFFT.jl — the `N` step of `A = N·F·S`, behind a backend seam.
-
-The transform cores and plan builders never name a NUFFT library: they call `_nufft_makeplan`,
-`_nufft_setpts!`, `_nufft_exec!` and `_nufft_destroy!`. Plan creation dispatches on the backend and
-takes the nodes, whose array type picks host or device within it; execution, point setting and teardown
-dispatch on the returned handle.
-
-Backends are `SpectralBackends` types:
-
-- `DirectSumSpectralBackend` — implemented here. No dependencies, always available, `O(M·K)`: the
-  correctness reference the fast backends are validated against. Threaded over the axis each direction
-  writes, so `nthreads` means there what it means elsewhere.
-- `FlowTransformBindings.NonuniformFFTsBackend()` (`using NonuniformFFTs`) and
-  `FlowTransformBindings.FINUFFTBackend()` (`using FINUFFT`, cuFINUFFT on `CuArray` nodes): the plans of
-  FlowTransformBindings, which give both a real-data transform.
-"""
+# The `N` step of `A = N·F·S`, behind a backend seam.
+#
+# The transform cores and plan builders never name a NUFFT library: they call `_nufft_makeplan`,
+# `_nufft_setpts!`, `_nufft_exec!` and `_nufft_destroy!`. Plan creation dispatches on the backend and
+# takes the nodes, whose array type picks host or device within it; execution, point setting and teardown
+# dispatch on the returned handle. Every mode array is in `FlowTransformBindings.CenteredModes()` order.
+#
+# Backends are `SpectralBackends` types:
+#
+# - `DirectSumSpectralBackend`: implemented here. No dependencies, always available, `O(M·K)`: the
+#   correctness reference the fast backends are validated against. Threaded over the axis each direction
+#   writes, so `nthreads` means there what it means elsewhere.
+# - `FlowTransformBindings.NonuniformFFTsBackend()` (`using NonuniformFFTs`) and
+#   `FlowTransformBindings.FINUFFTBackend()` (`using FINUFFT`, cuFINUFFT on `CuArray` nodes): the plans of
+#   FlowTransformBindings, which give both a real-data transform.
 
 using SpectralBackends: SpectralBackends
 
@@ -124,11 +122,10 @@ Base.show(io::IO, h::_FTBNUFFT) = print(io, "_FTBNUFFT(type ", h.type, ", ", h.p
 # The seam's thread count `0` and oversampling factor `0` take the backend's own choice; for
 # FlowTransformBindings that is the session's `Threads.nthreads()` and the library's default.
 function _nufft_makeplan(backend::_FTBLibrary, nodes::NTuple{2,AbstractVector}, type, n_modes, iflag,
-                         ntrans, tol; dtype = Float64, strengths = Complex{dtype}, modeord = 0,
+                         ntrans, tol; dtype = Float64, strengths = Complex{dtype},
                          nthreads = nothing, upsampfac = nothing)
     iflag == (type == 2 ? 1 : -1) || throw(ArgumentError(
         "a type-$type NUFFT runs with iflag $(type == 2 ? 1 : -1); got $iflag"))
-    modeord == 0 || throw(ArgumentError("NUFSHT's mode arrays are centered (modeord = 0); got $modeord"))
     nt = (nthreads === nothing || nthreads == 0) ? Threads.nthreads() : Int(nthreads)
     uf = (upsampfac === nothing || upsampfac == 0) ? nothing : Float64(upsampfac)
     p = FTB.plan_nufft(backend, strengths, nodes, (Int(n_modes[1]), Int(n_modes[2]));
@@ -155,9 +152,8 @@ _nufft_destroy!(h::_FTBNUFFT) = FTB.close!(h.plan)
     DirectSumNUFFTPlan{T,V}
 
 Handle for the direct-summation backend: built once over its nodes, points rewritten by
-`_nufft_setpts!`, executed repeatedly. `modeord` is `0` for centered modes and `1` for FFT order;
-NUFSHT's plans use `0`. `nthreads` is resolved at construction (`0` meaning all Julia threads) and
-bounds the split in [`_nufft_exec!`](@ref).
+`_nufft_setpts!`, executed repeatedly. `nthreads` is resolved at construction (`0` meaning all Julia
+threads) and bounds the split in [`_nufft_exec!`](@ref).
 """
 struct DirectSumNUFFTPlan{T<:AbstractFloat, V<:AbstractVector{T}}
     type::Int
@@ -165,29 +161,19 @@ struct DirectSumNUFFTPlan{T<:AbstractFloat, V<:AbstractVector{T}}
     n2::Int
     iflag::Int
     ntrans::Int
-    modeord::Int
     nthreads::Int
     x::V
     y::V
 end
 
-# Frequency carried by index `i` (1-based) of a length-`n` mode axis. FFT order splits at `cld(n,2)`:
-# for odd `n`, which `Nφ = 2lmax+1` always is, the non-negative frequencies run to `(n-1)÷2` inclusive.
-@inline function _mode_freq(i::Int, n::Int, modeord::Int)
-    k = i - 1
-    modeord == 0 && return k - n ÷ 2          # centered: -n÷2 … n-1-n÷2
-    return k < cld(n, 2) ? k : k - n          # FFTW order
-end
-
 function _nufft_makeplan(::SpectralBackends.AbstractDirectSumSpectralBackend, nodes::NTuple{2,AbstractVector},
                          type, n_modes, iflag, ntrans, tol;
-                         dtype = Float64, modeord = 0, nthreads = nothing, kwargs...)
+                         dtype = Float64, nthreads = nothing, kwargs...)
     nt = (isnothing(nthreads) || nthreads == 0) ? Threads.nthreads() : Int(nthreads)
     nt ≥ 1 || throw(ArgumentError("nthreads must be positive (or 0 for all threads), got $nthreads"))
     x = similar(first(nodes), dtype, length(first(nodes)))
     p = DirectSumNUFFTPlan{dtype, typeof(x)}(Int(type), Int(n_modes[1]), Int(n_modes[2]),
-                                             Int(iflag), Int(ntrans), Int(modeord), nt,
-                                             x, similar(x))
+                                             Int(iflag), Int(ntrans), nt, x, similar(x))
     return _nufft_setpts!(p, nodes...)
 end
 
@@ -236,11 +222,11 @@ function _ds_type2!(vals, modes, p::DirectSumNUFFTPlan{T}, nt::Int) where {T}
     fill!(vals, zero(eltype(vals)))
     _ds_split(M, nt) do js
         @inbounds for b in 1:B, i2 in 1:n2
-            k2 = T(_mode_freq(i2, n2, p.modeord))
+            k2 = T(FTB.mode_frequency(FTB.CenteredModes(), i2, n2))
             for i1 in 1:n1
                 c = modes[i1 + (i2 - 1) * n1 + (b - 1) * n1 * n2]
                 iszero(c) && continue
-                k1 = T(_mode_freq(i1, n1, p.modeord))
+                k1 = T(FTB.mode_frequency(FTB.CenteredModes(), i1, n1))
                 for j in js
                     vals[j + (b - 1) * M] += c * cis(s * (k1 * p.x[j] + k2 * p.y[j]))
                 end
@@ -258,9 +244,9 @@ function _ds_type1!(modes, vals, p::DirectSumNUFFTPlan{T}, nt::Int) where {T}
     s = T(p.iflag)
     _ds_split(n2, nt) do i2s
         @inbounds for b in 1:B, i2 in i2s
-            k2 = T(_mode_freq(i2, n2, p.modeord))
+            k2 = T(FTB.mode_frequency(FTB.CenteredModes(), i2, n2))
             for i1 in 1:n1
-                k1 = T(_mode_freq(i1, n1, p.modeord))
+                k1 = T(FTB.mode_frequency(FTB.CenteredModes(), i1, n1))
                 acc = zero(eltype(modes))
                 for j in 1:M
                     acc += vals[j + (b - 1) * M] * cis(s * (k1 * p.x[j] + k2 * p.y[j]))

@@ -195,7 +195,7 @@ Test.@testset "NUFFT backends honour or refuse nthreads" begin
     ref = Dict{Int,Array{ComplexF64}}()
     for nt in (1, 0, Threads.nthreads()), ty in (2, 1)
         p = NUFSHT._nufft_makeplan(ds, (θ, φ), ty, [n1, n2], ty == 2 ? +1 : -1, B, 1e-12;
-                                   dtype = Float64, modeord = 0, nthreads = nt)
+                                   dtype = Float64, nthreads = nt)
         Test.@test p.nthreads == (nt == 0 ? Threads.nthreads() : nt)
         out = ty == 2 ? zeros(ComplexF64, M, B) : zeros(ComplexF64, n1, n2, B)
         NUFSHT._nufft_exec!(p, ty == 2 ? modes : vals, out)

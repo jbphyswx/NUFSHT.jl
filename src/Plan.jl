@@ -18,10 +18,9 @@ export AbstractPlanDirections, SynthesisOnly, SynthesisAndAnalysis
 # selects a real-data transform on a backend that has one (`_real_capable`). A backend without one
 # ignores it.
 @inline _make_nufft(backend, nodes::NTuple{2,AbstractVector}, type, n_modes, iflag, B, tol, ::Type{T},
-                    modeord, nthreads, upsampfac, ::Type{Z} = Complex{T}) where {T,Z} =
+                    nthreads, upsampfac, ::Type{Z} = Complex{T}) where {T,Z} =
     _nufft_makeplan(backend, nodes, type, n_modes, iflag, B, tol;
-                    dtype = T, strengths = Z, modeord = modeord, nthreads = nthreads,
-                    upsampfac = upsampfac)
+                    dtype = T, strengths = Z, nthreads = nthreads, upsampfac = upsampfac)
 
 # Backend-generic zeroed buffer shaped like `ref` (host `Array` for CPU nodes, device array for GPU
 # nodes) — used so a device node set yields device-resident plan buffers.
@@ -125,8 +124,8 @@ end
     _pool_recipe(backend, nt, uf)
 
 The build inputs a narrower plan set needs that cannot be recovered from a plan: the resolved NUFFT
-backend, its thread count and its oversampling factor. Everything else — mode counts, `modeord`,
-tolerance, nodes, realness — is read back off the plan when a width is built. `narrowable` is
+backend, its thread count and its oversampling factor. Everything else — mode counts, tolerance, nodes,
+realness — is read back off the plan when a width is built. `narrowable` is
 [`_width_narrowable`](@ref) of the backend; how the widths are stored is [`_nufft_size_pool`](@ref)'s.
 """
 _pool_recipe(backend, nt, uf) =
@@ -149,13 +148,13 @@ function _build_width!(plan, k::Integer)
     # stores half, a complex half-height one is built at the stored size.
     Z = eltype(_fbuf(plan))
     n_modes = Int64[Z <: Real ? 2plan.lmax + 3 : size(plan.Fhat, 1), plan.Nφ]
-    n2 = _make_nufft(r.backend, (θn, φn), 2, n_modes, +1, k, plan.tol, T, 0, r.nt, r.uf, Z)
+    n2 = _make_nufft(r.backend, (θn, φn), 2, n_modes, +1, k, plan.tol, T, r.nt, r.uf, Z)
     n1 = if plan.nodes.nufft_type1 === nothing
         nothing                                   # mirror the plan's own directions
     elseif _nufft_share_directions(r.backend)
         _nufft_as_type1(n2)                       # same plan, opposite direction — see the seam
     else
-        _make_nufft(r.backend, (θn, φn), 1, n_modes, -1, k, plan.tol, T, 0, r.nt, r.uf, Z)
+        _make_nufft(r.backend, (θn, φn), 1, n_modes, -1, k, plan.tol, T, r.nt, r.uf, Z)
     end
     return (k = Int(k), nufft_type2 = n2, nufft_type1 = n1)
 end
@@ -295,13 +294,13 @@ _node_set(::Val{true}, θ, φ, θn, θs, fbuf, p2, p1) = VariableCountNodes(θ, 
 
 # The analysis plan, or `nothing` when the caller declined it — on every backend, so which calls a plan
 # answers does not depend on which library is loaded.
-_build_analysis(::SynthesisOnly, backend, θ, φ, n_modes, B, tol, ::Type{T}, modeord, nt, uf,
+_build_analysis(::SynthesisOnly, backend, θ, φ, n_modes, B, tol, ::Type{T}, nt, uf,
                 ::Type{Z}, p2) where {T,Z} = nothing
 
-function _build_analysis(::SynthesisAndAnalysis, backend, θ, φ, n_modes, B, tol, ::Type{T}, modeord,
-                         nt, uf, ::Type{Z}, p2) where {T,Z}
+function _build_analysis(::SynthesisAndAnalysis, backend, θ, φ, n_modes, B, tol, ::Type{T}, nt, uf,
+                         ::Type{Z}, p2) where {T,Z}
     _nufft_share_directions(backend) && return _nufft_as_type1(p2)
-    return _make_nufft(backend, (θ, φ), 1, n_modes, -1, B, tol, T, modeord, nt, uf, Z)
+    return _make_nufft(backend, (θ, φ), 1, n_modes, -1, B, tol, T, nt, uf, Z)
 end
 
 # Internal accessors for the point-dependent fields, so the rest of the package is written against
@@ -349,8 +348,8 @@ Fields:
 `nodes.nufft_type2` is the type-2 handle (`iflag = +1`, synthesis N) and `nodes.nufft_type1` the
 type-1 handle (`iflag = -1`, adjoint N†). `iflag = +1` supplies the reconstruction sign directly, so the
 modes need no conjugate-transpose. The axis convention is `x = θ`, `y = φ`, and both mode axes are in
-centered order (`modeord = 0`) — which the signed wavenumber ranges above already are, so nothing has
-to be shifted per point.
+`FlowTransformBindings.CenteredModes()` order, the signed wavenumber ranges above, so nothing is shifted
+per point.
 """
 struct NUSHTplan{T<:AbstractFloat, FE<:Number, AT3<:AbstractArray{FE,3},
                  AT2<:AbstractMatrix, CT3<:AbstractArray{Complex{T},3},
@@ -490,8 +489,8 @@ function make_plan(
     φ = T.(φ_nodes)
 
     # `plan_sph2fourier` already yields the DFS bivariate Fourier series, so the NUFFT's mode array is
-    # assembled straight from it (`_assemble_modes!`). Both axes are signed and centered, which is
-    # `modeord = 0` exactly, with no offset to undo per point. θ reaches lmax+1 where φ reaches lmax:
+    # assembled straight from it (`_assemble_modes!`). Both axes are signed and centered,
+    # `FTB.CenteredModes()`, with no offset to undo per point. θ reaches lmax+1 where φ reaches lmax:
     # the supernumerary slots of the square coefficient array carry degrees up to `lmax+|m|`, and an
     # odd-order column's last row is the sine at frequency `lmax+1`.
     nub = _resolve_nufft(nufft, FE)
@@ -533,17 +532,15 @@ function make_plan(
     # A real transform is built for the full θ axis and stores its half; a complex half-height one is
     # built at the stored size.
     n_modes = Int64[r2c ? Nk : Nkstore, Nφ]
-    modeord = 0                               # centered: both mode axes are signed and symmetric
     nt = nthreads === nothing ? 0 : Int(nthreads)
     uf = upsampfac === nothing ? 0.0 : Float64(upsampfac)
     # Where a backend's plan carries no direction, one object serves both and the second is a handle
     # onto it — that halves the oversampled grid and the sorted point copy the plan owns, and its
     # points are already set.
-    nufft_type2 = _make_nufft(nub, (θ, φ), 2, n_modes, +1, B, tol64, T, modeord, nt, uf, ZS)
+    nufft_type2 = _make_nufft(nub, (θ, φ), 2, n_modes, +1, B, tol64, T, nt, uf, ZS)
     # The type-1 plan: the type-2 plan itself on a backend whose plan serves both directions, and none
     # for a synthesis-only plan.
-    nufft_type1 = _build_analysis(directions, nub, θ, φ, n_modes, B, tol64, T, modeord, nt, uf, ZS,
-                                  nufft_type2)
+    nufft_type1 = _build_analysis(directions, nub, θ, φ, n_modes, B, tol64, T, nt, uf, ZS, nufft_type2)
     # A scalar plan hands the NUFFT the colatitudes unchanged, so `θ_nufft` aliases `θ_nodes` and costs
     # no extra storage; a spin plan negates them and owns a separate array.
     pool_recipe = _pool_recipe(nub, nt, uf)

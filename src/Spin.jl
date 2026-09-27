@@ -221,8 +221,8 @@ function make_spin_plan(::Type{FE}, θ_nodes, φ_nodes, lmax::Integer, s::Intege
     θ_shift = (realfield && !r2c) ?
         _to_like(θ, Complex{T}.(cis.(T(Lθ ÷ 2) .* negθ))) : nothing
 
-    # NUFFT built through the backend seam, on the device of the nodes. `modeord = 0` (centered): the G
-    # mode array is already centered.
+    # NUFFT built through the backend seam, on the device of the nodes; the G mode array is centered, the
+    # seam's order.
     tol64 = Float64(tol)
     # A real transform covers the full θ axis and stores its half; a complex half-height one is built
     # at the stored size.
@@ -232,9 +232,8 @@ function make_spin_plan(::Type{FE}, θ_nodes, φ_nodes, lmax::Integer, s::Intege
     uf = upsampfac === nothing ? 0.0 : Float64(upsampfac)
     # See `_nufft_share_directions`: where the backend's plan carries no direction, one object serves
     # both and the second is a handle onto it, already pointed at the same nodes.
-    nufft_type2 = _make_nufft(nub, (negθ, φ), 2, n_modes, +1, B, tol64, T, 0, nt, uf, ZS)
-    nufft_type1 = _build_analysis(directions, nub, negθ, φ, n_modes, B, tol64, T, 0, nt, uf,
-                                  ZS, nufft_type2)
+    nufft_type2 = _make_nufft(nub, (negθ, φ), 2, n_modes, +1, B, tol64, T, nt, uf, ZS)
+    nufft_type1 = _build_analysis(directions, nub, negθ, φ, n_modes, B, tol64, T, nt, uf, ZS, nufft_type2)
     # `negθ` is this plan's `θ_nufft`, a separate array: the NUFFT is handed the negated colatitudes,
     # which absorbs the e^{-im'θ} factor.
     nodes = _node_set(Val(variable_npts), θ, φ, negθ, θ_shift, fbuf, nufft_type2, nufft_type1)
