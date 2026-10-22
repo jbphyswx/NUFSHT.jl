@@ -22,6 +22,8 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 julia = "1.11"
 
 [sources]
+ComputationalBackends = { url = "https://github.com/jbphyswx/ComputationalBackends.jl.git" }
+SpectralBackends = { url = "https://github.com/jbphyswx/SpectralBackends.jl.git" }
 FlowTransformBindings = { url = "https://github.com/jbphyswx/FlowTransformBindings.jl.git" }
 NUFSHT = { path = ".." }
 
