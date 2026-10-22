@@ -27,7 +27,8 @@ arbitrary scattered (colatitude, longitude) points.
 Given a field sampled at M arbitrary points on the sphere, NUFSHT.jl can:
 
 - **Synthesise** (Type 2): Evaluate a bandlimited field (given as SH coefficients) at any scattered point set in O(K log K + M) time.
-- **Adjoint** (Type 1): Apply `A†`, the transpose of the synthesis, to scattered values. It carries no quadrature weights, so it is not an analysis; `nusht_solve!` is.
+- **Adjoint** (Type 1): Apply `A†`, the transpose of the synthesis, to scattered values. It carries no quadrature weights.
+- **Analyze**: The coefficients of a sampled field, `nusht_analyze!`: with quadrature weights the weighted adjoint `Σⱼ wⱼ fⱼ conj(Y_lm(xⱼ))`, one transform; without them the least-squares fit.
 - **Solve** (LSMR): Exactly invert the synthesis operator at any scattered point set.
 - **Filter**: Apply isotropic spectral filters (Gaussian, top-hat, custom) entirely in harmonic space.
 
@@ -63,7 +64,9 @@ C_rec, iters, rel_res, converged = nusht_solve!(C_rec, f, plan; rtol=1e-6)
 |----------|----------|
 | Evaluate SH expansion at scattered points | `nusht_type2!` |
 | Apply the adjoint `A†` | `nusht_type1!` |
+| Coefficients from points with quadrature weights | `nusht_analyze!(C, f, plan; weights)` |
 | Invert at arbitrary scattered points | `nusht_solve!` |
+| Convert scalar coefficients to spin-0 ones and back | `scalar_to_spin0!`, `spin0_to_scalar!` |
 | Apply spectral filter at scattered points | `nusht_filter!` |
 | Filter with land/ocean mask | `nusht_filter!` + `nusht_filter_renorm!` |
 

@@ -112,11 +112,11 @@ end
     _assemble_modes!(Z, G, lmax)
 
 `G` (bivariate Fourier coefficients, `sph2fourier` layout, `(lmax+1, 2lmax+1, B)`) → `Z`, the complex
-mode array with `Z[kθ+offθ, kφ+offφ]` the coefficient of `exp(i(kθ·θ + kφ·φ))`. Exact: no grid, no
-doubling, no FFT. The device method is a `@kernel` over the same [`_mode_entry`](@ref).
+mode array with `Z[kθ+offθ, kφ+offφ]` the coefficient of `exp(i(kθ·θ + kφ·φ))`, exactly. The device
+method is a `@kernel` over the same `_mode_entry`.
 
-`Z` may be the full `(2lmax+3, 2lmax+1, B)` array or the folded `(lmax+2, …)` half — see
-[`_folded`](@ref). Row `r` is written unconditionally, so no `fill!` is needed.
+`Z` may be the full `(2lmax+3, 2lmax+1, B)` array or the folded `(lmax+2, …)` half (`_folded`). Every
+entry is written, so `Z` needs no `fill!`.
 """
 function _assemble_modes!(Z, G, lmax::Integer)
     CT = eltype(Z)
@@ -134,8 +134,8 @@ end
 """
     _assemble_modes_adjoint!(G, Z, lmax)
 
-Exact Euclidean adjoint of [`_assemble_modes!`](@ref), one entry of `G` per
-[`_mode_adjoint_entry`](@ref). A real `G` takes the real part, which is the adjoint of the
+Exact Euclidean adjoint of [`_assemble_modes!`](@ref), one entry of `G` per `_mode_adjoint_entry`. A
+real `G` takes the real part, which is the adjoint of the
 real→complex embedding; a complex one does not. The device method is a `@kernel` over the same
 per-element map.
 """

@@ -1,4 +1,4 @@
-# The `N` step of `A = N·F·S`, behind a backend seam.
+# The `N` step of `A = N·F·S`.
 #
 # The transform cores and plan builders never name a NUFFT library: they call `_nufft_makeplan`,
 # `_nufft_setpts!`, `_nufft_exec!` and `_nufft_destroy!`. Plan creation dispatches on the backend and
@@ -7,9 +7,10 @@
 #
 # Backends are `SpectralBackends` types:
 #
-# - `DirectSumSpectralBackend`: implemented here. No dependencies, always available, `O(M·K)`: the
-#   correctness reference the fast backends are validated against. Threaded over the axis each direction
-#   writes, so `nthreads` means there what it means elsewhere.
+# - `DirectSumSpectralBackend`: implemented here. No dependencies, always available, `O(M·K)`
+#   multiply-adds and `O(M·(n₁ + n₂))` exponentials: the correctness reference the fast backends are
+#   validated against. Threaded over the axis each direction writes, so `nthreads` means there what it
+#   means elsewhere.
 # - `FlowTransformBindings.NonuniformFFTsBackend()` (`using NonuniformFFTs`) and
 #   `FlowTransformBindings.FINUFFTBackend()` (`using FINUFFT`, cuFINUFFT on `CuArray` nodes): the plans of
 #   FlowTransformBindings, which give both a real-data transform.
@@ -76,8 +77,7 @@ _real_capable(::_FTBLibrary) = true
 """
     _resolve_nufft(backend, FE) -> backend
 
-Concrete backends pass through untouched — one named explicitly is honoured or refused, never swapped.
-`AutoSpectralBackend` takes NonuniformFFTs when it is loaded, FINUFFT when only it is, and direct
+A concrete backend passes through unchanged. `AutoSpectralBackend` takes NonuniformFFTs when it is loaded, FINUFFT when only it is, and direct
 summation when neither is. Override with `nufft=`.
 """
 _resolve_nufft(backend::SpectralBackends.AbstractSpectralBackend, ::Type) = backend
@@ -119,8 +119,8 @@ end
 Base.show(io::IO, h::_FTBNUFFT) = print(io, "_FTBNUFFT(type ", h.type, ", ", h.plan, ")")
 
 # `strengths` is the element type of the non-uniform data, so a real one builds the real-data plan.
-# The seam's thread count `0` and oversampling factor `0` take the backend's own choice; for
-# FlowTransformBindings that is the session's `Threads.nthreads()` and the library's default.
+# A thread count `0` takes the session's `Threads.nthreads()`, and an oversampling factor `0` the
+# library's default.
 function _nufft_makeplan(backend::_FTBLibrary, nodes::NTuple{2,AbstractVector}, type, n_modes, iflag,
                          ntrans, tol; dtype = Float64, strengths = Complex{dtype},
                          nthreads = nothing, upsampfac = nothing)
@@ -149,13 +149,16 @@ _nufft_destroy!(h::_FTBNUFFT) = FTB.close!(h.plan)
 # ── Direct summation ──────────────────────────────────────────────────────────
 
 """
-    DirectSumNUFFTPlan{T,V}
+    DirectSumNUFFTPlan{T,V,S}
 
 Handle for the direct-summation backend: built once over its nodes, points rewritten by
 `_nufft_setpts!`, executed repeatedly. `nthreads` is resolved at construction (`0` meaning all Julia
 threads) and bounds the split in [`_nufft_exec!`](@ref).
+
+The phase separates, `e^{is(k₁x + k₂y)} = e^{isk₁x} e^{isk₂y}`, so a point's `n₁·n₂` exponentials are
+the products of two tables of `n₁` and `n₂`. `ex` and `ey` hold those tables, one column per thread.
 """
-struct DirectSumNUFFTPlan{T<:AbstractFloat, V<:AbstractVector{T}}
+struct DirectSumNUFFTPlan{T<:AbstractFloat, V<:AbstractVector{T}, S<:AbstractMatrix{Complex{T}}}
     type::Int
     n1::Int
     n2::Int
@@ -164,6 +167,8 @@ struct DirectSumNUFFTPlan{T<:AbstractFloat, V<:AbstractVector{T}}
     nthreads::Int
     x::V
     y::V
+    ex::S
+    ey::S
 end
 
 function _nufft_makeplan(::SpectralBackends.AbstractDirectSumSpectralBackend, nodes::NTuple{2,AbstractVector},
@@ -172,8 +177,11 @@ function _nufft_makeplan(::SpectralBackends.AbstractDirectSumSpectralBackend, no
     nt = (isnothing(nthreads) || nthreads == 0) ? Threads.nthreads() : Int(nthreads)
     nt ≥ 1 || throw(ArgumentError("nthreads must be positive (or 0 for all threads), got $nthreads"))
     x = similar(first(nodes), dtype, length(first(nodes)))
-    p = DirectSumNUFFTPlan{dtype, typeof(x)}(Int(type), Int(n_modes[1]), Int(n_modes[2]),
-                                             Int(iflag), Int(ntrans), nt, x, similar(x))
+    n1, n2 = Int(n_modes[1]), Int(n_modes[2])
+    ex = Matrix{Complex{dtype}}(undef, n1, nt)
+    ey = Matrix{Complex{dtype}}(undef, n2, nt)
+    p = DirectSumNUFFTPlan{dtype, typeof(x), typeof(ex)}(Int(type), n1, n2, Int(iflag), Int(ntrans), nt,
+                                                         x, similar(x), ex, ey)
     return _nufft_setpts!(p, nodes...)
 end
 
@@ -191,67 +199,90 @@ _nufft_destroy!(::DirectSumNUFFTPlan) = nothing
 # A synthesis-only plan holds no analysis plan; there is nothing to free.
 _nufft_destroy!(::Nothing) = nothing
 
-# Split `1:n` into `nt` contiguous ranges and run `f` on each. One thread spawns nothing, so a serial
-# plan stays allocation-free. Callers pass an axis whose ranges write disjoint output, so the split
-# needs no synchronisation beyond the closing barrier and the result does not depend on `nt`.
+# Split `1:n` into `nt` contiguous ranges and run `f(t, range)` on each, `t` the range's slot in the
+# plan's per-thread tables. One thread spawns nothing, so a serial plan stays allocation-free. Callers pass
+# an axis whose ranges write disjoint output, so the split needs no synchronisation beyond the closing
+# barrier and the result does not depend on `nt`.
 @inline function _ds_split(f::F, n::Int, nt::Int) where {F}
-    nt ≤ 1 && return f(1:n)
+    nt ≤ 1 && return f(1, 1:n)
     chunk = cld(n, nt)
     @sync for t in 1:nt
         lo = (t - 1) * chunk + 1
         hi = min(n, lo + chunk - 1)
         lo > hi && break
-        Threads.@spawn f(lo:hi)
+        Threads.@spawn f(t, lo:hi)
     end
     return nothing
 end
 
-# Complex exponentials each thread takes before a split: a spawn barrier costs microseconds and an
-# exponential nanoseconds, so a thread needs a few thousand of them to repay its share of the barrier.
-const _DIRECTSUM_MIN_WORK = 2_000
+# Multiply-adds per thread below which the direct sum runs on one thread, where a spawn barrier
+# outweighs the split.
+const _DIRECTSUM_MIN_WORK = 32_768
+
+# `e[i] = e^{i s kᵢ x}` over the centred frequencies `kᵢ` of `rng`, out of `n`.
+@inline function _ds_phases!(e, s::T, x::T, n::Int, rng) where {T}
+    @inbounds for i in rng
+        e[i] = cis(s * T(FTB.mode_frequency(FTB.CenteredModes(), i, n)) * x)
+    end
+    return e
+end
 
 # Each direction is its own method, so the arrays reach the split as typed arguments and the inner loops
 # stay allocation-free.
 #
-# type 2: values at the M points from the mode array, split over the points. Modes stay outermost, so a
-# zero coefficient is skipped once for all points and a single-mode synthesis costs `O(M)`.
+# type 2: values at the M points from the mode array, split over the points. Each point forms its two
+# tables, then sums `Σᵢ₂ ey[i₂] Σᵢ₁ c[i₁,i₂] ex[i₁]`, the inner sum down a contiguous mode column.
 function _ds_type2!(vals, modes, p::DirectSumNUFFTPlan{T}, nt::Int) where {T}
     M = length(p.x)
     n1, n2, B = p.n1, p.n2, p.ntrans
     s = T(p.iflag)
-    fill!(vals, zero(eltype(vals)))
-    _ds_split(M, nt) do js
-        @inbounds for b in 1:B, i2 in 1:n2
-            k2 = T(FTB.mode_frequency(FTB.CenteredModes(), i2, n2))
-            for i1 in 1:n1
-                c = modes[i1 + (i2 - 1) * n1 + (b - 1) * n1 * n2]
-                iszero(c) && continue
-                k1 = T(FTB.mode_frequency(FTB.CenteredModes(), i1, n1))
-                for j in js
-                    vals[j + (b - 1) * M] += c * cis(s * (k1 * p.x[j] + k2 * p.y[j]))
+    _ds_split(M, nt) do t, js
+        ex = view(p.ex, :, t)
+        ey = view(p.ey, :, t)
+        @inbounds for j in js
+            _ds_phases!(ex, s, p.x[j], n1, 1:n1)
+            _ds_phases!(ey, s, p.y[j], n2, 1:n2)
+            for b in 1:B
+                off = (b - 1) * n1 * n2
+                acc = zero(eltype(vals))
+                for i2 in 1:n2
+                    col = zero(eltype(vals))
+                    @simd for i1 in 1:n1
+                        col += modes[off + i1 + (i2 - 1) * n1] * ex[i1]
+                    end
+                    acc += col * ey[i2]
                 end
+                vals[j + (b - 1) * M] = acc
             end
         end
     end
     return vals
 end
 
-# type 1: the exact adjoint, split over the mode columns. Each mode is a reduction over the points held
-# in a register, so no thread accumulates into another's output and the result is the same at any split.
+# type 1: the exact adjoint, split over the mode columns. Each thread adds every point's
+# `v·ey[i₂]·ex` into its own columns, the points in order, so the result is the same at any split.
 function _ds_type1!(modes, vals, p::DirectSumNUFFTPlan{T}, nt::Int) where {T}
     M = length(p.x)
     n1, n2, B = p.n1, p.n2, p.ntrans
     s = T(p.iflag)
-    _ds_split(n2, nt) do i2s
-        @inbounds for b in 1:B, i2 in i2s
-            k2 = T(FTB.mode_frequency(FTB.CenteredModes(), i2, n2))
-            for i1 in 1:n1
-                k1 = T(FTB.mode_frequency(FTB.CenteredModes(), i1, n1))
-                acc = zero(eltype(modes))
-                for j in 1:M
-                    acc += vals[j + (b - 1) * M] * cis(s * (k1 * p.x[j] + k2 * p.y[j]))
+    _ds_split(n2, nt) do t, i2s
+        ex = view(p.ex, :, t)
+        ey = view(p.ey, :, t)
+        @inbounds for b in 1:B, i2 in i2s, i1 in 1:n1
+            modes[i1 + (i2 - 1) * n1 + (b - 1) * n1 * n2] = zero(eltype(modes))
+        end
+        @inbounds for j in 1:M
+            _ds_phases!(ex, s, p.x[j], n1, 1:n1)
+            _ds_phases!(ey, s, p.y[j], n2, i2s)
+            for b in 1:B
+                v = vals[j + (b - 1) * M]
+                off = (b - 1) * n1 * n2
+                for i2 in i2s
+                    w = v * ey[i2]
+                    @simd for i1 in 1:n1
+                        modes[off + i1 + (i2 - 1) * n1] += w * ex[i1]
+                    end
                 end
-                modes[i1 + (i2 - 1) * n1 + (b - 1) * n1 * n2] = acc
             end
         end
     end

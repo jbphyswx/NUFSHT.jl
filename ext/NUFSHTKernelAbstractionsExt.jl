@@ -1,35 +1,35 @@
 """
     NUFSHTKernelAbstractionsExt
 
-Device-generic GPU methods for the array-indexed steps of the transform, written **once** as
-KernelAbstractions `@kernel`s and dispatched on `GPUArraysCore.AbstractGPUArray` — so they run on any
-KA backend (CUDA/ROCm/Metal/oneAPI, and the reference `JLArray`/KA-CPU backend used for testing)
-without per-vendor code. The plain CPU `Array` methods in `src` are untouched; a GPU-backed array is
-`<:AbstractGPUArray` so these more-specific methods win for it.
+Device-generic methods for the array-indexed steps of the transform, as KernelAbstractions `@kernel`s
+dispatched on `GPUArraysCore.AbstractGPUArray`. They run on any KernelAbstractions backend (CUDA, ROCm,
+Metal, oneAPI, and the `JLArray` / KA-CPU reference backends) and take precedence over the host methods
+for a device array.
 
-Every array-indexed step needs a kernel — the scalar mode assembly and its adjoint, the spin Wigner
-recurrence and contraction, the solver's per-column primitives and the spectral filter. The NUFFT is
-not among them: it is dispatched through the `_nufft_*` seam to FlowTransformBindings, which puts the
-plan on the device of the nodes.
+The kernels cover the scalar mode assembly and its adjoint, the spin Wigner recurrence and contraction,
+the solver's per-column steps, the weighted strengths and Hermitian projection of an analysis, the
+scalar ↔ spin-0 conversions and the spectral filter. The NUFFT goes through the `_nufft_*` functions to
+FlowTransformBindings, which builds the plan on the nodes' device.
 
 Loaded by `using KernelAbstractions` (with `GPUArraysCore`).
 """
 module NUFSHTKernelAbstractionsExt
 
 using NUFSHT: NUFSHT
-# The KernelAbstractions kernel DSL macros (`@kernel`, `@index`, `@Const`) are recognized by the
-# `@kernel` macro *syntactically* and only work unqualified — a module-qualified `KA.@index` is not
-# rewritten and miscompiles. So they are the one necessary exception to the qualified-import
-# convention; all non-DSL KA entry points stay qualified (`KernelAbstractions.get_backend`, etc.).
+# `@kernel`, `@index` and `@Const` are imported by bare name: the `@kernel` macro recognizes the DSL
+# keywords only unqualified, and a qualified `KA.@index` is not rewritten and miscompiles.
 using KernelAbstractions: KernelAbstractions, @kernel, @index, @Const
 using GPUArraysCore: GPUArraysCore
 using ComputationalBackends: ComputationalBackends
 
-# A plan on `GPUBackend(b)`: its nodes, and so every buffer, in `b`'s memory.
-function NUFSHT._backend_plan(::Type{FE}, θ, φ, lmax, b::ComputationalBackends.GPUBackend; kwargs...) where {FE}
-    on_device(x) = copyto!(KernelAbstractions.allocate(b.backend, eltype(x), (length(x),)), x)
-    return NUFSHT.make_plan(FE, on_device(θ), on_device(φ), lmax; kwargs...)
-end
+# A plan under `execution = GPUBackend(b)`: its nodes, and so every buffer, in `b`'s memory.
+_on_device(b::ComputationalBackends.GPUBackend, x) =
+    copyto!(KernelAbstractions.allocate(b.backend, eltype(x), (length(x),)), x)
+
+NUFSHT._make_plan(::Type{FE}, θ, φ, lmax, b::ComputationalBackends.GPUBackend; kwargs...) where {FE} =
+    NUFSHT._build_plan(FE, _on_device(b, θ), _on_device(b, φ), lmax; kwargs...)
+NUFSHT._make_spin_plan(::Type{FE}, θ, φ, lmax, s, b::ComputationalBackends.GPUBackend; kwargs...) where {FE} =
+    NUFSHT._build_spin_plan(FE, _on_device(b, θ), _on_device(b, φ), lmax, s; kwargs...)
 
 # Kernel launches are asynchronous on device backends (CUDA/ROCm/…), so results are synchronized before
 # the host reads them; JLArrays' reference backend is synchronous and defines no `synchronize`.
@@ -40,9 +40,9 @@ end
 
 # ── Device scalar mode assembly (F) ─────────────────────────────────────────────
 # Both directions of `src/Modes.jl` are per-element gathers, so each is one workitem per output
-# element with no atomics and no fill pass, calling the very same `_mode_entry`/`_mode_adjoint_entry`
-# the host loops do — the arithmetic exists once. The plan buffers are `(…, …, B)`, so `ndrange` is
-# the whole output including the batch axis.
+# element with no atomics and no fill pass, calling the `_mode_entry`/`_mode_adjoint_entry` the host
+# loops call. The plan buffers are `(…, …, B)`, so `ndrange` is the whole output including the batch
+# axis.
 
 @kernel function _modes_kern!(Z, @Const(G), lmax, offθ, offφ, n0, nm, h)
     r, c, b = @index(Global, NTuple)
@@ -75,150 +75,122 @@ function NUFSHT._assemble_modes_adjoint!(G::GPUArraysCore.AbstractGPUArray, Z, l
     return G
 end
 
-# ── Device spin S-engine: on-the-fly Trapani–Navaza recurrence + G-contraction ──
-# The spin transform's `_assemble_G!` (Legendre step + bivariate-Fourier assembly) as KA kernels, so
-# the whole spin path runs on device (recurrence buffers `similar` to the device nodes; NUFFT via the
-# FlowTransformBindings). Same math as the CPU `src/Spin.jl` methods — validated bit-for-bit on JLArray. The
-# degree loop is sequential (ℓ depends on ℓ-1); per degree, Stage A+B is one thread per column, the
-# symmetry fills and the contraction are elementwise.
+# ── Device spin S-engine: the blocked plane build and contraction of `src/Spin.jl` ──
+# A block of `K` degrees is three launches: the quarter planes from the stored `m = ℓ` columns, one
+# workitem per (row, degree); their lower triangles by transpose; and the contraction, one workitem per
+# output entry, summing the block's degrees in ascending order as the host does. Launches on one
+# backend run in order, so only a host read needs a sync.
 
-# Trapani–Navaza degree step, one workitem per column n∈0:ℓ: Stage A (row m=ℓ) then the downward
-# Stage B m-sweep for that column (self-contained — no cross-column dependency).
-# `dl` is n-major (`dl[n+off, m+off] = d^ℓ_{m,n}`), matching `src/Spin.jl`: consecutive workitems then
-# read and write consecutive addresses, so these accesses coalesce.
-@kernel function _recur_AB_kern!(dl, @Const(dlp), ℓ, off)
-    c = @index(Global)
-    n = c - 1
-    RT = eltype(dl)
-    @inbounds begin
-        if n == 0
-            dl[off, ℓ + off] = -sqrt(RT(2ℓ - 1) / RT(2ℓ)) * dlp[off, (ℓ - 1) + off]
-        else
-            dl[n + off, ℓ + off] =
-                sqrt(RT(ℓ) * RT(2ℓ - 1) / (RT(2) * RT(ℓ + n) * RT(ℓ + n - 1))) * dlp[(n - 1) + off, (ℓ - 1) + off]
-        end
-        if ℓ - 1 >= n
-            m = ℓ - 1
-            dl[n + off, m + off] = RT(2n) / sqrt(RT(ℓ - m) * RT(ℓ + m + 1)) * dl[n + off, (m + 1) + off]
-        end
-        for m in (ℓ - 2):-1:n
-            s1 = sqrt(RT(ℓ - m) * RT(ℓ + m + 1))
-            s2 = sqrt(RT(ℓ - m - 1) * RT(ℓ + m + 2) / (RT(ℓ - m) * RT(ℓ + m + 1)))
-            dl[n + off, m + off] = RT(2n) / s1 * dl[n + off, (m + 1) + off] - s2 * dl[n + off, (m + 2) + off]
+# Quarter planes per block on a device.
+const _DEVICE_PLANES = 32
+NUFSHT._plane_count(::GPUArraysCore.AbstractGPUArray, ::Integer) = _DEVICE_PLANES
+
+# Row `n` of plane `k` (degree `ℓ0 + k − 1`): its column `m = ℓ`, then the downward recurrence in `m` on
+# `n ≤ m`. A row depends on itself alone, and consecutive workitems touch consecutive addresses.
+@kernel function _quarter_kern!(P, @Const(bnd), ℓ0)
+    i, k = @index(Global, NTuple)
+    n = i - 1; ℓ = ℓ0 + k - 1
+    RT = eltype(P)
+    if n <= ℓ
+        @inbounds begin
+            P[n + 1, ℓ + 1, k] = bnd[n + 1, ℓ + 1]
+            for m in (ℓ - 1):-1:n
+                c1 = RT(2) / sqrt(RT(ℓ - m) * RT(ℓ + m + 1))
+                if m == ℓ - 1
+                    P[n + 1, m + 1, k] = c1 * RT(n) * P[n + 1, m + 2, k]
+                else
+                    s2 = sqrt(RT(ℓ - m - 1) * RT(ℓ + m + 2) / (RT(ℓ - m) * RT(ℓ + m + 1)))
+                    P[n + 1, m + 1, k] = c1 * RT(n) * P[n + 1, m + 2, k] - s2 * P[n + 1, m + 3, k]
+                end
+            end
         end
     end
 end
 
-@kernel function _recur_seed_kern!(dl, off)          # ℓ=0 seed d⁰₀₀ = 1
-    @inbounds dl[off, off] = one(eltype(dl))
-end
-
-@kernel function _recur_S1_kern!(dl, ℓ, off)         # transpose: eighth → quarter (n>m)
-    i, j = @index(Global, NTuple)
-    m = i - 1; n = j - 1
-    if n > m
-        RT = eltype(dl)
-        @inbounds dl[n + off, m + off] = ifelse(iseven(m + n), one(RT), -one(RT)) * dl[m + off, n + off]
+# `Δ_{n,m} = (−1)^{m+n} Δ_{m,n}` below the diagonal; it reads only above it.
+@kernel function _quarter_transpose_kern!(P, ℓ0)
+    i, j, k = @index(Global, NTuple)
+    n = i - 1; m = j - 1
+    if m < n <= ℓ0 + k - 1
+        @inbounds P[n + 1, m + 1, k] = NUFSHT._parity(eltype(P), m + n) * P[m + 1, n + 1, k]
     end
 end
 
-@kernel function _recur_S2_kern!(dl, ℓ, off)         # m → −m: quarter → half
-    i, j = @index(Global, NTuple)
-    mabs = i; n = j - 1
-    RT = eltype(dl)
-    @inbounds dl[n + off, (-mabs) + off] = ifelse(iseven(ℓ + n), one(RT), -one(RT)) * dl[n + off, mabs + off]
-end
-
-@kernel function _recur_S3_kern!(dl, ℓ, off)         # n → −n: half → full
-    i, j = @index(Global, NTuple)
-    m = i - 1 - ℓ; nabs = j
-    RT = eltype(dl)
-    @inbounds dl[(-nabs) + off, m + off] = ifelse(iseven(ℓ + abs(m)), one(RT), -one(RT)) * dl[nabs + off, m + off]
-end
-
-# Forward contraction for degree ℓ: G_{m'm} += i^{m+s} N_ℓ sf_{ℓm} Δ^ℓ_{m'm} Δ^ℓ_{m',−s}.
-# `mp0` is the first m' the mode buffer carries (`-ℓ` complex, `0` real) and `goff` maps m' to its row.
-@kernel function _contract_kern!(G, @Const(dl), @Const(sf), ℓ, s, lmax, off, Nℓ, mp0, goff)
+# `G_{m'm} += Σ_ℓ i^{m+s} N_ℓ sf_{ℓm} Δ^ℓ_{m'm} Δ^ℓ_{m',−s}` over the block, one workitem per entry.
+# Row `i` holds `m' = i − 1 + mp0`: `mp0 = −lmax` on the full layout, `0` on a folded one.
+@kernel function _contract_block_kern!(G, @Const(P), @Const(sf), ℓ0, ℓ1, s, lmax, mp0)
     i, j, b = @index(Global, NTuple)
-    mp = i - 1 + mp0; m = j - 1 - ℓ
-    CT = eltype(G)
+    mp = i - 1 + mp0; m = j - 1 - lmax
+    CT = eltype(G); RT = real(CT)
     @inbounds begin
-        ph = NUFSHT._im_pow(CT, -(m + s)) * sf[ℓ + 1, m + lmax + 1, b] * Nℓ
-        G[mp + goff, m + off, b] += ph * dl[mp + off, m + off] * dl[mp + off, (-s) + off]
-    end
-end
-
-# Adjoint contraction for degree ℓ: sf_{ℓm} = conj(i^{m+s}) N_ℓ Σ_{m'} Δ^ℓ_{m'm} Δ^ℓ_{m',−s} Ĝ_{m'm}.
-@kernel function _contract_adj_kern!(sf, @Const(dl), @Const(Ĝ), ℓ, s, lmax, off, Nℓ, mp0, goff)
-    j, b = @index(Global, NTuple)
-    m = j - 1 - ℓ
-    CT = eltype(sf)
-    @inbounds begin
-        phc = conj(NUFSHT._im_pow(CT, -(m + s))) * Nℓ
-        acc = zero(CT)
-        for mp in mp0:ℓ
-            acc += dl[mp + off, m + off] * dl[mp + off, (-s) + off] * Ĝ[mp + goff, m + off, b]
+        acc = G[i, j, b]
+        ph0 = NUFSHT._im_pow(CT, -(m + s))
+        for ℓ in max(ℓ0, abs(mp), abs(m)):ℓ1
+            ph = ph0 * sqrt(RT(2ℓ + 1) / (4 * RT(π))) * sf[ℓ + 1, j, b]
+            acc += ph * NUFSHT._qprod(P, ℓ - ℓ0 + 1, RT, ℓ, mp, m, s)
         end
-        sf[ℓ + 1, m + lmax + 1, b] = phc * acc
+        G[i, j, b] = acc
     end
 end
 
-# Which of the two layouts the plan's mode buffer is in, read off its θ extent.
-@inline _fold_index(G, lmax, off, ℓ) =
-    size(G, 1) == 2lmax + 1 ? (-ℓ, off) : (0, 1)
+# `sf_{ℓm} = conj(i^{m+s}) N_ℓ Σ_{m'} Δ^ℓ_{m'm} Δ^ℓ_{m',−s} Ĝ_{m'm}`, one workitem per (order, column,
+# degree of the block).
+@kernel function _contract_block_adj_kern!(sf, @Const(P), @Const(Ĝ), ℓ0, s, lmax, mp0)
+    j, b, k = @index(Global, NTuple)
+    m = j - 1 - lmax; ℓ = ℓ0 + k - 1
+    CT = eltype(sf); RT = real(CT)
+    if abs(m) <= ℓ
+        @inbounds begin
+            acc = zero(CT)
+            for mp in max(mp0, -ℓ):ℓ
+                acc += NUFSHT._qprod(P, k, RT, ℓ, mp, m, s) * Ĝ[mp - mp0 + 1, j, b]
+            end
+            sf[ℓ + 1, j, b] = conj(NUFSHT._im_pow(CT, -(m + s))) * sqrt(RT(2ℓ + 1) / (4 * RT(π))) * acc
+        end
+    end
+end
 
-# The four stages are dependent (S1 reads Stage B, S2 reads S1, S3 reads S2) but they run on one
-# backend, which executes launches in order — so no sync is needed between them, only before a host
-# read. Syncing per launch cost ~4·lmax full device barriers per spin transform.
-function _recur_step_device!(backend, dl, dlp, ℓ, off)
-    _recur_AB_kern!(backend)(dl, dlp, ℓ, off; ndrange = (ℓ + 1,))
-    _recur_S1_kern!(backend)(dl, ℓ, off; ndrange = (ℓ + 1, ℓ + 1))
-    _recur_S2_kern!(backend)(dl, ℓ, off; ndrange = (ℓ, ℓ + 1))
-    _recur_S3_kern!(backend)(dl, ℓ, off; ndrange = (2ℓ + 1, ℓ))
+@inline _row_origin(G, lmax) = size(G, 1) == 2lmax + 1 ? -lmax : 0
+
+function _device_planes!(backend, eng::NUFSHT._WignerPlanes, ℓ0, ℓ1)
+    nb = ℓ1 - ℓ0 + 1
+    _quarter_kern!(backend)(eng.planes, eng.bnd, ℓ0; ndrange = (ℓ1 + 1, nb))
+    _quarter_transpose_kern!(backend)(eng.planes, ℓ0; ndrange = (ℓ1 + 1, ℓ1 + 1, nb))
     return nothing
 end
 
 function NUFSHT._assemble_G_impl!(G::GPUArraysCore.AbstractGPUArray, sf,
-                                  plan::NUFSHT.SpinNUSHTplan{T}, ::Nothing) where {T}
-    lmax = plan.lmax; s = plan.s; off = lmax + 1; B = plan.B
-    dl = plan.dl_curr; dlp = plan.dl_prev
+                                  plan::NUFSHT.SpinNUSHTplan{T}, eng::NUFSHT._WignerPlanes) where {T}
+    lmax = plan.lmax; K = size(eng.planes, 3)
     backend = KernelAbstractions.get_backend(G)
     fill!(G, zero(Complex{T}))
-    _recur_seed_kern!(backend)(dl, off; ndrange = (1,))
-    for ℓ in 0:lmax
-        if ℓ > 0
-            dl, dlp = dlp, dl
-            _recur_step_device!(backend, dl, dlp, ℓ, off)
-        end
-        ℓ < abs(s) && continue
-        Nℓ = T(sqrt((2ℓ + 1) / (4π)))
-        mp0, goff = _fold_index(G, lmax, off, ℓ)
-        _contract_kern!(backend)(G, dl, sf, ℓ, s, lmax, off, Nℓ, mp0, goff;
-                                 ndrange = (ℓ - mp0 + 1, 2ℓ + 1, B))
+    mp0 = _row_origin(G, lmax)
+    ℓ0 = abs(plan.s)
+    while ℓ0 <= lmax
+        ℓ1 = min(lmax, ℓ0 + K - 1)
+        _device_planes!(backend, eng, ℓ0, ℓ1)
+        _contract_block_kern!(backend)(G, eng.planes, sf, ℓ0, ℓ1, plan.s, lmax, mp0; ndrange = size(G))
+        ℓ0 = ℓ1 + 1
     end
-    _sync(backend)                     # one barrier for the whole sweep, before any host read
+    _sync(backend)
     return G
 end
 
 function NUFSHT._assemble_G_adjoint_impl!(sf::GPUArraysCore.AbstractGPUArray, Ĝ,
-                                          plan::NUFSHT.SpinNUSHTplan{T}, ::Nothing) where {T}
-    lmax = plan.lmax; s = plan.s; off = lmax + 1; B = plan.B
-    dl = plan.dl_curr; dlp = plan.dl_prev
+                                          plan::NUFSHT.SpinNUSHTplan{T}, eng::NUFSHT._WignerPlanes) where {T}
+    lmax = plan.lmax; K = size(eng.planes, 3)
     backend = KernelAbstractions.get_backend(sf)
     fill!(sf, zero(Complex{T}))
-    _recur_seed_kern!(backend)(dl, off; ndrange = (1,))
-    for ℓ in 0:lmax
-        if ℓ > 0
-            dl, dlp = dlp, dl
-            _recur_step_device!(backend, dl, dlp, ℓ, off)
-        end
-        ℓ < abs(s) && continue
-        Nℓ = T(sqrt((2ℓ + 1) / (4π)))
-        mp0, goff = _fold_index(Ĝ, lmax, off, ℓ)
-        _contract_adj_kern!(backend)(sf, dl, Ĝ, ℓ, s, lmax, off, Nℓ, mp0, goff;
-                                     ndrange = (2ℓ + 1, B))
+    mp0 = _row_origin(Ĝ, lmax)
+    ℓ0 = abs(plan.s)
+    while ℓ0 <= lmax
+        ℓ1 = min(lmax, ℓ0 + K - 1)
+        _device_planes!(backend, eng, ℓ0, ℓ1)
+        _contract_block_adj_kern!(backend)(sf, eng.planes, Ĝ, ℓ0, plan.s, lmax, mp0;
+                                           ndrange = (2lmax + 1, plan.B, ℓ1 - ℓ0 + 1))
+        ℓ0 = ℓ1 + 1
     end
-    _sync(backend)                     # one barrier for the whole sweep, before any host read
+    _sync(backend)
     return sf
 end
 
@@ -231,9 +203,7 @@ end
 
 # ── Device pack/unpack between the packed solver vectors and the plan's full layout ──────────────
 # The scalar solver carries its vectors packed to the `l ≤ lmax` slots, so crossing to and from the
-# plan's `(Nθ, Nφ, B)` layout is a gather/scatter by index vector. The `src` versions are scalar loops
-# (zero-allocation on a host array); here they are broadcasts over reshaped views, which a device array
-# can execute — a `SubArray` header costs nothing against a kernel launch.
+# plan's `(Nθ, Nφ, B)` layout is a gather/scatter by index vector, here a broadcast over reshaped views.
 function NUFSHT._pack_coeffs!(dst::GPUArraysCore.AbstractGPUArray, src, idx, srclen::Integer,
                               n::Integer)
     _cols(dst, n) .= view(reshape(src, srclen, :), idx, 1:n)
@@ -334,6 +304,60 @@ function NUFSHT._add_field!(f, fbuf::GPUArraysCore.AbstractGPUArray,       # f[:
     return f
 end
 
+# ── Device analysis: weighted strengths, Hermitian projection, scalar ↔ spin-0 ──────────────────
+# `fbuf[j, b] = w[j] f[j, b]` by `NUFSHT._weighted_value`, the weights on the plan's device.
+function NUFSHT._copy_weighted!(fbuf::GPUArraysCore.AbstractGPUArray, f, w)
+    M = length(w)
+    reshape(fbuf, M, :) .= NUFSHT._weighted_value.(reshape(w, M, 1), reshape(f, M, :))
+    return fbuf
+end
+
+# One workitem per pair `(ℓ, ±m)`, `m ≥ 0`, of a column, each calling the per-pair function the host
+# loop calls.
+@kernel function _hermitian_part_kern!(sf, lmax)
+    i, j, b = @index(Global, NTuple)
+    if j <= i
+        NUFSHT._hermitian_pair!(sf, i - 1, j - 1, lmax, b)
+    end
+end
+
+@kernel function _scalar_to_spin0_kern!(sf, @Const(C), lmax)
+    i, j, b = @index(Global, NTuple)
+    if j <= i
+        NUFSHT._scalar_pair_to_spin0!(sf, C, i - 1, j - 1, lmax, b)
+    end
+end
+
+@kernel function _spin0_to_scalar_kern!(C, @Const(sf), lmax)
+    i, j, b = @index(Global, NTuple)
+    if j <= i
+        NUFSHT._spin0_pair_to_scalar!(C, sf, i - 1, j - 1, lmax, b)
+    end
+end
+
+function NUFSHT._hermitian_part!(sf::GPUArraysCore.AbstractGPUArray, plan::NUFSHT.SpinNUSHTplan,
+                                 ::Union{NUFSHT.FoldedComplex,NUFSHT.FoldedReal})
+    lmax = plan.lmax
+    backend = KernelAbstractions.get_backend(sf)
+    _hermitian_part_kern!(backend)(_as3(sf, lmax), Int(lmax); ndrange = (lmax + 1, lmax + 1, plan.B))
+    _sync(backend)
+    return sf
+end
+
+function NUFSHT._scalar_to_spin0_pairs!(sf::GPUArraysCore.AbstractGPUArray, C, lmax::Int, B::Int)
+    backend = KernelAbstractions.get_backend(sf)
+    _scalar_to_spin0_kern!(backend)(_as3(sf, lmax), _as3(C, lmax), lmax; ndrange = (lmax + 1, lmax + 1, B))
+    _sync(backend)
+    return sf
+end
+
+function NUFSHT._spin0_to_scalar_pairs!(C::GPUArraysCore.AbstractGPUArray, sf, lmax::Int, B::Int)
+    backend = KernelAbstractions.get_backend(C)
+    _spin0_to_scalar_kern!(backend)(_as3(C, lmax), _as3(sf, lmax), lmax; ndrange = (lmax + 1, lmax + 1, B))
+    _sync(backend)
+    return C
+end
+
 # ── Device spectral filter (× H(ℓ)) ─────────────────────────────────────────────
 # `C` is `(lmax+1, 2lmax+1, B)`, multiplied by the transfer matrix broadcast across the batch. The
 # matrix depends only on the filter, `lmax`, the element type and the array type, so each is built and
@@ -362,7 +386,9 @@ end
 _no_device_table() = throw(ArgumentError(
     "a device spin plan cannot use a precomputed WignerTable; build it with wigner_table = nothing " *
     "so the Δ planes are generated on device by the recurrence kernels."))
-NUFSHT._assemble_G_impl!(::GPUArraysCore.AbstractGPUArray, sf, plan, ::NUFSHT.WignerTable) = _no_device_table()
-NUFSHT._assemble_G_adjoint_impl!(::GPUArraysCore.AbstractGPUArray, Ĝ, plan, ::NUFSHT.WignerTable) = _no_device_table()
+NUFSHT._assemble_G_impl!(::GPUArraysCore.AbstractGPUArray, sf, plan::NUFSHT.SpinNUSHTplan,
+                         ::NUFSHT.WignerTable) = _no_device_table()
+NUFSHT._assemble_G_adjoint_impl!(::GPUArraysCore.AbstractGPUArray, Ĝ, plan::NUFSHT.SpinNUSHTplan,
+                                 ::NUFSHT.WignerTable) = _no_device_table()
 
 end # module NUFSHTKernelAbstractionsExt

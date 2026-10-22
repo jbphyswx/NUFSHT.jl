@@ -11,7 +11,7 @@ export coefficient_size, allocate_coefficients
 export AbstractNodeSet, FixedCountNodes, VariableCountNodes
 export AbstractPlanDirections, SynthesisOnly, SynthesisAndAnalysis
 
-# A NUFFT plan over `nodes = (x, y)` with its points set. The NUFFT seam lives in NUFFT.jl; an
+# A NUFFT plan over `nodes = (x, y)` with its points set, through the bindings in NUFFT.jl; an
 # `upsampfac` of `0` takes the library's own oversampling.
 #
 # `dtype` is the precision; `strengths` is the element type of the non-uniform data, and a real one
@@ -48,8 +48,8 @@ abstract type AbstractPlanDirections end
 """
     SynthesisAndAnalysis <: AbstractPlanDirections
 
-Build both directions — the default. Required by [`nusht_type1!`](@ref), [`nusht_solve!`](@ref) and
-[`nusht_filter!`](@ref).
+Build both directions — the default. Required by [`nusht_type1!`](@ref), [`nusht_analyze!`](@ref),
+[`nusht_solve!`](@ref) and [`nusht_filter!`](@ref).
 """
 struct SynthesisAndAnalysis <: AbstractPlanDirections end
 
@@ -64,10 +64,10 @@ struct SynthesisOnly <: AbstractPlanDirections end
 # The S-step is `plan_sph2fourier` and its adjoint, and its output is already the DFS bivariate Fourier
 # series, so no grid synthesis or analysis plan is needed. FastTransforms plans its FFTs on the
 # libfftw3 FFTW.jl loads, whose planner is process-global, so the plans are built under FFTW.jl's
-# planner lock, the planner at one thread.
-function _build_sph_plans(Fslice)
+# planner lock, the planner at one thread, and FastTransforms at the plan's thread count `n`.
+function _build_sph_plans(Fslice, n::Integer)
     return FFTW.set_num_threads(1) do
-        P = FTB.with_fasttransforms_threads(() -> FastTransforms.plan_sph2fourier(Fslice))
+        P = _ft_call(() -> FastTransforms.plan_sph2fourier(Fslice), n)
         # `P'` leaves `AdjointFTPlan.adjoint` undefined, which FastTransforms then resolves through an
         # `UndefRefError` on every `lmul!`. Name the parent explicitly.
         return (P, FastTransforms.AdjointFTPlan(P, P))
@@ -152,7 +152,7 @@ function _build_width!(plan, k::Integer)
     n1 = if plan.nodes.nufft_type1 === nothing
         nothing                                   # mirror the plan's own directions
     elseif _nufft_share_directions(r.backend)
-        _nufft_as_type1(n2)                       # same plan, opposite direction — see the seam
+        _nufft_as_type1(n2)                       # same plan, opposite direction
     else
         _make_nufft(r.backend, (θn, φn), 1, n_modes, -1, k, plan.tol, T, r.nt, r.uf, Z)
     end
@@ -216,25 +216,42 @@ function _release_width!(slot)
 end
 
 """
-    _sph_pool(Fslice, ntasks)
+    _sph_pool(Fslice, Fstage, P, Padj, nslots, n)
 
-One `Fslice` and one set of sphere plans per task, for threading the per-column sphere loops. A
-FastTransforms plan is not safe to apply concurrently, and the loop's slice buffer is shared, so both
-have to be replicated. Empty when there is nothing to thread, so a single-threaded plan pays nothing.
+One `Fslice`, one staging slice like `Fstage` and one set of sphere plans per task for `nslots` tasks,
+for threading the per-column sphere loops, the first entry the plan's own `(Fslice, Fstage, P, Padj)`
+and the rest built at the plan's thread count `n`. A FastTransforms plan is not safe to apply
+concurrently, and the loop's slice buffers are shared, so all of them have to be replicated. Empty when
+there is nothing to thread, so a single-threaded plan pays nothing.
 
 Index the result by task chunk. A spawned task owns its chunk index for its whole life, while tasks
 migrate between threads, so two tasks keyed by `Threads.threadid()` can share an entry.
 """
-function _sph_pool(Fslice, ntasks::Integer)
-    ntasks <= 1 && return typeof((similar(Fslice), _build_sph_plans(Fslice)...))[]
-    return [(similar(Fslice), _build_sph_plans(Fslice)...) for _ in 1:ntasks]
+function _sph_pool(Fslice, Fstage, P, Padj, nslots::Integer, n::Integer)
+    pool = Tuple{typeof(Fslice), typeof(Fstage), typeof(P), typeof(Padj)}[]
+    nslots <= 1 && return pool
+    push!(pool, (Fslice, Fstage, P, Padj))
+    for _ in 2:nslots
+        push!(pool, (similar(Fslice), _fresh_stage(Fstage), _build_sph_plans(Fslice, n)...))
+    end
+    return pool
 end
+
+_fresh_stage(::Nothing) = nothing
+_fresh_stage(stage::AbstractArray) = similar(stage)
+
+# The host slice a coefficient array copies through on its way to and from `Fslice`: one of the array's
+# own element type for a device array whose element type differs from the slice's, so the transfer
+# moves the array's precision and `copyto!` converts on the host; `nothing` where `copyto!` between the
+# two converts in place (a host array, or one element type).
+_slice_stage(F, Fslice) =
+    (F isa Array || eltype(F) === eltype(Fslice)) ? nothing : similar(Fslice, eltype(F))
 
 """
     AbstractNUSHTplan
 
-Supertype of [`NUSHTplan`]() and [`SpinNUSHTplan`](); both carry an [`AbstractNodeSet`]()
-in their `nodes` field, so the node-set operations are written once.
+Supertype of [`NUSHTplan`](@ref) and [`SpinNUSHTplan`](@ref); both carry an
+[`AbstractNodeSet`](@ref) in their `nodes` field, so the node-set operations are written once.
 """
 abstract type AbstractNUSHTplan end
 
@@ -317,7 +334,8 @@ end
 @inline _require_analysis(p1) = p1
 _require_analysis(::Nothing) = throw(ArgumentError(
     "this plan was built with `directions = SynthesisOnly()` and has no analysis plan. Rebuild with " *
-    "`directions = SynthesisAndAnalysis()` to use nusht_type1!, nusht_solve! or nusht_filter!."))
+    "`directions = SynthesisAndAnalysis()` to use nusht_type1!, nusht_analyze!, nusht_solve! or " *
+    "nusht_filter!."))
 
 """
     NUSHTplan{T}
@@ -328,10 +346,12 @@ degree `lmax`, transforming `B` co-located fields per call (`ntrans = B`).
 Fields:
 - `lmax`, `Nθ = lmax+1`, `Nφ = 2lmax+1`, `B` (batch size / NUFFT `ntrans`)
 - `tol`: NUFFT accuracy tolerance
+- `ntasks`: the plan's thread count, which its FastTransforms calls run at and its sphere-column loop
+  divides among tasks
 - `nodes`: the [`AbstractNodeSet`](@ref) holding `θ_nodes`, `φ_nodes` (colatitudes ∈ [0,π] and
   longitudes ∈ [0,2π) of the `M` points), the `(M, B)` strengths buffer `fbuf`, and the two NUFFT
   handles. [`set_nodes!`](@ref) re-points it.
-- `C`: filter scratch, **empty until the first filter call** — see [`_filter_scratch`](@ref).
+- `C`: filter scratch, **empty until the first filter call** (`_filter_scratch`).
   `F`: the bivariate Fourier coefficients `P·C`. Both `(Nθ, Nφ, B)` with
   eltype `FE`
 - `Fhat`: the complex mode array the NUFFT evaluates, assembled from `F` by
@@ -341,6 +361,8 @@ Fields:
   transform, only the `kθ ≥ 0` half is stored (`lmax+2` rows) and that backend supplies the rest.
 - `Fslice`: `(Nθ, Nφ)` scratch `Matrix` each batch slice is `copyto!`-ed through for the S-step.
   FastTransforms has no `Float32` sphere plan, so it stays double precision and the copy converts.
+  `Fstage`: the host `(Nθ, Nφ)` slice of element type `FE` a device plan of another precision copies
+  through, or `nothing` (see `_slice_stage`).
 - `sph_plan`, `sph_plan_adj`: FastTransforms `plan_sph2fourier` (P) and its adjoint on a `(Nθ, Nφ)`
   slice. `P` alone is the whole S-step — its output is already the bivariate Fourier series, so
   synthesis is `P·C` → assemble → one NUFFT, with no equiangular grid in between.
@@ -352,7 +374,7 @@ modes need no conjugate-transpose. The axis convention is `x = θ`, `y = φ`, an
 per point.
 """
 struct NUSHTplan{T<:AbstractFloat, FE<:Number, AT3<:AbstractArray{FE,3},
-                 AT2<:AbstractMatrix, CT3<:AbstractArray{Complex{T},3},
+                 AT2<:AbstractMatrix, STG<:Union{Nothing,AbstractMatrix}, CT3<:AbstractArray{Complex{T},3},
                  ND<:AbstractNodeSet, SP, SPADJ, SPL, SZP, RCP,
                  FT, IV<:AbstractVector{Int}} <: AbstractNUSHTplan
     lmax::Int
@@ -360,11 +382,13 @@ struct NUSHTplan{T<:AbstractFloat, FE<:Number, AT3<:AbstractArray{FE,3},
     Nφ::Int
     B::Int
     tol::FT
+    ntasks::Int                   # the plan's thread count; see _ft_threads
     nodes::ND                     # the point-dependent half; see AbstractNodeSet
     C::Base.RefValue{Union{Nothing,AT3}}   # filter scratch, empty until used; see _filter_scratch
     F::AT3
     Fhat::CT3
     Fslice::AT2
+    Fstage::STG                   # see _slice_stage
     sph_plan::SP
     sph_plan_adj::SPADJ           # sph_plan' (P'), stored to keep the adjoint alloc-free
     sph_pool::SPL                 # per-task slice + plans for the threaded column loops; see _sph_pool
@@ -376,11 +400,8 @@ end
 """
     _filter_scratch(plan) -> AbstractArray
 
-The plan's coefficient scratch, allocated on first use. Filtering scales coefficients before
-synthesising and must not modify the caller's array, so it needs a buffer of its own — and nothing else
-in the plan does. A plan that only synthesises, transforms or solves therefore never allocates one; a
-filtering plan allocates it once and reuses it, so repeated filtering allocates nothing after the first
-call.
+The coefficient scratch filtering scales in, so the caller's array is left unmodified. Allocated on the
+first filter call and reused after; a plan that never filters holds none.
 """
 @inline function _filter_scratch(plan::NUSHTplan)
     c = plan.C[]
@@ -423,42 +444,61 @@ function plan_memory(plan::NUSHTplan)
     F      = Base.summarysize(plan.F)
     Fhat   = Base.summarysize(plan.Fhat)
     Fslice = Base.summarysize(plan.Fslice)
+    Fstage = plan.Fstage === nothing ? 0 : Base.summarysize(plan.Fstage)
     fbuf   = Base.summarysize(_fbuf(plan))
     nodes  = Base.summarysize(_θnodes(plan)) + Base.summarysize(_φnodes(plan))
     pool   = Base.summarysize(plan.size_pool)
-    sph    = Base.summarysize(plan.sph_pool)
+    # The first entry of a nonempty pool is the plan's own slice and plans, counted above.
+    sph    = sum(Base.summarysize, view(plan.sph_pool, 2:length(plan.sph_pool)); init = 0)
     valid  = slot(plan.valid)
-    return (; C, F, Fhat, Fslice, fbuf, nodes, size_pool = pool, sph_pool = sph, valid,
-            total = C + F + Fhat + Fslice + fbuf + nodes + pool + sph + valid)
+    return (; C, F, Fhat, Fslice, Fstage, fbuf, nodes, size_pool = pool, sph_pool = sph, valid,
+            total = C + F + Fhat + Fslice + Fstage + fbuf + nodes + pool + sph + valid)
 end
 
 """
-    make_plan([FE = Float64,] θ_nodes, φ_nodes, lmax; tol=1e-8, ntrans=1, …)
-
-`FE` is the field element type, positional as it is for `zeros(T, …)`. `Float64`/`Float32` assert the
-field values are real, which makes the mode array conjugate-symmetric in `kθ`; on a NUFFT backend with
-a real-data transform (either FlowTransformBindings library) only the `kθ ≥ 0` half is then built and
-only real strengths come back, halving the mode array, the upsampled FFT and the spreading.
-`ComplexF64`/`ComplexF32` build the full array. Both are the same spherical harmonic transform; only
-the symmetry exploited differs.
+    make_plan([FE = float(eltype(θ_nodes)),] θ_nodes, φ_nodes, lmax; execution = AutoBackend(), tol=1e-8, ntrans=1, …)
 
 Construct a `NUSHTplan` for `M` scattered points at colatitudes `θ_nodes ∈ [0,π]` and longitudes
 `φ_nodes ∈ [0,2π)`, up to spherical harmonic degree `lmax`, transforming `ntrans` co-located fields
 per call. Builds the NUFFT plans over the nodes once; [`close!`](@ref) frees them.
 
+`FE` is the field element type, positional as it is for `zeros(T, …)`. A real `FE` asserts the field
+values are real, so the mode array is conjugate-symmetric in `kθ`; on a NUFFT backend with a real-data
+transform (either FlowTransformBindings library) only the `kθ ≥ 0` half is built and real strengths
+come back. A complex `FE` builds the full array. Both are the same spherical harmonic transform.
+
 Keyword arguments:
+- `execution`: where the plan runs, a `ComputationalBackends` backend. `SerialBackend()` runs it on one
+  thread and `ThreadedBackend()` on `Threads.nthreads()`; `AutoBackend()`, the default, runs it on the
+  host at `nthreads`. `GPUBackend(b)` puts the nodes, and so the plan, in `b`'s memory (with
+  KernelAbstractions and GPUArraysCore). `DistributedBackend(inner)` divides the points among the worker
+  processes and `MPIBackend(inner)` among the ranks of its communicator (with Distributed, MPI), each
+  share's plan built under `inner` with the other keywords; both plans take and return the whole field.
 - `tol`: NUFFT accuracy tolerance, raised to `eps(T)`.
 - `nufft`: `SpectralBackends.AutoSpectralBackend()` (default),
   `FlowTransformBindings.NonuniformFFTsBackend()`, `FlowTransformBindings.FINUFFTBackend()` or
   `SpectralBackends.DirectSumSpectralBackend()`.
 - `ntrans`: batch size `B` — transform `B` co-located fields (same nodes) per call.
-- `nthreads`: the thread count the NUFFT runs at and the per-column sphere steps divide among tasks
-  at; `nothing` or `0` takes `Threads.nthreads()`. FINUFFT takes any count, while NonuniformFFTs
+- `nthreads`: the thread count the NUFFT and FastTransforms' OpenMP regions run at, and the per-column
+  sphere steps divide among tasks at; `nothing` or `0` takes `Threads.nthreads()`. Inside an
+  OhMyThreads farm, and in the tasks of the per-column loop, FastTransforms runs on one thread. An
+  explicit count takes precedence over the one
+  `execution` sets, except under `SerialBackend()`, which runs on one thread and raises an
+  `ArgumentError` for any count other than `1`. FINUFFT takes any count, while NonuniformFFTs
   parallelises over Julia's own threads and so reaches only `1` and `Threads.nthreads()` — a count it
   cannot deliver is an error.
 - `upsampfac`: the NUFFT's oversampling factor; `nothing` takes the library's own.
+- `variable_npts`: let [`set_nodes!`](@ref) change the point count ([`VariableCountNodes`](@ref)).
+- `directions`: [`SynthesisAndAnalysis`](@ref) (default) or [`SynthesisOnly`](@ref).
 """
-function make_plan(
+make_plan(::Type{FE}, θ_nodes, φ_nodes, lmax;
+          execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+          kwargs...) where {FE<:Number} =
+    _make_plan(FE, θ_nodes, φ_nodes, lmax, execution; kwargs...)
+
+# The plan on this process over the nodes as given: host nodes build a host plan, device nodes a
+# device-resident one.
+function _build_plan(
     ::Type{FE},
     θ_nodes,
     φ_nodes,
@@ -519,11 +559,12 @@ function make_plan(
     # no Float32 sphere plans). Each batch slice is copied through `Fslice`, host↔device for a device
     # plan, converting precision; every other buffer runs at `FE`.
     Fslice = zeros(realfield ? Float64 : ComplexF64, Nθ, Nφ)
-    sph_plan, sph_plan_adj = _build_sph_plans(Fslice)
+    Fstage = _slice_stage(F, Fslice)
+    ntasks = _task_count(nthreads)
+    sph_plan, sph_plan_adj = _build_sph_plans(Fslice, ntasks)
     # Replicated only when there is something to thread, so a single-threaded plan pays no build cost
     # and no memory. Capped at `B`: more tasks than columns cannot help.
-    ntasks = (nthreads === nothing || nthreads == 0) ? Threads.nthreads() : Int(nthreads)
-    sph_pool = _sph_pool(Fslice, min(ntasks, B))
+    sph_pool = _sph_pool(Fslice, Fstage, sph_plan, sph_plan_adj, min(ntasks, B), ntasks)
 
     # iflag +1 for synthesis (type 2): reconstruction uses the +i (inverse-DFT) sign, so the raw
     # FFT modes need no conjugation — an axis swap takes the place of a conjugate-transpose
@@ -550,10 +591,10 @@ function make_plan(
     nodes = _node_set(Val(variable_npts), θ, φ, θ, θ_shift, fbuf, nufft_type2, nufft_type1)
 
     IV = typeof(similar(θ, Int, 0))
-    return NUSHTplan{T, FE, typeof(F), typeof(Fslice), typeof(Fhat), typeof(nodes),
+    return NUSHTplan{T, FE, typeof(F), typeof(Fslice), typeof(Fstage), typeof(Fhat), typeof(nodes),
                      typeof(sph_plan), typeof(sph_plan_adj),
                      typeof(sph_pool), typeof(size_pool), typeof(pool_recipe), typeof(tol64), IV}(
-        lmax, Nθ, Nφ, B, tol64, nodes, C, F, Fhat, Fslice,
+        lmax, Nθ, Nφ, B, tol64, ntasks, nodes, C, F, Fhat, Fslice, Fstage,
         sph_plan, sph_plan_adj, sph_pool, size_pool, pool_recipe,
         Base.RefValue{Union{Nothing,IV}}(nothing),
     )
@@ -564,31 +605,34 @@ end
 make_plan(θ_nodes, φ_nodes, lmax; kwargs...) =
     make_plan(float(eltype(θ_nodes)), θ_nodes, φ_nodes, lmax; kwargs...)
 
-"""
-    make_plan(FE, θ_nodes, φ_nodes, lmax, backend; kwargs...)
+# Backends whose plan is built on this process from the nodes as given.
+const _HostExecution = Union{ComputationalBackends.AbstractSerialBackend,
+                             ComputationalBackends.AbstractThreadedBackend,
+                             ComputationalBackends.AbstractAutoBackend}
 
-A plan that runs on `backend`, with the other keywords of `make_plan`; the backend sets the thread
-count, so `nthreads` is not among them. `SerialBackend()` runs the plan on one thread and
-`ThreadedBackend()` on `Threads.nthreads()`; `AutoBackend()` is the keyword form's default.
-`GPUBackend(b)` puts the nodes, and so the plan, in `b`'s memory (with KernelAbstractions).
-`DistributedBackend` divides the points among the worker processes and `MPIBackend` among the ranks of
-its communicator (with Distributed, MPI); both plans take and return the whole field.
 """
-function make_plan(::Type{FE}, θ_nodes, φ_nodes, lmax, backend::ComputationalBackends.AbstractExecutionBackend;
-                   kwargs...) where {FE<:Number}
-    haskey(kwargs, :nthreads) && throw(ArgumentError(
-        "make_plan with a backend takes its thread count from the backend; it takes no `nthreads`"))
-    return _backend_plan(FE, θ_nodes, φ_nodes, lmax, backend; kwargs...)
-end
+    _plan_threads(execution, nthreads) -> Union{Nothing,Integer}
 
-_backend_plan(::Type{FE}, θ, φ, lmax, ::ComputationalBackends.AbstractSerialBackend; kwargs...) where {FE} =
-    make_plan(FE, θ, φ, lmax; nthreads = 1, kwargs...)
-_backend_plan(::Type{FE}, θ, φ, lmax, ::ComputationalBackends.AbstractThreadedBackend; kwargs...) where {FE} =
-    make_plan(FE, θ, φ, lmax; nthreads = Threads.nthreads(), kwargs...)
-_backend_plan(::Type{FE}, θ, φ, lmax, ::ComputationalBackends.AbstractAutoBackend; kwargs...) where {FE} =
-    make_plan(FE, θ, φ, lmax; kwargs...)
-_backend_plan(::Type{FE}, θ, φ, lmax, b::ComputationalBackends.AbstractExecutionBackend; kwargs...) where {FE} =
-    _backend_unavailable(b, "a plan")
+The thread count a plan built under `execution` runs at, given the caller's `nthreads`: `1` under
+`SerialBackend`, which refuses any other count; `nthreads` under `ThreadedBackend` when given and
+`Threads.nthreads()` when not; `nthreads` itself under any other backend.
+"""
+_plan_threads(::ComputationalBackends.AbstractSerialBackend, nthreads) =
+    (nthreads === nothing || nthreads == 1) ? 1 : throw(ArgumentError(
+        "execution = SerialBackend() runs a plan on one thread; got nthreads = $nthreads"))
+_plan_threads(::ComputationalBackends.AbstractThreadedBackend, nthreads) =
+    nthreads === nothing ? Threads.nthreads() : nthreads
+_plan_threads(::ComputationalBackends.AbstractExecutionBackend, nthreads) = nthreads
+
+# A thread count, `nothing` and `0` taking every Julia thread.
+@inline _task_count(nthreads) = (nthreads === nothing || nthreads == 0) ? Threads.nthreads() : Int(nthreads)
+
+# `make_plan` under `execution`. NUFSHTKernelAbstractionsExt adds `GPUBackend`, NUFSHTDistributedExt
+# `DistributedBackend` and NUFSHTMPIExt `MPIBackend`.
+_make_plan(::Type{FE}, θ, φ, lmax, execution::_HostExecution; nthreads = nothing, kwargs...) where {FE} =
+    _build_plan(FE, θ, φ, lmax; nthreads = _plan_threads(execution, nthreads), kwargs...)
+_make_plan(::Type{FE}, θ, φ, lmax, e::ComputationalBackends.AbstractExecutionBackend; kwargs...) where {FE} =
+    _execution_unavailable(e, "a plan")
 
 """
     set_nodes!(plan, θ_nodes, φ_nodes) -> plan
@@ -761,8 +805,8 @@ end
 """
     close!(plan::NUSHTplan)
 
-Free every NUFFT plan the plan owns, now: its own and any narrower set [`_build_width!`](@ref) cached
-for a compacted solve. A plan left unreachable has its host NUFFT plans freed by collection, and its
+Free every NUFFT plan the plan owns, now: its own and any narrower set `_build_width!` cached for a
+compacted solve. A plan left unreachable has its host NUFFT plans freed by collection, and its
 cuFINUFFT plans only by this. Safe to call more than once.
 """
 function close!(plan::AbstractNUSHTplan)

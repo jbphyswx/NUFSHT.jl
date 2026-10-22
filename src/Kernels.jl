@@ -12,7 +12,7 @@ export kernel_transfer, cutoff_degree, gaussian_from_scale
 abstract type AbstractSpectralTransfer end
 
 """
-    cutoff_degree(scale_m, R_m)
+    cutoff_degree(scale_m, R_m=6.371e6)
 
 Compute the spherical harmonic cutoff degree L corresponding to a physical
 filter scale in meters on a sphere of radius R_m.

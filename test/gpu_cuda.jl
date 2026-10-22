@@ -88,3 +88,29 @@ Test.@testset "CUDA scalar transforms equal host: $(nameof(typeof(nufft)))" for 
         NUFSHT.close!(pc); NUFSHT.close!(pg)
     end
 end
+
+# Single precision: each batch slice crosses between the plan's element type on the device and the
+# double-precision sphere step on the host, in both directions.
+Test.@testset "CUDA single-precision scalar transforms equal host: $(nameof(typeof(nufft)))" for nufft in LIBRARIES
+    Random.seed!(13)
+    lmax, B = 16, 2
+    N = lmax + 1; Nφ = 2lmax + 1; M = 4 * N^2
+    θ = Float32.(acos.(2 .* rand(M) .- 1)); φ = Float32.(2π .* rand(M))
+    for FE in (Float32, ComplexF32)
+        C = zeros(FE, N, Nφ, B)
+        for b in 1:B, ℓ in 0:6, m in -ℓ:ℓ
+            C[FastSphericalHarmonics.sph_mode(ℓ, m), b] = randn(FE)
+        end
+        pc = NUFSHT.make_plan(FE, θ, φ, lmax; tol = 1e-6, ntrans = B, nufft)
+        pg = NUFSHT.make_plan(FE, CUDA.CuArray(θ), CUDA.CuArray(φ), lmax; tol = 1e-6, ntrans = B, nufft)
+        fc = zeros(FE, M, B); NUFSHT.nusht_type2!(fc, C, pc)
+        fg = CUDA.zeros(FE, M, B); NUFSHT.nusht_type2!(fg, CUDA.CuArray(C), pg)
+        Test.@test relerr(Array(fg), fc) < 1e-4
+
+        g = randn(FE, M, B)
+        Cc = zeros(FE, N, Nφ, B); NUFSHT.nusht_type1!(Cc, g, pc)
+        Cg = CUDA.zeros(FE, N, Nφ, B); NUFSHT.nusht_type1!(Cg, CUDA.CuArray(g), pg)
+        Test.@test relerr(Array(Cg), Cc) < 1e-4
+        NUFSHT.close!(pc); NUFSHT.close!(pg)
+    end
+end

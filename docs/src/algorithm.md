@@ -14,7 +14,7 @@ A = N \cdot F \cdot S
 
 | Step | Name | Size in → out | Cost |
 |------|------|---------------|------|
-| **S** | `plan_sph2fourier` | ``K \to N_\theta \times N_\phi`` | ``O(K \log K)`` via FastTransforms |
+| **S** | `plan_sph2fourier` | ``K \to N_\theta \times N_\phi`` | ``O(l_\text{max}^3)``: FastTransforms' Givens rotations and triangular products |
 | **F** | `_assemble_modes!` | ``N_\theta \times N_\phi \to (2l_\text{max}+3) \times (2l_\text{max}+1)`` | ``O(K)`` |
 | **N** | NUFFT type 2 | Fourier modes ``\to \mathbb{R}^M`` | ``O(K \log K + M)``, via the chosen backend |
 
@@ -23,10 +23,8 @@ where ``K = (l_\text{max}+1)(2l_\text{max}+1)`` is the number of SH coefficients
 
 ## The bivariate Fourier series
 
-`plan_sph2fourier` already produces the DFS series — that is what the transform is
-for. There is no equiangular grid in the pipeline and nothing is doubled: forming
-grid samples and Fourier-transforming them back would be a round trip from Fourier
-coefficients to Fourier coefficients.
+`plan_sph2fourier` produces the DFS series directly, so the pipeline has no equiangular
+grid and no doubling.
 
 For order ``m`` in the `sph_mode` column packing, the series `S` returns is
 
@@ -44,11 +42,10 @@ with ``\Phi_m = \cos(|m|\varphi)`` on the ``+m`` column and ``\sin(|m|\varphi)``
 \end{cases}
 ```
 
-That parity is not a storage convention. The DFS extension of ``Y_{\ell m}`` in
-``\theta`` is ``\sin^{|m|}\theta \cdot Q(\cos\theta)``, which is even in ``\theta``
-for even ``m`` and odd for odd ``m`` — the same fact the glide reflection
-``f(\theta,\varphi) \mapsto f(2\pi-\theta, \varphi+\pi)`` encodes, expressed in a basis
-where it costs nothing.
+The parity comes from the harmonics: the DFS extension of ``Y_{\ell m}`` in ``\theta`` is
+``\sin^{|m|}\theta \cdot Q(\cos\theta)``, which is even in ``\theta`` for even ``m`` and odd
+for odd ``m``, the fact the glide reflection
+``f(\theta,\varphi) \mapsto f(2\pi-\theta, \varphi+\pi)`` encodes.
 
 `_assemble_modes!` rewrites those cosines and sines as complex exponentials, giving the
 mode array the NUFFT evaluates. The ``\theta`` axis runs ``-(l_\text{max}+1) \ldots
@@ -70,11 +67,18 @@ A^\dagger = S^\dagger \cdot F^\dagger \cdot N^\dagger
 | ``F`` | `_assemble_modes!` | `_assemble_modes_adjoint!` (gather, real part for a real array) |
 | ``S`` | `plan_sph2fourier` (``P``) | ``P'`` (FastTransforms conjugate plan) |
 
-`nusht_type1!` **is** ``A^\dagger`` — the transpose, not an inverse. At scattered
-points ``A^\dagger A \neq I``, and only quadrature on a grid makes the two coincide;
-for exact analysis of a field already sampled on the Clenshaw-Curtis grid use
-`FastSphericalHarmonics.sph_transform`. Inversion at scattered points is
-`nusht_solve!`.
+`nusht_type1!` **is** ``A^\dagger``, the transpose, with no quadrature weights. At scattered
+points ``A^\dagger A \neq I``. Quadrature weights ``w_j`` make the weighted adjoint
+``A^\dagger W`` the analysis,
+
+```math
+c_k = \sum_j w_j f_j \overline{Y_k(x_j)},
+```
+
+exact for a degree-``l_\text{max}`` field when the rule integrates the product of two
+degree-``l_\text{max}`` harmonics exactly; that is `nusht_analyze!(C, f, plan; weights)`. At
+scattered points without such weights the analysis is the fit `nusht_solve!` (also
+`nusht_analyze!` without weights).
 
 ## LSMR inversion (`nusht_solve!`)
 
@@ -85,14 +89,14 @@ for exact analysis of a field already sampled on the Clenshaw-Curtis grid use
 ```
 
 by **LSMR** (Fong & Saunders 2011) on the Golub–Kahan bidiagonalization of ``A``.
-One ``A`` and one ``A^\dagger`` per iteration, the same cost as conjugate gradients on
-the normal equations, but it works at ``\kappa(A)`` rather than ``\kappa(A)^2`` and
-decreases ``\lVert A^\dagger r \rVert`` — the quantity the solve reports and stops on —
-monotonically.
+One ``A`` and one ``A^\dagger`` per iteration, as for conjugate gradients on the normal
+equations. LSMR's convergence is governed by ``\kappa(A)``, the normal equations' by
+``\kappa(A)^2``, and it decreases ``\lVert A^\dagger r \rVert`` — the quantity the solve
+reports and stops on — monotonically.
 
-**Convergence** depends on ``\kappa(A)``, which is a property of the *point
-distribution*, not of `lmax`. Measured on the design matrix over the ``l \leq
-l_\text{max}`` modes at fourfold overdetermination:
+**Convergence** depends on ``\kappa(A)``, a property of the *point distribution*
+independent of `lmax`. For the design matrix over the ``l \leq l_\text{max}`` modes at
+fourfold overdetermination:
 
 | Point set | ``\kappa(A)`` | Iterations to ``10^{-10}`` |
 |-----------|---------------|---------------------------|
@@ -109,31 +113,20 @@ reach `rtol`.
 
 ## The real fast path
 
-The field element type passed to `make_plan` is a statement about the data, not a storage
-preference: `Float64`/`Float32` assert the field **values** are real, and a real field's
-mode array is Hermitian, ``Z[-k] = \overline{Z[k]}``. Only the ``k_\theta \geq 0`` half is
-therefore stored — ``l_\text{max}+2`` rows instead of ``2 l_\text{max}+3`` — on **every**
-backend: halving the ``\theta`` axis halves the deconvolution and the upsampled FFT and leaves
-the interpolation untouched, so it is never more work than the full array.
+The field element type passed to `make_plan` is a statement about the data:
+`Float64`/`Float32` assert the field **values** are real, and a real field's mode array is
+Hermitian, ``Z[-k] = \overline{Z[k]}``. Only the ``k_\theta \geq 0`` half is therefore
+stored, ``l_\text{max}+2`` of the ``2 l_\text{max}+3`` rows, on **every** backend: halving the
+``\theta`` axis halves the deconvolution and the upsampled FFT and leaves the interpolation
+untouched.
 
 How the missing half is supplied splits into two cases. Both NUFFT libraries, through
 FlowTransformBindings, take the half-spectrum of a transform built for the full ``\theta`` axis and
 supply the rest themselves — with **real strengths**, so the spreading/interpolation halves too and
 the forward needs no weights. Direct summation's transform is half-height and complex: its centered
 rows are labelled ``k_\theta - \lceil\cdot\rceil``, which a per-point phase undoes, and the absent
-conjugate half is paid for by doubling every ``k_\theta > 0`` row on the way in.
-
-Measured with NonuniformFFTs' real-data transform against its unfolded path at the same points
-and modes, identical iteration counts, results agreeing to ``2 \times 10^{-16}``:
-
-| ``l_\text{max}``, ``M`` | synthesis | `nusht_solve!` |
-|---|---|---|
-| 64, ``10^4`` | 1.52× | 1.51× |
-| 64, ``10^5`` | 1.15× | 1.31× |
-| 128, ``2\times10^4`` | 1.96× | 1.89× |
-| 128, ``2\times10^5`` | 1.23× | 1.21× |
-
-Near 2× where modes dominate, settling to ~1.2× where the point count does.
+conjugate half is paid for by doubling every ``k_\theta > 0`` row on the way in. The saving is
+largest where the mode count dominates the cost.
 
 Forward, the fold is free: writing the half and letting the complex-to-real transform imply
 the conjugate is exact, with no weights. Its **transpose** is not. The embedding
@@ -146,9 +139,36 @@ E^\dagger \hat{Z} = \hat{Z}[k] + \overline{\hat{Z}[-k]} = 2\,\hat{Z}[k] \quad (k
 
 using ``\overline{\hat{Z}[-k]} = \hat{Z}[k]`` for real strengths. Hence the diagonal
 ``\{1, 2, 2, \ldots\}``: one at ``k_\theta = 0``, which is its own partner, two above it. There
-is no third case at the top, because the ``\theta`` axis has odd length ``2 l_\text{max}+3``
-and therefore no self-paired Nyquist row — an even axis would need one. A complex field is not
-Hermitian and uses the full array with no weights in either direction.
+is no third case at the top: the ``\theta`` axis has odd length ``2 l_\text{max}+3`` and so no
+self-paired Nyquist row. A complex field is not Hermitian and uses the full array with no
+weights in either direction.
+
+## Spin-weighted plans
+
+A spin-``s`` plan synthesizes ``f = \sum_{\ell m} {}_s f_{\ell m}\, {}_sY_{\ell m}`` with
+``{}_sY_{\ell m}(\theta,\varphi) = N_\ell\, d^\ell_{m,-s}(\theta)\, e^{im\varphi}``, written as the
+bivariate Fourier series ``f = \sum_{m',m} G_{m'm}\, e^{-im'\theta} e^{im\varphi}`` that one NUFFT
+evaluates. On host `Float64` nodes ``G`` comes from FastTransforms' `plan_spinsph2fourier`; for any other
+element type, and on a device, from the Wigner-``d`` recurrence. Both are the same linear map.
+
+FastTransforms stores ``{}_s f_{\ell m}`` at row ``\ell - \max(|m|,|s|) + 1`` of column ``1`` (``m = 0``),
+``2m+1`` (``m > 0``) or ``2|m|`` (``m < 0``), as the coefficient of ``\sigma_{ms}\, {}_sY_{\ell m}``, with
+``\sigma_{ms} = (-1)^{m+s}`` for ``m + s > 0`` and ``1`` otherwise. Its Givens rotations and
+Jacobi-to-Chebyshev conversions build the orthonormal functions
+``(1-x)^{|m+s|/2} (1+x)^{|m-s|/2} \tilde P_k^{(|m+s|,|m-s|)}(x)``, ``x = \cos\theta``, each with a
+positive leading coefficient, and ``\sigma_{ms}`` is the sign of ``d^\ell_{m,-s}(\theta)`` as
+``\theta \to 0``. Column ``m`` of its output is
+
+```math
+\frac{e^{im\varphi}}{\sqrt{2\pi}} \sum_{j=0}^{l_\text{max}} B_j \cos(j\theta) \quad (m+s \text{ even}),
+\qquad
+\frac{e^{im\varphi}}{\sqrt{2\pi}} \sum_{j=0}^{l_\text{max}} B_j \sin((j+1)\theta) \quad (m+s \text{ odd}),
+```
+
+so ``G_{0m} = B_0/\sqrt{2\pi}`` and ``G_{\pm k, m} = B_k / (2\sqrt{2\pi})`` on a cosine column, and
+``G_{\pm k, m} = \pm i\, B_{k-1} / (2\sqrt{2\pi})`` on a sine column. The sine row ``B_{l_\text{max}}``,
+of frequency ``l_\text{max}+1``, is zero for degrees ``\ell \le l_\text{max}``. FastTransforms' rotations
+and conversion matrices are real, so its transpose is the exact adjoint.
 
 ## References
 

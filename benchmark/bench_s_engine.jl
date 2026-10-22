@@ -1,25 +1,21 @@
-# Phase 0a — which S-engine produces the DFS Fourier coefficients faster?
+# Which S-engine produces the DFS Fourier coefficients of a scalar field faster?
 #
-# `S` must turn spherical harmonic coefficients into the bivariate Fourier coefficients the NUFFT
+# `S` turns spherical harmonic coefficients into the bivariate Fourier coefficients the NUFFT
 # evaluates. Two engines do that:
 #
-#   scalar : FastTransforms `plan_sph2fourier` (butterfly), O(L² log² L)
-#   spin   : the Wigner-d factorization at s = 0 (`_assemble_G!`), O(L³)
+#   scalar : FastTransforms `plan_sph2fourier` (Givens rotations, triangular products), O(L³)
+#   spin   : the Wigner-d recurrence at s = 0, passed to `_assemble_G_impl!` as the engine, O(L³)
 #
 #     d^ℓ_{mn}(θ) = i^{m−n} Σ_{m'} Δ^ℓ_{m'm} Δ^ℓ_{m'n} e^{−im'θ},   Y_ℓm = N_ℓ d^ℓ_{m,0}(θ) e^{imφ}
 #
-# so at s = 0 the spin contraction IS a scalar S-engine — one already threaded, Float32-generic and
-# device-capable, and one that would let FastTransforms (with its OpenMP-in-a-task hazard, Float64
-# lock and host bounce) be dropped entirely.
-#
-# The butterfly is asymptotically better, so this measures where the crossover actually is rather than
-# assuming either answer. Only the S step is timed: no NUFFT, no real/complex basis conversion.
+# so at s = 0 the spin contraction is a scalar S-engine, threaded, Float32-generic and device-capable.
+# Only the S step is timed: no NUFFT, no real/complex basis conversion.
 using NUFSHT: NUFSHT
 using FlowTransformBindings: FlowTransformBindings as FTB
 using FINUFFT: FINUFFT
 using FastSphericalHarmonics: FastSphericalHarmonics
 using LinearAlgebra: LinearAlgebra
-using Printf: @printf
+using Printf: Printf
 using Random: Random
 
 # Cold (first call at this shape) and warm (steady state) are reported separately: a min-over-repeats
@@ -38,17 +34,17 @@ end
 spin_triples(L) = sum((2ℓ + 1)^2 for ℓ in 0:L)
 
 function main()
-    @printf("julia -t%d | BLAS=%d | FFTW planner=%d | FastTransforms nthreads=%d\n",
+    Printf.@printf("julia -t%d | BLAS=%d | FFTW planner=%d | FastTransforms nthreads=%d\n",
             Threads.nthreads(), LinearAlgebra.BLAS.get_num_threads(), NUFSHT.FFTW.get_num_threads(),
             ccall((:omp_get_max_threads, NUFSHT.FastTransforms.libfasttransforms), Cint, ()))
-    @printf("loadavg=%s | %s physical / %s logical cores\n",
+    Printf.@printf("loadavg=%s | %s physical / %s logical cores\n",
             strip(read(`sysctl -n vm.loadavg`, String)),
             strip(read(`sysctl -n hw.physicalcpu`, String)),
             strip(read(`sysctl -n hw.ncpu`, String)))
     println("="^104)
-    @printf("%-6s %-12s | %-11s %-11s | %-11s %-11s | %-9s %s\n",
-            "lmax", "spin triples", "S butterfly", "(cold)", "S spin s=0", "(cold)",
-            "spin/bfly", "verdict")
+    Printf.@printf("%-6s %-12s | %-11s %-11s | %-11s %-11s | %-9s %s\n",
+            "lmax", "spin triples", "S FastTr.", "(cold)", "S spin s=0", "(cold)",
+            "spin/FT", "verdict")
 
     for lmax in (32, 64, 128, 256, 512)
         # A handful of points: the NUFFT is not timed here, but a plan needs nodes.
@@ -71,16 +67,18 @@ function main()
         ps = NUFSHT.make_plan(Float64, θ, φ, lmax; tol = 1e-8, nufft = be)
         pg = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 0; tol = 1e-8, nufft = be)
 
-        # Butterfly arm: exactly what `nusht_type2!` does for S — load the slice buffer, apply P.
+        # FastTransforms arm: exactly what `nusht_type2!` does for S — load the slice buffer, apply P.
         # `_sph_evaluate!` is in-place on plan.F, so the reload is part of the step, as in production.
         bc, bw = timed(() -> (copyto!(ps.F, C); NUFSHT._sph_evaluate!(ps)), 5)
-        # Recurrence arm: coefficients -> G, the same DFS Fourier coefficients, not in place.
-        gc, gw = timed(() -> NUFSHT._assemble_G!(pg.G, sf, pg), 5)
+        # Recurrence arm: coefficients -> G, the same DFS Fourier coefficients, into the plan's mode
+        # buffer. A host Float64 spin plan runs FastTransforms, so the recurrence is passed as the engine.
+        eng = NUFSHT._wigner_planes(NUFSHT._θnodes(pg), lmax, pg.ntasks)
+        gc, gw = timed(() -> NUFSHT._assemble_G_impl!(pg.G, sf, pg, eng), 5)
 
         r = gw / bw
-        @printf("%-6d %-12.3g | %-11.3f %-11.3f | %-11.3f %-11.3f | %-9.2f %s\n",
+        Printf.@printf("%-6d %-12.3g | %-11.3f %-11.3f | %-11.3f %-11.3f | %-9.2f %s\n",
                 lmax, float(spin_triples(lmax)), 1e3bw, 1e3bc, 1e3gw, 1e3gc, r,
-                r < 1 ? "recurrence wins" : "butterfly wins")
+                r < 1 ? "recurrence wins" : "FastTransforms wins")
         flush(stdout)
         NUFSHT.close!(ps); NUFSHT.close!(pg)
     end

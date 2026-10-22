@@ -12,9 +12,8 @@ plan_memory
 
 ### Which directions a plan holds
 
-A plan that only ever synthesises has no reason to hold an analysis plan. `directions` says which it
-needs; asking a synthesis-only plan to analyse raises rather than quietly building the missing half.
-Where a backend's plan carries no direction of its own, both directions already share one object and
+`directions` says which transform directions a plan holds; asking a synthesis-only plan to analyse
+raises. Where a backend's plan carries no direction of its own, both directions share one object and
 the choice costs nothing either way.
 
 ```@docs
@@ -39,13 +38,15 @@ NUFSHT.VariableCountNodes
 ```@docs
 nusht_type2!
 nusht_type1!
+nusht_analyze!
 nusht_solve!
 ```
 
 ## Spin-weighted transforms
 
 Synthesis/analysis/inversion of spin-weighted (`spin = s`) fields at arbitrary scattered
-points, built from the Wigner-`d` Fourier factorization + a 2-D NUFFT. Spin-1 is the
+points: the coefficients become a bivariate Fourier series (FastTransforms' `plan_spinsph2fourier` on
+host `Float64` nodes, the Wigner-`d` recurrence otherwise) and a 2-D NUFFT evaluates it. Spin-1 is the
 tangent-vector case (velocity `u_θ + i u_φ`), enabling vector / Helmholtz decomposition on
 scattered spherical data.
 
@@ -58,8 +59,14 @@ nusht_solve_spin!
 WignerTable
 sYlm
 spin_coeff_index
+scalar_to_spin0!
+spin0_to_scalar!
 NUFSHT.wigner_d
-NUFSHT._wigner_d_halfpi_step!
+NUFSHT._FTSpinEngine
+NUFSHT._WignerPlanes
+NUFSHT._wigner_boundary
+NUFSHT._wigner_quarter!
+NUFSHT._quarter_sign
 ```
 
 ## Filtering
@@ -82,12 +89,15 @@ cutoff_degree
 
 ## Parallel execution
 
-Parallelism is selected by a `ComputationalBackends.AbstractExecutionBackend` argument, with the
-backends themselves provided by the accelerator extensions (`using OhMyThreads` / `Distributed` /
-`MPI`). See the performance section of the README for the threads-vs-processes trade-offs.
+Parallelism is selected by a `ComputationalBackends.AbstractExecutionBackend`, with the backends
+themselves provided by the accelerator extensions (`using OhMyThreads` / `KernelAbstractions` /
+`Distributed` / `MPI`). See the performance section of the README for the threads-vs-processes
+trade-offs.
 
-The collection entry points farm independent problems across a backend; `MPIBackend` instead
-decomposes a single transform's points across ranks.
+`make_plan` and `make_spin_plan` take the `execution` keyword for where the plan runs, and the
+collection entry points farm independent problems across it. `nusht_type1!`, `nusht_analyze!`,
+`nusht_solve!` and `nusht_solve_spin!` take a backend as a fourth argument, `MPIBackend(; comm)` for
+instance, and then treat the plan as one rank's share of a single transform's points.
 
 ```@docs
 nusht_type2

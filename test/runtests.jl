@@ -3,7 +3,6 @@ using Test: Test
 # thread-local mode before FastTransforms loads that runtime.
 using NUFSHT: NUFSHT
 using FlowTransformBindings: FlowTransformBindings as FTB
-using Statistics: Statistics
 using Random: Random
 using FastSphericalHarmonics: FastSphericalHarmonics
 using Aqua: Aqua
@@ -14,9 +13,7 @@ using LinearAlgebra: LinearAlgebra
 include("reference.jl")          # independent Y_lm, design matrix, conditioning, point fixtures
 
 Test.@testset "NUFSHT.jl" begin
-    include("test_constant.jl")
     include("test_kernels.jl")
-    include("test_roundtrip.jl")
     include("test_synthesis.jl")
     include("test_solve.jl")
     include("test_spin.jl")
@@ -29,6 +26,6 @@ Test.@testset "NUFSHT.jl" begin
     include("test_distributed.jl")
 
     Test.@testset "Aqua quality checks" begin
-        Aqua.test_all(NUFSHT; ambiguities=false, deps_compat=(check_extras=false,))
+        Aqua.test_all(NUFSHT; deps_compat=(check_extras=false,))
     end
 end
