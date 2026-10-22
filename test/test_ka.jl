@@ -1,251 +1,234 @@
 using KernelAbstractions: KernelAbstractions   # loads NUFSHTKernelAbstractionsExt (with GPUArraysCore)
 using GPUArraysCore: GPUArraysCore
 using JLArrays: JLArrays                        # reference GPU-array backend for GPU-less testing
+using ComputationalBackends: ComputationalBackends
 
-# Device-genericity of the KA-kernel steps, exercised on `JLArray` (a CPU-backed `AbstractGPUArray`
-# with a KA backend) — it takes the exact `::AbstractGPUArray` dispatch + kernel-launch path a real
-# CuArray/ROCArray does, so a real GPU should reproduce these results. Kernels must match the plain
-# CPU-loop `src` methods bit-for-bit.
-Test.@testset "KernelAbstractions extension: JLArray is a device array" begin
-    Test.@test JLArrays.JLArray <: GPUArraysCore.AbstractGPUArray
+# A NUFFT for device plans where no device NUFFT library exists: the plan's buffers stay on the device
+# and each execution moves its input and output across in bulk, which the scalar-indexing guard allows.
+# Everything else a solve runs under that guard is NUFSHT's own device path.
+struct HostBounceNUFFT <: NUFSHT.SpectralBackends.AbstractNUFFTSpectralBackend end
+struct HostBouncePlan{P}
+    inner::P
+end
+NUFSHT._nufft_makeplan(::HostBounceNUFFT, nodes, type, n_modes, iflag, ntrans, tol; kwargs...) =
+    HostBouncePlan(NUFSHT._nufft_makeplan(NUFSHT.SpectralBackends.DirectSumSpectralBackend(),
+                                          map(Array, nodes), type, n_modes, iflag, ntrans, tol; kwargs...))
+NUFSHT._nufft_setpts!(p::HostBouncePlan, x, y) = (NUFSHT._nufft_setpts!(p.inner, Array(x), Array(y)); p)
+NUFSHT._nufft_destroy!(::HostBouncePlan) = nothing
+function NUFSHT._nufft_exec!(p::HostBouncePlan, input, output)
+    hout = Array(output)
+    NUFSHT._nufft_exec!(p.inner, Array(input), hout)
+    return copyto!(output, hout)
 end
 
-# The scalar F step (`P·C` → the complex exponential mode array) as KA kernels. Both directions are
-# per-element gathers sharing `_mode_entry`/`_mode_adjoint_entry` with the host loops, so device and
-# host must agree bit-for-bit — this is the whole scalar mode assembly, exercised in both layouts (the
-# full `2lmax+3`-row array and the folded `lmax+2`-row real one) and at both coefficient element types.
-Test.@testset "KernelAbstractions extension: device scalar mode assembly on JLArray" begin
-    Random.seed!(101)
-    for (lmax, B) in ((8, 1), (11, 3)), FE in (Float64, ComplexF64)
-        N = lmax + 1; Nφ = 2lmax + 1
-        G = FE <: Real ? randn(N, Nφ, B) : randn(ComplexF64, N, Nφ, B)
-        for rows in (2lmax + 3, lmax + 2)          # full and folded
-            Zc = zeros(ComplexF64, rows, Nφ, B)
-            NUFSHT._assemble_modes!(Zc, G, lmax)
-            Zj = JLArrays.JLArray(zeros(ComplexF64, rows, Nφ, B))
-            NUFSHT._assemble_modes!(Zj, JLArrays.JLArray(G), lmax)
-            Test.@test Array(Zj) == Zc
-            # The device method must be the one dispatch actually picks, or this compares host to host.
-            Test.@test which(NUFSHT._assemble_modes!,
-                             (typeof(Zj), typeof(JLArrays.JLArray(G)), Int)).module ===
-                       Base.get_extension(NUFSHT, :NUFSHTKernelAbstractionsExt)
-
-            Z = randn(ComplexF64, rows, Nφ, B)
-            Gc = zeros(FE, N, Nφ, B); NUFSHT._assemble_modes_adjoint!(Gc, Z, lmax)
-            Gj = JLArrays.JLArray(zeros(FE, N, Nφ, B))
-            NUFSHT._assemble_modes_adjoint!(Gj, JLArrays.JLArray(Z), lmax)
-            Test.@test Array(Gj) == Gc
-        end
-    end
-    @info "KernelAbstractions ext: device scalar mode assembly matches CPU on JLArray (full + folded, real + complex)"
-end
-
-# The spin S-engine (Trapani–Navaza recurrence + bivariate-Fourier contraction) as KA kernels — the
-# device path for the whole spin transform (only the NUFFT is vendor-specific, via cuFINUFFT). Must
-# reproduce the CPU `_assemble_G!`/`_assemble_G_adjoint!` bit-for-bit on JLArray.
-Test.@testset "KernelAbstractions extension: device spin assembly (recurrence) on JLArray" begin
-    Random.seed!(202)
-    for (lmax, s, B) in ((8, 0, 1), (8, 2, 1), (12, 1, 3), (6, -1, 2))
-        N = lmax + 1; Nφ = 2lmax + 1; M = 50
-        θ = clamp.(π .* rand(M), 1e-9, π - 1e-9); φ = 2π .* rand(M)
-        pc = NUFSHT.make_spin_plan(θ, φ, lmax, s; tol = 1e-10, ntrans = B)   # CPU (Array buffers)
-        sf = zeros(ComplexF64, N, Nφ, B)
-        for b in 1:B, ℓ in abs(s):lmax, m in -ℓ:ℓ
-            sf[NUFSHT.spin_coeff_index(ℓ, m, lmax), b] = randn(ComplexF64)
-        end
-        # Device plan: same scalar fields, JLArray recurrence/mode buffers (NUFFT plans are unused here).
-        ndj = NUFSHT.FixedCountNodes(JLArrays.JLArray(pc.nodes.θ_nodes), JLArrays.JLArray(pc.nodes.φ_nodes),
-                                     JLArrays.JLArray(pc.nodes.θ_nufft), nothing, JLArrays.JLArray(pc.nodes.fbuf),
-                                     pc.nodes.nufft_type2, pc.nodes.nufft_type1)
-        pj = NUFSHT.SpinNUSHTplan(lmax, s, B, pc.tol, ndj,
-                                  JLArrays.JLArray(pc.dl_curr), JLArrays.JLArray(pc.dl_prev),
-                                  JLArrays.JLArray(zeros(ComplexF64, size(pc.G))), pc.wigner)
-
-        Gc = copy(pc.G); NUFSHT._assemble_G!(Gc, sf, pc)                     # CPU forward
-        NUFSHT._assemble_G!(pj.G, JLArrays.JLArray(sf), pj)                  # device forward
-        Test.@test Array(pj.G) ≈ Gc
-
-        Ĝ = randn(ComplexF64, Nφ, Nφ, B)
-        sfc = zeros(ComplexF64, N, Nφ, B); NUFSHT._assemble_G_adjoint!(sfc, Ĝ, pc)          # CPU adjoint
-        sfj = JLArrays.JLArray(zeros(ComplexF64, N, Nφ, B))
-        NUFSHT._assemble_G_adjoint!(sfj, JLArrays.JLArray(Ĝ), pj)                            # device adjoint
-        Test.@test Array(sfj) ≈ sfc
-        NUFSHT.close!(pc)
-    end
-    @info "KernelAbstractions ext: device spin recurrence+assembly matches CPU on JLArray (s=0,±1,2; batched)"
-end
-
-# Device-generic solver column primitives on complex data (so `nusht_solve_spin!` runs on GPU) — must
-# match the CPU scalar-loop versions on JLArray. One set serves the real and complex paths.
-Test.@testset "KernelAbstractions extension: device column primitives, complex (JLArray)" begin
-    Random.seed!(303)
-    N = 8; Nφ = 15; B = 4
-    a = randn(ComplexF64, N, Nφ, B); b = randn(ComplexF64, N, Nφ, B); x = randn(ComplexF64, N, Nφ, B)
-    α = randn(B); β = randn(B); s = randn(B); σ = -1.0
-
-    dc = zeros(Float64, B); NUFSHT._col_hdot!(dc, a, b)
-    dj = JLArrays.JLArray(zeros(Float64, B)); NUFSHT._col_hdot!(dj, JLArrays.JLArray(a), JLArrays.JLArray(b))
-    Test.@test Array(dj) ≈ dc
-
-    yc = copy(a); NUFSHT._col_axpy!(yc, α, x, σ)
-    yj = JLArrays.JLArray(copy(a)); NUFSHT._col_axpy!(yj, JLArrays.JLArray(α), JLArrays.JLArray(x), σ)
-    Test.@test Array(yj) ≈ yc
-
-    pc = copy(a); NUFSHT._col_pbp!(pc, b, β)
-    pj = JLArrays.JLArray(copy(a)); NUFSHT._col_pbp!(pj, JLArrays.JLArray(b), JLArrays.JLArray(β))
-    Test.@test Array(pj) ≈ pc
-
-    qc = copy(a); NUFSHT._col_scale!(qc, s)
-    qj = JLArrays.JLArray(copy(a)); NUFSHT._col_scale!(qj, JLArrays.JLArray(s))
-    Test.@test Array(qj) ≈ qc
-end
-
-# A plan built from device node arrays must have ALL buffers device-resident. Only the spin path can
-# be checked here: building a scalar plan needs a NUFFT for the array type, and the only device NUFFT
-# is cuFINUFFT, which is `CuArray`-only. The scalar path's own device kernels are covered above
-# without a plan; end to end it is exercised on real hardware in test/gpu_cuda.jl.
-Test.@testset "KernelAbstractions extension: device plan buffers are device-resident (JLArray)" begin
-    isdev(x) = x isa GPUArraysCore.AbstractGPUArray
-    Random.seed!(404)
-    lmax = 6; M = 60; B = 2
-    θ = JLArrays.JLArray(clamp.(π .* rand(M), 1e-9, π - 1e-9))
-    φ = JLArrays.JLArray(2π .* rand(M))
-
-    splan = NUFSHT.make_spin_plan(θ, φ, lmax, 2; tol = 1e-8, ntrans = B)
-    for f in (:dl_curr, :dl_prev, :G)
-        Test.@test isdev(getfield(splan, f))
-    end
-    for f in (:θ_nodes, :φ_nodes, :θ_nufft, :fbuf)
-        Test.@test isdev(getfield(splan.nodes, f))
-    end
-    sws = NUFSHT.LSMRWorkspace(splan)
-    for f in (:x, :v, :h, :hbar, :w, :u, :nrm, :cf)
-        Test.@test isdev(getfield(sws, f))
-    end
-    # The bidiagonalization's scalar recurrences run on the host, so those stay host vectors.
-    for f in (:α, :β, :ζbar, :rel, :colres)
-        Test.@test getfield(sws, f) isa Array
-    end
-    NUFSHT.close!(splan)
-    @info "KernelAbstractions ext: spin device plan/workspace are device-resident"
-end
-
-# Device-generic solver column primitives on real data + the real↔complex field copy (so the *scalar*
-# nusht_solve!/type-2/1 run on GPU) — must match the CPU scalar-loop `src` methods on JLArray.
-Test.@testset "KernelAbstractions extension: device column primitives, real (JLArray)" begin
-    Random.seed!(505)
-    N = 7; Nφ = 13; B = 4
-    a = randn(N, Nφ, B); b = randn(N, Nφ, B); x = randn(N, Nφ, B)
-    α = randn(B); β = randn(B); σ = -1.0
-
-    dc = zeros(B); NUFSHT._col_hdot!(dc, a, b)
-    dj = JLArrays.JLArray(zeros(B)); NUFSHT._col_hdot!(dj, JLArrays.JLArray(a), JLArrays.JLArray(b))
-    Test.@test Array(dj) ≈ dc
-
-    yc = copy(a); NUFSHT._col_axpy!(yc, α, x, σ)
-    yj = JLArrays.JLArray(copy(a)); NUFSHT._col_axpy!(yj, JLArrays.JLArray(α), JLArrays.JLArray(x), σ)
-    Test.@test Array(yj) ≈ yc
-
-    pc = copy(a); NUFSHT._col_pbp!(pc, b, β)
-    pj = JLArrays.JLArray(copy(a)); NUFSHT._col_pbp!(pj, JLArrays.JLArray(b), JLArrays.JLArray(β))
-    Test.@test Array(pj) ≈ pc
-
-    # real↔complex field copy, both `f` shapes: (M, B) and (M,) with B=1.
-    M = 20
-    for (fsz, bufsz) in (((M, B), (M, B)), ((M,), (M, 1)))
-        fbuf = randn(ComplexF64, bufsz...)
-        fc = zeros(fsz...); NUFSHT._copy_real!(fc, fbuf)
-        fj = JLArrays.JLArray(zeros(fsz...)); NUFSHT._copy_real!(fj, JLArrays.JLArray(fbuf))
-        Test.@test Array(fj) == fc
-
-        fsrc = randn(fsz...)
-        bc = zeros(ComplexF64, bufsz...); NUFSHT._copy_field!(bc, fsrc)
-        bj = JLArrays.JLArray(zeros(ComplexF64, bufsz...)); NUFSHT._copy_field!(bj, JLArrays.JLArray(fsrc))
-        Test.@test Array(bj) == bc
-    end
-end
-
-# `nusht_solve!` narrows to the live column prefix as columns retire, so every call it makes to the
-# column kernels carries a count. A device override without that argument is simply not the method
-# those calls select: the loop lands on the `src` scalar loop instead and indexes the device array
-# element by element. Assert the arity the solver actually uses, not the bare one.
-Test.@testset "KernelAbstractions extension: device column kernels take the live-column count" begin
-    JA3 = JLArrays.JLArray{Float64,3}; JA1 = JLArrays.JLArray{Float64,1}
-    ext = Base.get_extension(NUFSHT, :NUFSHTKernelAbstractionsExt)
-    Test.@test ext !== nothing
-    for (fn, sig) in ((NUFSHT._col_hdot!, (JA1, JA3, JA3, Int)),
-                      (NUFSHT._col_axpy!, (JA3, JA1, JA3, Float64, Int)),
-                      (NUFSHT._col_pbp!, (JA3, JA3, JA1, Int)),
-                      (NUFSHT._col_scale!, (JA3, JA1, Int)))
-        Test.@test which(fn, sig).module === ext
-    end
-end
-
-# Everything the solver does to its column buffers, on device arrays with scalar indexing turned into
-# an error: the reductions at the live width, the column copies and the retire/compact pass. The
-# transforms themselves cannot run here (nothing implements AbstractFFTs for `JLArray`), so this
-# covers the bookkeeping — the part that reaches into individual columns and rows.
-Test.@testset "KernelAbstractions extension: device solver bookkeeping never scalar-indexes (JLArray)" begin
+# The solver steps that are NUFSHT's own, on device arrays with scalar indexing an error: the scatter of
+# the packed iterate into the plan's `(Nθ, Nφ, B)` layout, the gather of the adjoint back into it (with
+# and without the fold of the previous vector, over the first `n` columns), and the write-out of a
+# finished column to another column. Each is compared with the host loop.
+Test.@testset "KernelAbstractions extension: device packing never scalar-indexes (JLArray)" begin
     Random.seed!(707)
-    N, Nf, B, n = 7, 13, 4, 3
-    len = N * Nf
-    mlen = 5
+    lmax, B, n = 6, 4, 3
+    N, Nf = lmax + 1, 2lmax + 1
+    full = N * Nf
     J(v) = JLArrays.JLArray(v)
     no_scalar(f) = task_local_storage(f, :ScalarIndexing, GPUArraysCore.ScalarDisallowed)
-    # The guard must actually bite, or everything below it passes vacuously.
-    Test.@test_throws ErrorException no_scalar(() -> J(zeros(3))[1])
+    Test.@test_throws ErrorException no_scalar(() -> J(zeros(3))[1])   # the guard bites
 
-    a = randn(N, Nf, B); b = randn(N, Nf, B); x = randn(N, Nf, B); s = randn(B)
-    α = randn(B); β = randn(B); σ = -1.0
-    dc = zeros(B); NUFSHT._col_hdot!(dc, a, b, n)
-    yc = copy(a); NUFSHT._col_axpy!(yc, α, x, σ, n)
-    pc = copy(a); NUFSHT._col_pbp!(pc, b, β, n)
-    qc = copy(a); NUFSHT._col_scale!(qc, s, n)
-
-    # The scalar solver's vectors are packed to the `l ≤ lmax` slots, so its iterate is `(K, B)` and
-    # retirement scatters a column back into the plan's `(Nθ, Nφ, B)` layout. Build a real plan for the
-    # index vector and the shapes — its transforms are never run here.
-    θp, φp = fib_points(64)
-    splan = NUFSHT.make_plan(Float64, θp, φp, N - 1; tol = 1e-8)
-    idx = NUFSHT._valid_indices(zeros(0), N - 1)
+    idx = NUFSHT._valid_indices(zeros(0), lmax)
     K = length(idx)
-    xp = randn(K, B)
+    xp = randn(K, B); w = randn(N, Nf, B); v = randn(K, B); c = randn(B)
 
-    dj = J(zeros(B)); yj = J(copy(a)); pj = J(copy(a)); qj = J(copy(a)); Cj = J(zeros(N, Nf, B))
-    ws = NUFSHT.LSMRWorkspace(J(copy(xp)), J(zeros(K, B)), J(zeros(K, B)), J(zeros(K, B)),
-                              J(copy(a)), J(zeros(mlen, B)), J(idx), collect(1:B),
-                              J(zeros(B)), J(zeros(B)),
-                              ntuple(_ -> zeros(B), 17)...)
-    nlive = no_scalar() do
-        NUFSHT._col_hdot!(dj, J(a), J(b), n)
-        NUFSHT._col_axpy!(yj, J(α), J(x), σ, n)
-        NUFSHT._col_pbp!(pj, J(b), J(β), n)
-        NUFSHT._col_scale!(qj, J(s), n)
-        ws.rel .= (1e-9, 0.5, 0.4, 0.3)
-        ws.done .= (1.0, 1.0, 0.0, 0.0)            # slots 1 and 2 finished, 3 and 4 live
-        NUFSHT._retire_and_compact!(Cj, ws, splan, 1e-6, B, K, mlen)
-    end
-    NUFSHT.close!(splan)
+    Fc = zeros(N, Nf, B); NUFSHT._unpack_coeffs!(Fc, xp, idx, full, B)
+    vc = copy(v); NUFSHT._col_pbp_pack!(vc, w, c, idx, full, n)
+    pc = zeros(K, B); NUFSHT._pack_coeffs!(pc, w, idx, full, B)
+    Cc = zeros(N, Nf, B); NUFSHT._write_solution!(Cc, xp, idx, full, 2, 3)
 
-    Test.@test Array(dj)[1:n] ≈ dc[1:n]
-    Test.@test all(Array(dj)[(n + 1):end] .== 0)   # the count really did bound the reduction
-    Test.@test Array(yj) ≈ yc
-    Test.@test Array(pj) ≈ pc
-    Test.@test Array(qj) ≈ qc
-    # Retirement scatters slot `s` to column `perm[s]` — the identity before compaction — putting the
-    # packed values at the valid slots and zero everywhere else.
-    for c in 1:2
-        Test.@test Array(Cj)[:, :, c][idx] == xp[:, c]
-        Test.@test sum(abs, Array(Cj)[:, :, c]) == sum(abs, xp[:, c])   # nothing outside them
+    Fj = J(zeros(N, Nf, B)); vj = J(copy(v)); pj = J(zeros(K, B)); Cj = J(zeros(N, Nf, B))
+    idxj = J(idx)
+    no_scalar() do
+        NUFSHT._unpack_coeffs!(Fj, J(xp), idxj, full, B)
+        NUFSHT._col_pbp_pack!(vj, J(w), J(c), idxj, full, n)
+        NUFSHT._pack_coeffs!(pj, J(w), idxj, full, B)
+        NUFSHT._write_solution!(Cj, J(xp), idxj, full, 2, 3)
     end
-    Test.@test nlive == 2
-    Test.@test sort(ws.perm) == collect(1:B)
-    Test.@test ws.colres[1] == 1e-9 && ws.colres[2] == 0.5
-    Test.@test ws.rel[1:nlive] == [0.4, 0.3]       # survivors' state moved with them
+    Test.@test Array(Fj) == Fc
+    Test.@test Array(vj) ≈ vc
+    Test.@test Array(vj)[:, (n + 1):end] == v[:, (n + 1):end]   # the count bounded the fold
+    Test.@test Array(pj) == pc
+    Test.@test Array(Cj) == Cc
+    # Column 2 of the iterate lands in column 3, at the valid slots, with zero everywhere else.
+    Test.@test Cc[:, :, 3][idx] == xp[:, 2]
+    Test.@test all(iszero, vec(Cc[:, :, 3])[setdiff(1:full, idx)])
 end
 
-# Device-generic spectral filter (`apply_transfer!`, × H(ℓ)) — must match the CPU scalar mode loop
-# bit-for-bit on JLArray, for both a smooth (Gaussian) and a sharp (top-hat) transfer.
+# `nusht_solve!` and `nusht_solve_spin!` end to end on device arrays with scalar indexing an error,
+# scored against the coefficients the fields were synthesised from by an independent evaluation. The
+# plans are built with `execution = GPUBackend(JLBackend())`.
+Test.@testset "KernelAbstractions extension: device solves never scalar-index (JLArray)" begin
+    J(v) = JLArrays.JLArray(v)
+    no_scalar(f) = task_local_storage(f, :ScalarIndexing, GPUArraysCore.ScalarDisallowed)
+    Test.@test_throws ErrorException no_scalar(() -> J(zeros(3))[1])   # the guard bites
+    lmax, B = 6, 2
+    M = 4 * (lmax + 1)^2
+    θ, φ = fib_points(M)
+    nb = HostBounceNUFFT()
+    gpu = ComputationalBackends.GPUBackend(JLArrays.JLBackend())
+
+    # Scalar plan, real and complex field.
+    for FE in (Float64, ComplexF64)
+        Random.seed!(808)
+        Cr = rand_coeffs(lmax, 808, B)
+        Ct = FE <: Real ? Cr : Cr .+ im .* rand_coeffs(lmax, 809, B)
+        f = zeros(FE, M, B)
+        for b in 1:B
+            f[:, b] .= synth_ref(real.(Ct[:, :, b]), lmax, θ, φ)
+            FE <: Complex && (f[:, b] .+= im .* synth_ref(imag.(Ct[:, :, b]), lmax, θ, φ))
+        end
+        p = NUFSHT.make_plan(FE, θ, φ, lmax; execution = gpu, ntrans = B, nufft = nb)
+        ws = FTB.LSMRWorkspace(p)
+        C = NUFSHT.allocate_coefficients(p)
+        Test.@test C isa GPUArraysCore.AbstractGPUArray
+        fj = J(f)
+        res = no_scalar(() -> NUFSHT.nusht_solve!(C, fj, p; ws = ws, rtol = 1e-11, maxiter = 100))
+        Test.@test res[4]
+        Test.@test relerr(Array(C), Ct) < 1e-9
+        g = J(zeros(FE, M, B))
+        no_scalar(() -> NUFSHT.nusht_type2!(g, C, p))
+        Test.@test relerr(Array(g), f) < 1e-9
+        NUFSHT.close!(p)
+    end
+
+    # Spin plans: a real spin-0 field, whose fit runs over the packed Hermitian degrees, and a
+    # complex spin-1 one over the full array.
+    for (FE, s) in ((Float64, 0), (ComplexF64, 1))
+        Random.seed!(810 + s)
+        sf = zeros(ComplexF64, lmax + 1, 2lmax + 1, B)
+        for b in 1:B, ℓ in abs(s):lmax
+            sf[NUFSHT.spin_coeff_index(ℓ, 0, lmax), b] = FE <: Real ? randn() : randn(ComplexF64)
+            for m in 1:ℓ
+                a = randn(ComplexF64)
+                sf[NUFSHT.spin_coeff_index(ℓ, m, lmax), b] = a
+                sf[NUFSHT.spin_coeff_index(ℓ, -m, lmax), b] =
+                    FE <: Real ? (-1)^m * conj(a) : randn(ComplexF64)
+            end
+        end
+        fc = [sum(sf[NUFSHT.spin_coeff_index(ℓ, m, lmax), b] * NUFSHT.sYlm(s, ℓ, m, θ[i], φ[i])
+                  for ℓ in abs(s):lmax for m in -ℓ:ℓ) for i in 1:M, b in 1:B]
+        f = FE <: Real ? real.(fc) : fc
+        p = NUFSHT.make_spin_plan(FE, θ, φ, lmax, s; execution = gpu, ntrans = B, nufft = nb)
+        ws = FTB.LSMRWorkspace(p)
+        S = NUFSHT.allocate_coefficients(p)
+        Test.@test S isa GPUArraysCore.AbstractGPUArray
+        fj = J(f)
+        res = no_scalar(() -> NUFSHT.nusht_solve_spin!(S, fj, p; ws = ws, rtol = 1e-11, maxiter = 100))
+        Test.@test res[4]
+        Test.@test relerr(Array(S), sf) < 1e-9
+        NUFSHT.close!(p)
+    end
+end
+
+# Single-precision device scalar plans: the sphere step runs in double precision on the host, so each
+# batch slice crosses between the plan's element type on the device and Float64 on the host, in both
+# directions. Synthesis is scored against the direct sum, the adjoint against `Σⱼ yⱼ Y_lm(xⱼ)` evaluated
+# directly, at single-precision accuracy.
+Test.@testset "KernelAbstractions extension: single-precision device scalar plans (JLArray)" begin
+    J(v) = JLArrays.JLArray(v)
+    no_scalar(f) = task_local_storage(f, :ScalarIndexing, GPUArraysCore.ScalarDisallowed)
+    lmax, B = 6, 2
+    M = 4 * (lmax + 1)^2
+    θ, φ = fib_points(M)
+    valid = valid_mask_ref(lmax)
+    gpu = ComputationalBackends.GPUBackend(JLArrays.JLBackend())
+    for FE in (Float32, ComplexF32)
+        Ct = rand_coeffs(lmax, 820, B)
+        FE <: Complex && (Ct = Ct .+ im .* rand_coeffs(lmax, 821, B))
+        ref = zeros(FE <: Real ? Float64 : ComplexF64, M, B)
+        for b in 1:B
+            ref[:, b] .= synth_ref(real.(Ct[:, :, b]), lmax, θ, φ)
+            FE <: Complex && (ref[:, b] .+= im .* synth_ref(imag.(Ct[:, :, b]), lmax, θ, φ))
+        end
+        p = NUFSHT.make_plan(FE, Float32.(θ), Float32.(φ), lmax; execution = gpu, ntrans = B,
+                             nufft = HostBounceNUFFT(), tol = 1e-6)
+        g = J(zeros(FE, M, B))
+        no_scalar(() -> NUFSHT.nusht_type2!(g, J(FE.(Ct)), p))
+        Test.@test relerr(Array(g), ref) < 2e-5
+
+        Random.seed!(822)
+        y = FE <: Real ? randn(M, B) : randn(ComplexF64, M, B)
+        A = NUFSHT.allocate_coefficients(p)
+        no_scalar(() -> NUFSHT.nusht_type1!(A, J(FE.(y)), p))
+        for b in 1:B
+            Ab = Array(A)[:, :, b]
+            Test.@test relerr(Ab[valid], quadrature_ref(y[:, b], ones(M), lmax, θ, φ)[valid]) < 2e-5
+        end
+        NUFSHT.close!(p)
+    end
+end
+
+# `nusht_analyze!` with weights and the scalar ↔ spin-0 conversions on device arrays with scalar indexing
+# an error. On a rule exact for the product of two degree-`lmax` harmonics the quadrature returns the
+# coefficients a field was synthesized from by the direct sum, for a scalar plan and a real-field spin-0
+# plan (whose result passes through the Hermitian projection). The converted coefficients synthesize the
+# direct sum's field.
+Test.@testset "KernelAbstractions extension: device analysis and spin-0 conversions (JLArray)" begin
+    J(v) = JLArrays.JLArray(v)
+    no_scalar(f) = task_local_storage(f, :ScalarIndexing, GPUArraysCore.ScalarDisallowed)
+    lmax = 6
+    θ, φ, w = gauss_legendre_grid(lmax)
+    M = length(θ)
+    nb = HostBounceNUFFT()
+    gpu = ComputationalBackends.GPUBackend(JLArrays.JLBackend())
+
+    C = rand_coeffs(lmax, 830)
+    f = synth_ref(C, lmax, θ, φ)
+    p = NUFSHT.make_plan(Float64, θ, φ, lmax; execution = gpu, nufft = nb)
+    Cd = NUFSHT.allocate_coefficients(p)
+    res = no_scalar(() -> NUFSHT.nusht_analyze!(Cd, J(f), p; weights = J(w)))
+    Test.@test res.iterations == 0 && res.converged
+    Test.@test relerr(Array(Cd)[:, :, 1], C) < 1e-11
+    # A zero weight drops its point whatever the field holds there.
+    wm = copy(w); wm[1:5:M] .= 0
+    fz = copy(f); fz[1:5:M] .= 0
+    fn = copy(f); fn[1:5:M] .= NaN
+    Cz = NUFSHT.allocate_coefficients(p); Cn = NUFSHT.allocate_coefficients(p)
+    no_scalar(() -> NUFSHT.nusht_analyze!(Cz, J(fz), p; weights = J(wm)))
+    no_scalar(() -> NUFSHT.nusht_analyze!(Cn, J(fn), p; weights = J(wm)))
+    Test.@test Array(Cn) == Array(Cz)
+    Test.@test relerr(Array(Cn)[:, :, 1], quadrature_ref(fz, wm, lmax, θ, φ)) < 1e-11
+    NUFSHT.close!(p)
+
+    Random.seed!(831)
+    sh = zeros(ComplexF64, lmax + 1, 2lmax + 1)
+    for ℓ in 0:lmax
+        sh[NUFSHT.spin_coeff_index(ℓ, 0, lmax)] = randn()
+        for m in 1:ℓ
+            a = randn(ComplexF64)
+            sh[NUFSHT.spin_coeff_index(ℓ, m, lmax)] = a
+            sh[NUFSHT.spin_coeff_index(ℓ, -m, lmax)] = (-1)^m * conj(a)
+        end
+    end
+    f0 = [real(sum(sh[NUFSHT.spin_coeff_index(ℓ, m, lmax)] * NUFSHT.sYlm(0, ℓ, m, θ[j], φ[j])
+                   for ℓ in 0:lmax for m in -ℓ:ℓ)) for j in 1:M]
+    p0 = NUFSHT.make_spin_plan(Float64, θ, φ, lmax, 0; execution = gpu, nufft = nb)
+    S0 = NUFSHT.allocate_coefficients(p0)
+    no_scalar(() -> NUFSHT.nusht_analyze!(S0, J(f0), p0; weights = J(w)))
+    Test.@test relerr(Array(S0)[:, :, 1], sh) < 1e-10
+    NUFSHT.close!(p0)
+
+    pc = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 0; execution = gpu, nufft = nb)
+    sfd = NUFSHT.allocate_coefficients(pc)
+    no_scalar(() -> NUFSHT.scalar_to_spin0!(sfd, J(C)))
+    g = J(zeros(ComplexF64, M))
+    no_scalar(() -> NUFSHT.nusht_type2_spin!(g, sfd, pc))
+    Test.@test relerr(Array(g), complex.(f)) < 1e-11
+    NUFSHT.close!(pc)
+
+    Cd2 = J(zeros(lmax + 1, 2lmax + 1))
+    no_scalar(() -> NUFSHT.spin0_to_scalar!(Cd2, J(sh)))
+    Test.@test relerr(synth_ref(Array(Cd2), lmax, θ, φ), f0) < 1e-12
+end
+
+# The device spectral filter against the host slot loop, for a smooth and a sharp transfer.
 Test.@testset "KernelAbstractions extension: device apply_transfer! (JLArray)" begin
     Random.seed!(606)
     lmax = 8; N = lmax + 1; Nφ = 2lmax + 1; B = 3

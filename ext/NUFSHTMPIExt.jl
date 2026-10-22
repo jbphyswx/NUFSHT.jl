@@ -3,14 +3,20 @@
 
 MPI point-decomposition of a *single* transform: the `M` scattered points are partitioned across
 ranks, each holding a local plan for its subset, with the spherical harmonic coefficients replicated
-on every rank. Selected by passing a `ComputationalBackends.MPIBackend`, whose `comm` field names the
+on every rank. Selected by `ComputationalBackends.MPIBackend(; comm)`, whose `comm` field names the
 communicator (`nothing` → `MPI.COMM_WORLD`).
 
 - **Synthesis** `A` (coeffs → local field) needs no communication.
 - **Adjoint** `A†` is a sum over points, so each rank computes its local contribution and the result
   is `MPI.Allreduce!`-summed — communication O(lmax²), independent of `M`.
-- **Solve** runs LSMR on the global least-squares problem `min ‖Ac − f‖` with the adjoint
-  and inner products `Allreduce`d; every rank ends with the same replicated solution.
+- **Solve** runs [`nusht_solve!`](@ref)'s recurrence on the global least-squares problem `min ‖Ac − f‖`,
+  with its two sums over points, `‖u‖` and `A†u`, `Allreduce`d; every rank ends with the same
+  replicated solution.
+
+A rank passes its own points' plan and field to `nusht_type1!(C, f_local, plan, MPIBackend(; comm))`,
+and likewise `nusht_solve!`, `nusht_solve_spin!` and `nusht_analyze!`. `make_plan(FE, θ, φ, lmax;
+execution = MPIBackend())` instead takes every point and returns an [`MPINUSHTplan`](@ref) over this
+rank's share, whose transforms take and return the whole field.
 
 Loaded by `using MPI`.
 """
@@ -18,142 +24,131 @@ module NUFSHTMPIExt
 
 using NUFSHT: NUFSHT
 using ComputationalBackends: ComputationalBackends
+using FlowTransformBindings: FlowTransformBindings as FTB
 using MPI: MPI
-using LinearAlgebra: LinearAlgebra
 
 # A custom MPI backend must carry the communicator the same way `ComputationalBackends.MPIBackend`
 # does; `nothing` means the world communicator.
-@inline _comm(backend::ComputationalBackends.AbstractMPIBackend) = something(backend.comm, MPI.COMM_WORLD)
+@inline _comm(execution::ComputationalBackends.AbstractMPIBackend) = something(execution.comm, MPI.COMM_WORLD)
 
-# `u` lives in POINT space and is partitioned, so its norm is a sum over ranks. The coefficient-space
-# vectors are replicated — every rank holds the same array — so their norms are already global and
-# reducing them would multiply by the rank count. Only this one collective per iteration is real.
-# `dot` on equal-shaped arrays needs no `vec`, which would allocate a reshape header on both operands.
-_global_sq(u, comm) = MPI.Allreduce(LinearAlgebra.dot(u, u), +, comm)
-_local_sq(v) = real(LinearAlgebra.dot(v, v))
-
-"""
-    nusht_type1!(C, f_local, plan, MPIBackend(; comm)) -> C
-
-MPI point-decomposed **adjoint** `A†f`. Each rank owns a disjoint subset of the `M` points with a
-local plan; since `A†` is a sum over points, each rank computes its local contribution and the result
-is summed into `C`, replicated on every rank.
-"""
-function NUFSHT.nusht_type1!(C, f_local, plan::NUFSHT.NUSHTplan, backend::ComputationalBackends.AbstractMPIBackend)
+# `nusht_type1!(C, f_local, plan, MPIBackend(; comm))`: `A†` is a sum over points, so each rank adds
+# its own points' contribution and the sum lands in `C` on every rank.
+function NUFSHT._point_share_adjoint!(C, f_local, plan::NUFSHT.NUSHTplan,
+                                      execution::ComputationalBackends.AbstractMPIBackend)
     NUFSHT._nusht_true_adjoint!(C, f_local, plan)   # local A† (sum over this rank's points)
-    MPI.Allreduce!(C, +, _comm(backend))            # sum contributions across ranks → A†f
+    MPI.Allreduce!(C, +, _comm(execution))          # sum contributions across ranks → A†f
     return C
 end
 
-"""
-    MPILSMRWorkspace(C, f_local)
+# `nusht_solve!` and `nusht_solve_spin!` with `MPIBackend(; comm)` fourth: the least-squares fit over
+# the points of every rank, each rank's plan over its own points.
+NUFSHT._point_share(plan::NUFSHT.AbstractNUSHTplan, execution::ComputationalBackends.AbstractMPIBackend) =
+    _ranks(plan, _comm(execution))
 
-Reusable scratch for the MPI solve, mirroring [`LSMRWorkspace`](@ref) on the shared-memory path:
-holding one across solves makes the solver allocation-free instead of allocating five coefficient
-arrays and two field arrays per call.
+# `nusht_analyze!(C, f_local, plan, MPIBackend(; comm); weights)`: the quadrature is a sum over points,
+# each rank's own added across the ranks.
+NUFSHT._point_share_quadrature!(C, f_local, w_local, plan::NUFSHT.AbstractNUSHTplan,
+                                execution::ComputationalBackends.AbstractMPIBackend) =
+    MPI.Allreduce!(NUFSHT._quadrature!(C, f_local, w_local, plan), +, _comm(execution))
+
+# `plan` over this rank's points, its sums over points added across the ranks of `comm`.
+_ranks(plan, comm) = NUFSHT._PointShare(plan, A -> MPI.Allreduce!(A, +, comm))
+
+# ── A plan over every point, divided among the ranks ─────────────────────────────────────────────────
+
 """
-struct MPILSMRWorkspace{A, F}
-    x::A
-    v::A
-    h::A
-    hbar::A
-    w::A                                        # A†u before it is folded into v
-    u::F                                        # left bidiagonalization vector, this rank's points
-    Av::F
+    MPINUSHTplan
+
+A NUSHT plan whose points are divided among the ranks of a communicator: this rank's plan over its
+points `own = (rank+1):nranks:M`, and the synthesis of those points. Every rank holds the whole field
+and the coefficients, and the transforms take and return the whole field.
+"""
+struct MPINUSHTplan{P<:NUFSHT.NUSHTplan, O<:AbstractRange{Int}, L<:AbstractMatrix, C}
+    plan::P
+    own::O
+    npts::Int
+    local_out::L
+    comm::C
 end
-MPILSMRWorkspace(C, f_local) =
-    MPILSMRWorkspace(similar(C), similar(C), similar(C), similar(C), similar(C),
-                     similar(f_local), similar(f_local))
 
-"""
-    nusht_solve!(C, f_local, plan, MPIBackend(; comm); ws, maxiter, rtol, conlim, verbose) -> (C, iters, rel_res, converged)
+Base.show(io::IO, p::MPINUSHTplan) =
+    print(io, "MPINUSHTplan(lmax=", p.plan.lmax, ", M=", p.npts, ", ntrans=", p.plan.B, ", ", length(p.own),
+          " points on rank ", MPI.Comm_rank(p.comm), " of ", MPI.Comm_size(p.comm), ")")
 
-MPI point-decomposed **exact inversion**: LSMR on the Golub–Kahan bidiagonalization of `A`, where the
-points are partitioned across ranks. `A` (synthesis) needs no communication; `A†` is `Allreduce`d, as
-is `‖u‖` — the one bidiagonalization scalar that lives in the partitioned point space. Solves the
-*global* least-squares problem with `C` replicated on every rank.
+# `make_plan(FE, θ, φ, lmax; execution::MPIBackend, kwargs...)`: this rank's plan, under
+# `local_backend(execution)`, over its share of the `M` points.
+function NUFSHT._make_plan(::Type{FE}, θ_nodes, φ_nodes, lmax, execution::ComputationalBackends.AbstractMPIBackend;
+                           kwargs...) where {FE<:Number}
+    length(θ_nodes) == length(φ_nodes) || throw(DimensionMismatch("θ and φ must have equal length"))
+    comm = _comm(execution)
+    nranks = MPI.Comm_size(comm)
+    M = length(θ_nodes)
+    M ≥ nranks || throw(ArgumentError("an MPI plan needs a point per rank: $M points on $nranks ranks"))
+    own = (MPI.Comm_rank(comm) + 1):nranks:M
+    plan = NUFSHT._make_plan(FE, θ_nodes[own], φ_nodes[own], lmax,
+                             ComputationalBackends.local_backend(execution); kwargs...)
+    local_out = NUFSHT._zeros_like(plan.F, eltype(plan.F), length(own), plan.B)
+    return MPINUSHTplan(plan, own, M, local_out, comm)
+end
 
-Same contract and return as the shared-memory [`nusht_solve!`](@ref). Every rank runs the identical
-scalar recurrence on identical reduced values, so all ranks stop on the same iteration.
-"""
-function NUFSHT.nusht_solve!(C, f_local, plan::NUFSHT.NUSHTplan, backend::ComputationalBackends.AbstractMPIBackend;
-                             ws::MPILSMRWorkspace = MPILSMRWorkspace(C, f_local),
-                             maxiter::Int = 500, rtol::Real = 1e-6, conlim::Real = 0,
-                             verbose::Bool = false)
-    T = real(eltype(C))
-    comm = _comm(backend)
-    x = ws.x; v = ws.v; h = ws.h; hbar = ws.hbar; w = ws.w; u = ws.u; Av = ws.Av
-    isroot = MPI.Comm_rank(comm) == 0        # hoisted: was an MPI call per iteration
-    clim = conlim > 0 ? T(conlim) : one(T) / eps(T)
+NUFSHT.allocate_coefficients(p::MPINUSHTplan) = NUFSHT.allocate_coefficients(p.plan)
+NUFSHT.coefficient_size(p::MPINUSHTplan) = NUFSHT.coefficient_size(p.plan)
+FTB.LSMRWorkspace(p::MPINUSHTplan) = FTB.LSMRWorkspace(p.plan)
+NUFSHT.close!(p::MPINUSHTplan) = NUFSHT.close!(p.plan)
 
-    # Restrict the fit to degrees `l ≤ lmax`, as the serial solver does: the coefficient array is a
-    # square representation carrying degrees up to `lmax+|m|`, and that ragged set is not
-    # SO(3)-invariant, so fitting it gives a frame-dependent answer.
-    valid = NUFSHT._valid_mask(C, T, plan.lmax)
+# This rank's rows of a whole field, a vector or a column per transform.
+_own(f, p::MPINUSHTplan) = view(reshape(f, p.npts, :), p.own, :)
 
-    # A†u, summed across ranks and projected — the operator's adjoint half.
-    atu!(dst, src) = (NUFSHT._nusht_true_adjoint!(dst, src, plan);
-                      MPI.Allreduce!(dst, +, comm); dst .*= valid; dst)
+function _checked(f, p::MPINUSHTplan)
+    size(f, 1) == p.npts || throw(DimensionMismatch("the plan covers $(p.npts) points; got $(size(f, 1))"))
+    return f
+end
 
-    copyto!(u, f_local)
-    β = sqrt(_global_sq(u, comm))
-    β > 0 && (u ./= β)
-    atu!(w, u); copyto!(v, w)
-    α = sqrt(_local_sq(v))
-    α > 0 && (v ./= α)
+# This rank's synthesis written into the whole field, which the sum across ranks completes.
+function _assemble!(f, p::MPINUSHTplan)
+    fill!(f, zero(eltype(f)))
+    _own(f, p) .= p.local_out
+    return MPI.Allreduce!(f, +, p.comm)
+end
 
-    fill!(x, zero(eltype(C))); fill!(hbar, zero(eltype(C))); copyto!(h, v)
-    αbar = α; ζbar = α * β; atb = α * β
-    ρ = one(T); ρbar = one(T); cbar = one(T); sbar = zero(T)
-    maxrbar = zero(T); minrbar = T(Inf)
-    rel = atb > 0 ? one(T) : zero(T)
-    iters = 0
-    atb == 0 && (fill!(C, zero(eltype(C))); return C, 0, zero(T), true)
+function NUFSHT.nusht_type2!(f, C, p::MPINUSHTplan)
+    NUFSHT.nusht_type2!(p.local_out, C, p.plan)
+    return _assemble!(_checked(f, p), p)
+end
 
-    for i in 1:maxiter
-        iters = i
-        NUFSHT.nusht_type2!(Av, v, plan)            # A_local v (no communication)
-        @. u = Av - α * u
-        β = sqrt(_global_sq(u, comm))
-        β > 0 && (u ./= β)
-        atu!(w, u)
-        @. v = w - β * v
-        α = sqrt(_local_sq(v))
-        α > 0 && (v ./= α)
+function NUFSHT.nusht_synthesize!(f, C, filter, p::MPINUSHTplan)
+    NUFSHT.nusht_synthesize!(p.local_out, C, filter, p.plan)
+    return _assemble!(_checked(f, p), p)
+end
 
-        ρold = ρ; ρbarold = ρbar
-        r = hypot(αbar, β)
-        c = r > 0 ? αbar / r : one(T)
-        s = r > 0 ? β / r : zero(T)
-        θnew = s * α
-        αbar = c * α
-        ρ = r
+function NUFSHT.nusht_type1!(C, f, p::MPINUSHTplan)
+    NUFSHT._nusht_true_adjoint!(C, _own(_checked(f, p), p), p.plan)
+    return MPI.Allreduce!(C, +, p.comm)
+end
 
-        θbar = sbar * r
-        ρtemp = cbar * r
-        rb = hypot(ρtemp, θnew)
-        cbar = rb > 0 ? ρtemp / rb : one(T)
-        sbar = rb > 0 ? θnew / rb : zero(T)
-        ρbar = rb
-        ζ = cbar * ζbar
-        ζbar = -sbar * ζbar
+function NUFSHT.nusht_solve!(C, f, p::MPINUSHTplan; ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(p), kwargs...)
+    return NUFSHT._solve!(C, _own(_checked(f, p), p), _ranks(p.plan, p.comm), ws; kwargs...)
+end
 
-        maxrbar = max(maxrbar, ρbarold)
-        i > 1 && (minrbar = min(minrbar, ρbarold))
-        condA = max(maxrbar, ρtemp) / max(min(minrbar, ρtemp), eps(T))
+function NUFSHT.nusht_filter!(f_out, f_in, filter, p::MPINUSHTplan;
+                              ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(p), kwargs...)
+    C = NUFSHT._filter_scratch(p.plan)
+    NUFSHT.nusht_solve!(C, f_in, p; ws = ws, kwargs...)
+    return NUFSHT.nusht_synthesize!(f_out, C, filter, p)
+end
 
-        c1 = ρold * ρbarold > 0 ? -(θbar * r / (ρold * ρbarold)) : zero(T)
-        @. hbar = h + c1 * hbar
-        r * rb > 0 && (@. x += (ζ / (r * rb)) * hbar)
-        c3 = r > 0 ? -(θnew / r) : zero(T)
-        @. h = v + c3 * h
+# `nusht_analyze!` with whole-field `f` and `weights`: the quadrature over this rank's points, added
+# across the ranks, or the fit.
+NUFSHT.nusht_analyze!(C, f, p::MPINUSHTplan; weights = nothing, kwargs...) = _analyze!(C, f, weights, p; kwargs...)
 
-        rel = abs(ζbar) / atb
-        (verbose && isroot) && @info "nusht_solve! (MPI) iter $i rel_res=$rel"
-        (rel < rtol || condA >= clim || !(r > 0) || !(rb > 0) || α == 0 || β == 0) && break
-    end
-    copyto!(C, x)
-    return C, iters, rel, rel < rtol
+_analyze!(C, f, ::Nothing, p::MPINUSHTplan; kwargs...) = NUFSHT.nusht_solve!(C, f, p; kwargs...)
+
+function _analyze!(C, f, w::AbstractArray, p::MPINUSHTplan; ws = nothing, maxiter = nothing,
+                   rtol = nothing, conlim = nothing)
+    length(w) == p.npts || throw(DimensionMismatch("the plan covers $(p.npts) points; got $(length(w)) weights"))
+    NUFSHT._quadrature!(C, _own(_checked(f, p), p), view(w, p.own), p.plan)
+    MPI.Allreduce!(C, +, p.comm)
+    return NUFSHT._quadrature_result(C, p.plan)
 end
 
 end # module NUFSHTMPIExt

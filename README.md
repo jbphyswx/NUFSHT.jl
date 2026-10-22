@@ -32,11 +32,12 @@ at arbitrary scattered (colatitude, longitude) points on the sphere.
 
 ## Spin-weighted transforms (spin-`s`)
 
-NUFSHT also synthesizes/analyzes **spin-weighted** fields at arbitrary scattered points —
-built directly from the Wigner-`d` Fourier factorization plus a 2-D NUFFT, independent of any
-spin convention in FastTransforms. Spin-1 is the tangent-vector case (a velocity
-`U = u_θ + i u_φ` is a spin-1 field), which enables vector/Helmholtz decomposition on
-scattered spherical data.
+NUFSHT also synthesizes/analyzes **spin-weighted** fields at arbitrary scattered points: the
+spin-weighted coefficients become a bivariate Fourier series, which a 2-D NUFFT evaluates. On host
+`Float64` nodes that first step is FastTransforms' `plan_spinsph2fourier`; for any other element type,
+and on a device, it is the Wigner-`d` recurrence. Both give the same transform in the convention below.
+Spin-1 is the tangent-vector case (a velocity `U = u_θ + i u_φ` is a spin-1 field), which enables
+vector/Helmholtz decomposition on scattered spherical data.
 
 ```julia
 using NUFSHT
@@ -55,9 +56,14 @@ nusht_solve_spin!(sf_rec, f, plan; rtol=1e-9)
 ```
 
 `make_spin_plan` / `nusht_type2_spin!` / `nusht_type1_spin!` (exact adjoint) /
-`nusht_solve_spin!`; coefficient indices via `spin_coeff_index(ℓ,m,lmax)`, direct harmonic
-values via `sYlm(s,ℓ,m,θ,φ)`. Validated to ~1e-12 (synthesis), ~1e-15 (adjoint), and exact
+`nusht_solve_spin!` / `nusht_analyze!`; coefficient indices via `spin_coeff_index(ℓ,m,lmax)`, direct
+harmonic values via `sYlm(s,ℓ,m,θ,φ)`. Validated to ~1e-12 (synthesis), ~1e-15 (adjoint), and exact
 scattered inversion. See `dev/spin_hodge_validation.jl` for the spin-1 Helmholtz/Hodge use.
+
+The scalar plans use FastTransforms' real harmonics (no Condon–Shortley phase), the spin plans at
+`s = 0` the complex `₀Y_ℓm = N_ℓ d^ℓ_{m0}(θ) e^{imφ}` (with it). `scalar_to_spin0!(sf, C)` and
+`spin0_to_scalar!(C, sf)` convert between the two coefficient arrays, so both plans synthesize the same
+field.
 
 ## Installation
 
@@ -71,61 +77,78 @@ Pkg.add(url="https://github.com/jbphyswx/NUFSHT.jl")
 Everything below is dependency-light by default — the accelerators are **package extensions**, loaded
 only when you load their trigger package, so a plain `using NUFSHT` never pulls in MPI/CUDA/etc.
 
-- **Persistent guru plans, zero allocation.** A plan builds its NUFFT plans once (points set once) and
+- **Persistent plans, zero allocation.** A plan builds its NUFFT plans once (points set once) and
   pre-allocates every buffer, so warmed-up `nusht_type2!`/`nusht_type1!` and the hundreds of solver
-  matvecs inside `nusht_solve!` allocate **nothing** in NUFSHT's own code and never re-plan. What the
-  backend does inside its own exec is its own: single-threaded FINUFFT adds nothing, its all-cores
-  default adds a small planner-lock allocation, and NonuniformFFTs spawns tasks in its deconvolution.
-- **`nthreads` is honoured or refused, never dropped.** FINUFFT takes any count; direct summation
-  splits the axis each direction writes and gives bit-identical output at any count; NonuniformFFTs
-  parallelises over Julia's threads and so reaches `1` (serial spreading) and `Threads.nthreads()`,
-  erroring on anything else. Use `nthreads = 1` when two runs must agree bit for bit.
+  matvecs inside `nusht_solve!` allocate **nothing** in NUFSHT's own code and never re-plan. The NUFFT
+  comes from [FlowTransformBindings](https://github.com/jbphyswx/FlowTransformBindings.jl): at
+  `nthreads = 1` a FINUFFT execution allocates nothing and a NonuniformFFTs one a fixed amount,
+  independent of the point count.
+- **`execution` and `nthreads`.** `make_plan(…; execution = SerialBackend())` runs a plan on one thread,
+  `ThreadedBackend()` on `Threads.nthreads()`, and the default `AutoBackend()` at `nthreads`, whose own
+  default is `Threads.nthreads()`. An explicit `nthreads` takes precedence over the count `execution`
+  sets; with `SerialBackend()` any count other than `1` is an `ArgumentError`. The count covers the
+  NUFFT and FastTransforms' OpenMP regions alike, and each FastTransforms call restores the OpenMP count
+  it found.
+- **`nthreads` is honoured or refused.** FINUFFT takes any count;
+  direct summation splits the axis each direction writes and gives bit-identical output at any count;
+  NonuniformFFTs parallelises over Julia's threads and so reaches `1` (serial spreading) and
+  `Threads.nthreads()`, raising an error for any other count. Use `nthreads = 1` when two runs must agree
+  bit for bit: a multi-threaded type 1 (the adjoint) can differ in the last bit between runs on both
+  libraries, while type 2 and every single-threaded transform return the same bits.
 - **Batching (`ntrans = B`).** Transform `B` co-located fields (same points) in one call —
   `make_plan(θ, φ, lmax; ntrans = B)`, coefficients/fields carry a trailing batch axis. FFTW and
-  FINUFFT parallelize *across the batch* internally (measured ~4.5× / ~2.8× on small transforms), which
-  is the recommended way to use many cores on one node.
+  FINUFFT parallelize *across the batch* internally, the recommended way to use many cores on one node.
 - **Real and complex fields.** The field element type is the first (optional) positional argument, as
   it is for `zeros`: `make_plan(Float64, θ, φ, lmax)` for a real field, `make_plan(ComplexF64, …)` for
   a complex one; likewise `make_spin_plan(FE, θ, φ, lmax, s)`. Both compute the same transform — the
   real one additionally exploits the Hermitian symmetry a real field gives its spectrum, folding one
-  mode axis in half. The keyword spelling `T = ComplexF64` forwards to the positional form.
+  mode axis in half.
   A real field's coefficients are Hermitian, so `nusht_solve_spin!` on a real-field plan fits the
-  `(lmax+1)²` real degrees they actually have rather than the full complex array — the well-posed
-  problem, and a quarter of the unknowns. That closes only at `s = 0`: conjugation maps spin `s` to
-  spin `−s`, so no spin-`s ≠ 0` field is real and inverting one needs a complex plan. Synthesis and
-  the adjoint are exact for a real element type at every `s`.
+  `(lmax+1)²` real degrees they have, a quarter of the unknowns of the full complex array. That
+  subspace exists only at `s = 0`: conjugation maps spin `s` to spin `−s`, so no spin-`s ≠ 0` field is
+  real and inverting one needs a complex plan. Synthesis and the adjoint are exact for a real element
+  type at every `s`.
 - **Only the directions you use.** `make_plan(…; directions = SynthesisOnly())` builds no analysis
   plan, so a caller that only synthesises holds no type-1 grid; `nusht_type1!` / `nusht_solve!` /
-  `nusht_filter!` on such a plan raise rather than silently building one. The default is
-  `SynthesisAndAnalysis()`. Where a backend's plan carries no direction, both directions already share
+  `nusht_filter!` on such a plan raise. The default is `SynthesisAndAnalysis()`. Where a backend's plan carries no direction, both directions already share
   one object and the keyword costs nothing either way.
 - **Knowing what a plan holds.** `plan_memory(plan)` returns the byte count of each field and the
   total — the coefficient array, the mode array, the strengths, the node set and the plan pools — so
   the memory of a configuration can be checked before committing to it.
 - **Trading memory for speed.** Most of a plan's memory is the backend's oversampled grid, which
-  `upsampfac` (σ) sizes. `tol`, σ and the kernel half-support are exchangeable by construction, so
-  lowering σ meets the same tolerance on a smaller grid and pays for it in spreading: `σ = 1.25`
-  roughly halves the NUFFT's memory against the default `2.0` and costs synthesis ~1.1-1.5×, while
-  making analysis slightly *faster*. Use it when a dataset does not otherwise fit; `AutoTuning` times
-  the candidates and picks per plan.
+  `upsampfac` (σ) sizes. `tol`, σ and the kernel half-support trade against each other, so a lower σ
+  meets the same tolerance on a smaller grid at a cost in spreading: `σ = 1.25` roughly halves the
+  NUFFT's memory against the default `2.0`, slows synthesis, and leaves analysis slightly *faster*. Use
+  it when a dataset does not otherwise fit.
 - **Mixed precision.** `Float32` and `ComplexF32` are supported. The sphere plans FastTransforms
-  provides are `Float64`/`ComplexF64` only, so single-precision plans run their S-step through a
-  double-precision slice buffer and everything else at the requested precision.
-- **Parallel extensions** (each keyed on its trigger package):
-  - `using OhMyThreads` — thread-parallel over independent problems (one plan per task).
-  - `using Distributed` — farm independent problems across worker **processes** (`addprocs`); falls
-    back to serial when there are none.
+  provides are `Float64`/`ComplexF64` only, so single-precision scalar plans run their S-step through a
+  double-precision slice buffer, single-precision spin plans run the Wigner recurrence, and everything
+  else runs at the requested precision.
+- **Parallel extensions** (each keyed on its trigger package, selected by the `execution` keyword):
+  - `using OhMyThreads` — thread-parallel over independent problems (one plan per task),
+    `nusht_type2!(fs, Cs, plans; execution = ThreadedBackend())`.
+  - `using Distributed` — farm independent problems across worker **processes** (`addprocs`), each
+    worker at the thread count it was started with, `nusht_type2(θs, φs, Cs, lmax; execution =
+    DistributedBackend())`; serial when there are none. `make_plan(…; execution = DistributedBackend())`
+    divides one transform's points among the workers.
   - `using MPI` — point-decomposition: partition the `M` points across ranks; `A` needs no
-    communication, `A†` and the point-space norm are `Allreduce`d.
-  > Note: FastTransforms is *not* safe to call from a Julia task/thread (its OpenMP corrupts results);
-  > the thread/process extensions force it single-threaded, which is why batching + processes are the
-  > recommended scaling paths. See `dev/fasttransforms_task_safety.md`.
-- **GPU** (`using CUDA`, with `using KernelAbstractions`). The array-indexed steps (the spin Wigner-`d`
-  recurrence + bivariate-Fourier assembly, and the per-column solver primitives) are KA `@kernel`s —
-  **written once, run on any backend** — and the NUFFT is bound to cuFINUFFT. A device node set yields a
-  device-resident plan (buffers `similar` to the nodes). The device kernels are validated bit-for-bit
-  against the CPU path on `JLArrays`; end-to-end GPU parity (incl. cuFINUFFT) is in `test/gpu_cuda.jl`,
-  to run on NVIDIA hardware.
+    communication, `A†` and the point-space norm are `Allreduce`d. Either each rank passes its own
+    plan with `nusht_solve!(C, f_local, plan, MPIBackend(; comm))`, or
+    `make_plan(…; execution = MPIBackend())` divides the points itself.
+  > FastTransforms runs its S-step in OpenMP regions. NUFSHT loads FlowTransformBindings first, which
+  > on macOS selects the OpenMP runtime's thread-local mode (`KMP_GTID_MODE=2`) before FastTransforms
+  > loads it, so calls from Julia tasks are exact; in a session that loaded FastTransforms earlier with
+  > that variable unset, calls from tasks run on one OpenMP thread. A plan runs FastTransforms at its
+  > own thread count, the OhMyThreads farm and the per-column loop's tasks on one thread each, a
+  > Distributed worker at its own thread count.
+- **GPU** (`using KernelAbstractions` with the device array package). The array-indexed steps (the
+  spin Wigner-`d` recurrence + bivariate-Fourier assembly, the S-step of every device spin plan, and the
+  per-column solver primitives) are KA
+  `@kernel`s — **written once, run on any backend**. FlowTransformBindings builds the NUFFT on the nodes'
+  device: NonuniformFFTs on their KernelAbstractions backend, FINUFFT as cuFINUFFT on `CuArray` nodes
+  (`using CUDA, FINUFFT`). A device node set, or `execution = GPUBackend(b)` with host nodes, yields a
+  device-resident plan (buffers `similar` to the nodes). The device kernels are validated against the
+  CPU path on `JLArrays`; end-to-end GPU parity is in `test/gpu_cuda.jl`, to run on NVIDIA hardware.
 
 ## Algorithm
 
@@ -141,34 +164,36 @@ Type 1 (adjoint):     A† = S† · F† · N†
 |------|-----------|---------|---------|
 | **S** | SH coefficients → DFS bivariate Fourier series | `plan_sph2fourier` (P) | `P'` |
 | **F** | cos/sin basis → complex exponential mode array | `_assemble_modes!` | `_assemble_modes_adjoint!` |
-| **N** | NUFFT: evaluate the Fourier series at scattered points | guru type-2 plan | guru type-1 plan |
+| **N** | NUFFT: evaluate the Fourier series at scattered points | type-2 NUFFT | type-1 NUFFT |
 
-`plan_sph2fourier` already produces the DFS series — that is what it is for — so there is no
-equiangular grid in the pipeline and nothing is doubled. For order `m`, the θ basis is
+`plan_sph2fourier` produces the DFS series directly, so the pipeline has no equiangular grid and no
+doubling. For order `m`, the θ basis is
 `cos((i-1)θ)` when `|m|` is even and `sin(iθ)` when it is odd, which is the parity the glide
 reflection encodes: the DFS extension of `Y_lm` in θ is `sin^|m|θ · Q(cosθ)`.
 
-(The scalar path uses FastTransforms for **S**; the **spin** path replaces it with an on-the-fly
-Trapani–Navaza Wigner-`d` recurrence — O(lmax²) memory, numerically stable to lmax ≈ 1024, and also
-the device S-engine.)
+(The **spin** path's **S** is FastTransforms' `plan_spinsph2fourier` on host `Float64` nodes, its
+coefficients mapped to FastTransforms' layout and harmonic sign and its cosine and sine series to the
+NUFFT's exponentials. Every other element type, and the device, run the Trapani–Navaza Wigner-`d`
+recurrence, each degree's plane built from its stored `m = ℓ` column, so blocks of degrees run on
+separate tasks — `ntasks·(lmax+1)²` plane values, numerically stable to lmax ≈ 1024.)
 
 ### The real fast path
 
 The field element type is positional, as in `zeros(T, …)`, and it is a statement about the data:
 `make_plan(Float64, …)` asserts the field **values** are real, which makes the mode array Hermitian in
 `kθ`. Only the `kθ ≥ 0` half is then stored — on **every** backend, since halving the θ axis halves
-the deconvolution and the upsampled FFT and leaves the interpolation alone. On a backend with a
-genuine real-data transform (`NonuniformFFTsBackend`; FINUFFT has none) the strengths come back real
-too, so the spreading/interpolation halves as well:
+the deconvolution and the upsampled FFT and leaves the interpolation alone. Both NUFFT libraries take
+real strengths for it through FlowTransformBindings, so the spreading/interpolation halves as well:
 
 ```julia
-make_plan(Float64,    θ, φ, lmax)   # kθ ≥ 0, real strengths, if a real-capable backend is loaded
+make_plan(Float64,    θ, φ, lmax)   # kθ ≥ 0, real strengths
 make_plan(ComplexF64, θ, φ, lmax)   # full array
 ```
 
-Backend selection follows the field: with no `nufft` given, a real `FE` prefers a loaded real-capable
-backend, and a complex `FE` keeps the usual order. Naming a backend explicitly overrides that and is
-never swapped — `nufft = FINUFFTBackend()` on a real field still folds, but with complex strengths.
+With no `nufft` given, a plan takes the first loaded of NonuniformFFTs and FINUFFT, then direct
+summation. A backend named with `nufft = FlowTransformBindings.FINUFFTBackend()`,
+`FlowTransformBindings.NonuniformFFTsBackend()` or `SpectralBackends.DirectSumSpectralBackend()` is
+used as given.
 
 With a real-data transform the forward is free: writing the half and letting the complex-to-real
 transform imply the conjugate is exact, no weights. Its **transpose** is not — the embedding
@@ -176,31 +201,38 @@ transform imply the conjugate is exact, no weights. Its **transpose** is not —
 row (`{1, 2, 2, …}`, one at `kθ = 0` because that row is its own partner). There is no third case at
 the top: the θ axis has odd length `2·lmax+3` and so has no self-paired Nyquist row.
 
-Without a real-data transform the half-height transform is complex, so the conjugate half is not
-implied by anything and the same `{1, 2, 2, …}` is applied on the **forward** as well; a per-point
-phase undoes the centered row labelling, and the field is the real part of the result.
+Direct summation has no real-data transform. Its half-height transform is complex, so the conjugate
+half is implied by nothing and the same `{1, 2, 2, …}` is applied on the **forward** as well; a
+per-point phase undoes the centered row labelling, and the field is the real part of the result.
 
-### Adjoint vs inverse
+### Adjoint, analysis and inverse
 
-- **`nusht_type1!`** is `A†` — the exact Euclidean **transpose**, not an inverse. At scattered points
-  `A†A ≠ I`; only quadrature on a grid makes the two coincide. For exact analysis of a field already
-  sampled on the Clenshaw-Curtis grid, use `FastSphericalHarmonics.sph_transform`.
+- **`nusht_type1!`** is `A†`, the exact Euclidean **transpose**, with no quadrature weights. At scattered
+  points `A†A ≠ I`.
+
+- **`nusht_analyze!`** gives the coefficients of a sampled field, for scalar and spin plans. With
+  per-point quadrature `weights` it is `Σⱼ wⱼ fⱼ conj(Y_lm(xⱼ))`, one weighted adjoint transform, which is
+  the expansion of a degree-`lmax` field when the rule integrates the product of two degree-`lmax`
+  harmonics exactly (Gauss–Legendre colatitudes times `2lmax + 1` equispaced longitudes, for one).
+  Without weights it is the least-squares fit of `nusht_solve!`.
 
 - **`nusht_solve!`** inverts, by LSMR on the Golub–Kahan bidiagonalization of `A`.
 
-> **Use `nusht_solve!` for inversion at arbitrary scattered points.**
+> **Use `nusht_analyze!` with weights on a quadrature rule, and `nusht_solve!` (or `nusht_analyze!`
+> without weights) at arbitrary scattered points.** On the grid of `FastSphericalHarmonics.sph_points`,
+> `FastSphericalHarmonics.sph_transform` analyses a gridded field exactly.
 
 ## Accuracy
 
 | Operation | Points | Error | Notes |
 |-----------|--------|-------|-------|
-| `nusht_type2!` | CC grid (lmax=20) | ~1 × 10⁻¹³ | vs `sph_evaluate` |
+| `nusht_type2!` | grid of `sph_points` (lmax=20) | ~1 × 10⁻¹³ | vs `sph_evaluate` |
 | `nusht_type2!` | **Scattered** (lmax=4–20) | ~3 × 10⁻¹³ | vs direct `Σ c_lm Y_lm` |
 | `A†` adjoint identity `⟨Ax,y⟩ = ⟨x,A†y⟩` | Scattered | ~1 × 10⁻¹⁵ | |
 | `nusht_solve!` | Scattered, 4× overdetermined | coefficients ~1 × 10⁻¹¹ | see below |
 
-Solver convergence depends on `cond(A)`, which is a property of the **point distribution**, not of
-`lmax`. Measured on the design matrix over the `l ≤ lmax` modes at fourfold overdetermination:
+Solver convergence depends on `cond(A)`, a property of the **point distribution** independent of
+`lmax`. For the design matrix over the `l ≤ lmax` modes at fourfold overdetermination:
 
 | Point set | `cond(A)` | Iterations to 10⁻¹⁰ |
 |-----------|-----------|---------------------|
@@ -234,24 +266,36 @@ f = zeros(length(θ))
 nusht_type2!(f, C, plan)
 ```
 
-### Adjoint analysis (CC grid only — exact round-trip)
+### Fitting coefficients on FastSphericalHarmonics' grid
 
 ```julia
 using NUFSHT, FastSphericalHarmonics
 
 lmax = 30
-pts = sph_points(lmax + 1)          # Clenshaw-Curtis quadrature grid
+pts = sph_points(lmax + 1)          # equiangular grid, no points on the poles
 θ = vec([θ for θ in pts[1], φ in pts[2]])
 φ = vec([φ for θ in pts[1], φ in pts[2]])
 plan = make_plan(θ, φ, lmax; tol=1e-10)
 
-C_true = randn(lmax+1, 2lmax+1)
+C_true = zeros(lmax+1, 2lmax+1)     # degrees l ≤ lmax; the supernumerary slots stay zero
+for l in 0:lmax, m in -l:l
+    C_true[sph_mode(l, m)] = randn()
+end
 f = zeros(length(θ))
 nusht_type2!(f, C_true, plan)     # synthesise
 
-C_rec = similar(plan.C)
-nusht_solve!(C_rec, f, plan; rtol=1e-12)   # fit the l ≤ lmax coefficients
-# maximum(abs.(C_rec .- C_true)) ≈ 1e-11
+C_rec = allocate_coefficients(plan)
+nusht_analyze!(C_rec, f, plan; rtol=1e-12)   # the least-squares fit of the l ≤ lmax coefficients
+# C_rec[:, :, 1] ≈ C_true
+```
+
+### Analysis with quadrature weights
+
+```julia
+# θ, φ: the points of a rule exact for the product of two degree-lmax harmonics; w: its weights (Σw = 4π)
+plan = make_plan(θ, φ, lmax)
+C = allocate_coefficients(plan)
+nusht_analyze!(C, f, plan; weights = w)   # Σⱼ wⱼ fⱼ Y_lm(xⱼ), one transform
 ```
 
 ### Exact inversion at arbitrary scattered points
@@ -267,7 +311,7 @@ plan = make_plan(θ, φ, lmax; tol=1e-10)
 
 f = ...               # observed field values at (θ,φ)
 
-C = similar(plan.C)
+C = allocate_coefficients(plan)
 C, iters, rel_res, converged = nusht_solve!(C, f, plan; rtol=1e-6, maxiter=500)
 # Returns (coefficients, solver iterations, relative residual of `C`, whether it met `rtol`)
 ```
@@ -306,11 +350,14 @@ nusht_filter_renorm!(f_out, mask, filt, plan)   # divide by filtered mask
 
 | Function | Description |
 |----------|-------------|
-| `make_plan([FE,] θ, φ, lmax; tol)` | Construct pre-allocated plan for M scattered points; `FE` real or complex |
+| `make_plan([FE,] θ, φ, lmax; execution, tol)` | Construct pre-allocated plan for M scattered points; `FE` real or complex |
 | `plan_memory(plan)` | Per-field byte breakdown of what the plan holds, plus the total |
+| `allocate_coefficients(plan)` | A zeroed coefficient array of `coefficient_size(plan)`, on the plan's device |
 | `nusht_type2!(f, C, plan)` | Synthesis: SH coefficients → scattered field values |
 | `nusht_type1!(C, f, plan)` | Adjoint `A†` (the transpose, not an inverse) |
-| `nusht_solve!(C, f, plan; maxiter, rtol, verbose)` | Exact LSMR inversion at any scattered points |
+| `nusht_analyze!(C, f, plan; weights, ws, maxiter, rtol)` | Coefficients of a sampled field: the quadrature with `weights`, the fit without |
+| `nusht_solve!(C, f, plan; ws, weights, maxiter, rtol, conlim)` | Exact LSMR inversion at any scattered points |
+| `scalar_to_spin0!(sf, C)`, `spin0_to_scalar!(C, sf)` | Scalar-plan coefficients to spin-0-plan coefficients and back |
 | `nusht_filter!(f_out, f_in, filter, plan; ws)` | Spectral filter: solve → multiply → type2 |
 | `nusht_filter_renorm!(f_out, mask, filter, plan)` | Correct land-mask bias after `nusht_filter!` |
 | `GaussianTransfer(σ²)` | Gaussian filter `H(ℓ) = exp(-ℓ(ℓ+1)σ²/2)` |
@@ -327,36 +374,33 @@ C, iters, rel_res, converged = nusht_solve!(C, f, plan; rtol=1e-6, maxiter=500)
 
 - `C`: output coefficient array (overwritten in-place)
 - `iters`: number of solver iterations performed
-- `rel_res`: relative residual `‖A†r‖/‖A†f‖` of the coefficients in `C` — the worst column when
-  `ntrans > 1`, with `ws.colres` carrying them per column. Floored at `eps(T)`, since a relative
-  residual is not resolvable below machine precision.
+- `rel_res`: relative residual `‖A†r‖/‖A†f‖` of the coefficients in `C`, at least `eps(T)`: the worst
+  column when `ntrans > 1`, with `ws.residual` holding each column's and `ws.status` its stopping test.
 - `converged`: `rel_res < rtol`
 
 `‖A†r‖` decreases monotonically under LSMR, so a larger `maxiter` never returns a worse answer. A
 column also stops when LSMR's condition estimate exceeds `conlim` (default `1/eps(T)`) or the
-bidiagonalization terminates — which is what happens when the points do not determine the
-coefficients (`M` below `(lmax+1)²`, or clustered so that they effectively do not). There
-`converged == false` is the signal that the point set, not the budget, was the limit.
+bidiagonalization terminates, as it does when the points do not determine the coefficients (`M` below
+`(lmax+1)²`, or clustered). `converged == false` then means the point set limited the fit, and a larger
+`maxiter` does not help.
 
 ## Implementation notes
 
 ### No explicit doubling
 
 The glide reflection `f(θ,φ) → f(2π−θ, φ+π)` that periodizes the sphere onto the torus needs a
-`φ + π` shift, and `Nφ = 2·lmax+1` is always **odd** — so no column permutation performs it: shifting
-by `⌊Nφ/2⌋` columns is `2π⌊Nφ/2⌋/Nφ`, short of `π` by `π/Nφ`. The pipeline never forms the doubled
-map, which sidesteps the question: `plan_sph2fourier` already returns the DFS bivariate Fourier
-series, and the `cos`/`sin` parity in θ *is* the glide reflection, expressed in a basis where it costs
-nothing. An error there would also be invisible on the Clenshaw-Curtis grid, since synthesizing and
-then evaluating back at the sample points is an identity for any doubling, right or wrong — which is
-why the suite gates synthesis against a direct `Σ c_lm Y_lm` at **scattered** points.
+`φ + π` shift, and `Nφ = 2·lmax+1` is odd, so no column permutation performs it: shifting by `⌊Nφ/2⌋`
+columns is `2π⌊Nφ/2⌋/Nφ`, short of `π` by `π/Nφ`. The pipeline forms no doubled map:
+`plan_sph2fourier` returns the DFS bivariate Fourier series, whose `cos`/`sin` parity in θ is the glide
+reflection. Synthesizing and evaluating back at the sample points of `sph_points` is an identity for
+any doubling, so the tests check synthesis against a direct `Σ c_lm Y_lm` at **scattered** points.
 
 ### Which coefficient slots are harmonics
 
 The coefficient array is square and invertible *on grid samples*: slot `(i, j)` of the order-`m`
 column carries degree `l = i + |m| − 1`, up to `lmax + |m|`. As continuous functions only `l ≤ lmax`
 survive — `plan_sph2fourier` supplies `lmax+1` θ-frequencies per column, and a degree-`l` harmonic
-needs frequencies up to `l`. Beyond the band limit the stored coefficients reproduce the CC samples
+needs frequencies up to `l`. Beyond the band limit the stored coefficients reproduce the grid samples
 but not the harmonic between them. `nusht_solve!` fits exactly `l ≤ lmax`, which is also the only
 `SO(3)`-invariant choice: the ragged set `l ≤ lmax+|m|` contains fragments of the degree-`l`
 irreducibles but never whole ones, so fitting it gives a frame-dependent answer.
@@ -372,5 +416,7 @@ irreducibles but never whole ones, so fitting it gives a frame-dependent answer.
 - Belkner, S. et al. (2024): cunuSHT – GPU Accelerated Spherical Harmonic Transforms
   on Arbitrary Pixelizations. *arXiv:2406.14542*.
 - [FastSphericalHarmonics.jl](https://github.com/eschnett/FastSphericalHarmonics.jl)
+- [FlowTransformBindings.jl](https://github.com/jbphyswx/FlowTransformBindings.jl)
 - [FINUFFT.jl](https://github.com/ludvigak/FINUFFT.jl)
+- [NonuniformFFTs.jl](https://github.com/jipolanco/NonuniformFFTs.jl)
 - [FastTransforms.jl](https://github.com/JuliaApproximation/FastTransforms.jl)

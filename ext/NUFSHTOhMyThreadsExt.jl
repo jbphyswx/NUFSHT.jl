@@ -2,34 +2,28 @@
     NUFSHTOhMyThreadsExt
 
 Node-local multithreaded execution over a collection of **independent** problems (distinct point sets
-→ distinct plans), one plan per task: a single FINUFFT plan's buffers are mutated in place and are not
-safe to share across threads. Selected by passing a `ComputationalBackends.ThreadedBackend`. Loaded by
+→ distinct plans), one plan per task: a NUFFT plan's buffers are mutated in place and are not safe to
+share across threads. Selected by `execution = ComputationalBackends.ThreadedBackend()`. Loaded by
 `using OhMyThreads`.
 
-## FastTransforms threading inside Julia tasks
-
-FastTransforms runs its transforms in OpenMP parallel regions (`ceil(CPU_THREADS/2)` threads by
-default), which silently **corrupt results** when invoked from a non-root Julia task — see the
-`NUFSHT._with_fasttransforms_single` comment for the mechanism and evidence. The scalar entry points
-therefore bracket their whole `@tasks` section with FastTransforms single-threaded (the problem-level
-parallelism comes from OhMyThreads, not FastTransforms' internal threads); wrapping the whole section
-— not each task body — means the set/restore happen in the root task around the spawn/join barrier, so
-concurrent worker tasks never race on the global thread count. Build the plans with `nthreads = 1` to
-also keep FINUFFT from oversubscribing across concurrent tasks.
-
-The spin entry points touch no FastTransforms state, so they need no such bracket.
+The tasks carry the parallelism, so every farm runs FastTransforms on one OpenMP thread inside them
+(`FlowTransformBindings.FASTTRANSFORMS_THREADS`). Build the plans with `nthreads = 1` so the NUFFT
+does not oversubscribe the cores across concurrent tasks either.
 """
 module NUFSHTOhMyThreadsExt
 
 using NUFSHT: NUFSHT
 using ComputationalBackends: ComputationalBackends
+using FlowTransformBindings: FlowTransformBindings as FTB
 using OhMyThreads: OhMyThreads
 
-# ── Scalar collections (bracketed: the S-step drives FastTransforms) ──────────
+@inline _farm(f::F) where {F} = Base.ScopedValues.with(f, FTB.FASTTRANSFORMS_THREADS => 1)
 
-function NUFSHT.nusht_type2!(fs, Cs, plans::AbstractVector, ::ComputationalBackends.AbstractThreadedBackend)
+# ── Scalar collections ────────────────────────────────────────────────────────
+
+function NUFSHT._farm_type2!(fs, Cs, plans::AbstractVector, ::ComputationalBackends.AbstractThreadedBackend)
     NUFSHT._check_farm(fs, Cs, plans)
-    NUFSHT._with_fasttransforms_single() do
+    _farm() do
         OhMyThreads.@tasks for i in eachindex(plans)
             NUFSHT.nusht_type2!(fs[i], Cs[i], plans[i])
         end
@@ -37,9 +31,9 @@ function NUFSHT.nusht_type2!(fs, Cs, plans::AbstractVector, ::ComputationalBacke
     return fs
 end
 
-function NUFSHT.nusht_type1!(Cs, fs, plans::AbstractVector, ::ComputationalBackends.AbstractThreadedBackend)
+function NUFSHT._farm_type1!(Cs, fs, plans::AbstractVector, ::ComputationalBackends.AbstractThreadedBackend)
     NUFSHT._check_farm(Cs, fs, plans)
-    NUFSHT._with_fasttransforms_single() do
+    _farm() do
         OhMyThreads.@tasks for i in eachindex(plans)
             NUFSHT.nusht_type1!(Cs[i], fs[i], plans[i])
         end
@@ -47,9 +41,9 @@ function NUFSHT.nusht_type1!(Cs, fs, plans::AbstractVector, ::ComputationalBacke
     return Cs
 end
 
-function NUFSHT.nusht_solve!(Cs, fs, plans::AbstractVector, ::ComputationalBackends.AbstractThreadedBackend; kwargs...)
+function NUFSHT._farm_solve!(Cs, fs, plans::AbstractVector, ::ComputationalBackends.AbstractThreadedBackend; kwargs...)
     NUFSHT._check_farm(Cs, fs, plans)
-    NUFSHT._with_fasttransforms_single() do
+    _farm() do
         OhMyThreads.@tasks for i in eachindex(plans)
             NUFSHT.nusht_solve!(Cs[i], fs[i], plans[i]; kwargs...)
         end
@@ -57,9 +51,23 @@ function NUFSHT.nusht_solve!(Cs, fs, plans::AbstractVector, ::ComputationalBacke
     return Cs
 end
 
-function NUFSHT.nusht_filter!(outs, ins, filter, plans::AbstractVector, ::ComputationalBackends.AbstractThreadedBackend)
+# Scalar or spin plans.
+function NUFSHT._farm_analyze!(Cs, fs, plans::AbstractVector, weights,
+                               ::ComputationalBackends.AbstractThreadedBackend; kwargs...)
+    NUFSHT._check_farm(Cs, fs, plans)
+    NUFSHT._check_farm_weights(weights, plans)
+    _farm() do
+        OhMyThreads.@tasks for i in eachindex(plans)
+            NUFSHT.nusht_analyze!(Cs[i], fs[i], plans[i]; weights = NUFSHT._problem_weights(weights, i),
+                                  kwargs...)
+        end
+    end
+    return Cs
+end
+
+function NUFSHT._farm_filter!(outs, ins, filter, plans::AbstractVector, ::ComputationalBackends.AbstractThreadedBackend)
     NUFSHT._check_farm(outs, ins, plans)
-    NUFSHT._with_fasttransforms_single() do
+    _farm() do
         OhMyThreads.@tasks for i in eachindex(plans)
             NUFSHT.nusht_filter!(outs[i], ins[i], filter, plans[i])
         end
@@ -67,28 +75,34 @@ function NUFSHT.nusht_filter!(outs, ins, filter, plans::AbstractVector, ::Comput
     return outs
 end
 
-# ── Spin collections (no FastTransforms state, so no bracket) ─────────────────
+# ── Spin collections ──────────────────────────────────────────────────────────
 
-function NUFSHT.nusht_type2_spin!(fs, sfs, plans::AbstractVector, ::ComputationalBackends.AbstractThreadedBackend)
+function NUFSHT._farm_type2_spin!(fs, sfs, plans::AbstractVector, ::ComputationalBackends.AbstractThreadedBackend)
     NUFSHT._check_farm(fs, sfs, plans)
-    OhMyThreads.@tasks for i in eachindex(plans)
-        NUFSHT.nusht_type2_spin!(fs[i], sfs[i], plans[i])
+    _farm() do
+        OhMyThreads.@tasks for i in eachindex(plans)
+            NUFSHT.nusht_type2_spin!(fs[i], sfs[i], plans[i])
+        end
     end
     return fs
 end
 
-function NUFSHT.nusht_type1_spin!(sfs, fs, plans::AbstractVector, ::ComputationalBackends.AbstractThreadedBackend)
+function NUFSHT._farm_type1_spin!(sfs, fs, plans::AbstractVector, ::ComputationalBackends.AbstractThreadedBackend)
     NUFSHT._check_farm(sfs, fs, plans)
-    OhMyThreads.@tasks for i in eachindex(plans)
-        NUFSHT.nusht_type1_spin!(sfs[i], fs[i], plans[i])
+    _farm() do
+        OhMyThreads.@tasks for i in eachindex(plans)
+            NUFSHT.nusht_type1_spin!(sfs[i], fs[i], plans[i])
+        end
     end
     return sfs
 end
 
-function NUFSHT.nusht_solve_spin!(sfs, fs, plans::AbstractVector, ::ComputationalBackends.AbstractThreadedBackend; kwargs...)
+function NUFSHT._farm_solve_spin!(sfs, fs, plans::AbstractVector, ::ComputationalBackends.AbstractThreadedBackend; kwargs...)
     NUFSHT._check_farm(sfs, fs, plans)
-    OhMyThreads.@tasks for i in eachindex(plans)
-        NUFSHT.nusht_solve_spin!(sfs[i], fs[i], plans[i]; kwargs...)
+    _farm() do
+        OhMyThreads.@tasks for i in eachindex(plans)
+            NUFSHT.nusht_solve_spin!(sfs[i], fs[i], plans[i]; kwargs...)
+        end
     end
     return sfs
 end

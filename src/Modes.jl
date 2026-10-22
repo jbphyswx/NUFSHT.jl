@@ -1,31 +1,25 @@
-"""
-    Modes.jl — bivariate Fourier coefficients → the NUFFT's complex exponential mode array.
-
-`FastTransforms.plan_sph2fourier` already converts spherical harmonic coefficients into the
-Double-Fourier-Sphere bivariate Fourier series (its README: "`sph2fourier` converts the representation
-into a bivariate Fourier series"). This turns that real cos/sin basis into the complex exponentials a
-NUFFT evaluates, so synthesis is `P·C` → assemble → one NUFFT with no grid in between.
-
-For order `m` in the `sph_mode` column packing, the series `P·C` represents is
-
-    f(θ,φ) = Σ_m Φ_m(φ) · N_m · Σ_i G[i, col(m)] · Θ_{i,m}(θ)
-
-with `Φ_m = cos(|m|φ)` on the `+m` column and `sin(|m|φ)` on the `−m` column, `N_0 = 1/√(2π)` and
-`N_{m≠0} = 1/√π`, and `Θ = cos((i−1)θ)` for even `|m|` but `sin(iθ)` for odd `|m|`. That parity is not
-a storage convention: the DFS extension of `Y_ℓm` in θ is `sin^{|m|}θ · Q(cosθ)`, even in θ for even
-`m` and odd for odd `m`, which is the same fact the glide reflection encodes.
-
-Odd `|m|` therefore reaches θ-frequency `i`, so row `lmax+1` of such a column carries frequency
-`lmax+1`. A degree-`lmax` expansion has nothing there, but the coefficient array is a square,
-invertible representation whose supernumerary slots hold degrees `lmax < l ≤ lmax+|m|`, and those do
-reach it — so the mode array runs `-(lmax+1) … lmax+1` on θ and the transform stays faithful on the
-whole array rather than only on the band-limited subspace.
-
-Both directions are written as **gathers** — one output element reading its sources — so neither needs
-atomics and both are the same arithmetic on a host array and in a `@kernel`. The forward direction is
-a gather because at most two coefficient entries reach any one mode slot: the slot's column fixes
-`|m|`, its row fixes the θ-frequency and hence `i`, leaving only the `±m` pair of columns.
-"""
+# Bivariate Fourier coefficients → the NUFFT's complex exponential mode array.
+#
+# `FastTransforms.plan_sph2fourier` converts spherical harmonic coefficients into the
+# Double-Fourier-Sphere bivariate Fourier series; this turns its real cos/sin basis into the complex
+# exponentials a NUFFT evaluates, so synthesis is `P·C` → assemble → one NUFFT, with no grid between.
+#
+# For order `m` in the `sph_mode` column packing, the series `P·C` represents is
+#
+#     f(θ,φ) = Σ_m Φ_m(φ) · N_m · Σ_i G[i, col(m)] · Θ_{i,m}(θ)
+#
+# with `Φ_m = cos(|m|φ)` on the `+m` column and `sin(|m|φ)` on the `−m` column, `N_0 = 1/√(2π)` and
+# `N_{m≠0} = 1/√π`, and `Θ = cos((i−1)θ)` for even `|m|`, `sin(iθ)` for odd `|m|`: the DFS extension of
+# `Y_ℓm` in θ is `sin^{|m|}θ · Q(cosθ)`, even in θ for even `m` and odd for odd `m`.
+#
+# Odd `|m|` reaches θ-frequency `i`, so row `lmax+1` of such a column carries frequency `lmax+1`. A
+# degree-`lmax` expansion has nothing there, but the coefficient array is a square, invertible
+# representation whose supernumerary slots hold degrees `lmax < l ≤ lmax+|m|`, and those reach it; the
+# mode array runs `-(lmax+1) … lmax+1` on θ, and the transform is exact on the whole array.
+#
+# Both directions are gathers, one output element reading its sources, so neither needs atomics and
+# both are the same arithmetic on a host array and in a `@kernel`. At most two coefficient entries reach
+# a mode slot: its column fixes `|m|`, its row the θ-frequency and so `i`, leaving the `±m` pair.
 
 # Column `j` of the (lmax+1, 2lmax+1) coefficient array → its signed order, matching `sph_mode`:
 # column 1 is m = 0, then the pairs (2k, 2k+1) are m = −k, +k.
@@ -34,12 +28,12 @@ a gather because at most two coefficient entries reach any one mode slot: the sl
 # The θ-frequency row `i` of an order-`m` column carries, and whether that column is a sine series.
 @inline _theta_freq(i::Integer, am::Integer) = iseven(am) ? i - 1 : i
 
-# Whether the mode array holds only `kθ ≥ 0` (`lmax+2` rows) rather than the centered `-(lmax+1) …
-# lmax+1` (`2lmax+3` rows). A real field's array is exactly Hermitian, so every backend stores the
-# half; how the other half is supplied is the plan's business, not this gather's.
+# Whether the mode array holds the `kθ ≥ 0` half (`lmax+2` rows) of the centered `-(lmax+1) … lmax+1`
+# (`2lmax+3` rows). A real field's array is Hermitian, so every backend stores the half, and the plan
+# supplies the other.
 @inline _folded(Z, lmax::Integer) = size(Z, 1) == lmax + 2
 
-# The three normalizations every element needs, formed once per call instead of per element.
+# The three normalizations every element needs, formed once per call.
 @inline _mode_norms(::Type{RT}) where {RT} =
     (RT(1) / sqrt(RT(2) * RT(π)), RT(1) / sqrt(RT(π)), RT(0.5))
 
@@ -85,8 +79,7 @@ weight. The forward needs no such factor — writing the half and letting the ba
 transform imply the conjugate is exact — but its transpose does: the embedding `E` maps the half to the
 full array by `Z[-k] = conj(Z[k])`, so `E†` gives `Ẑ[k] + conj(Ẑ[-k])`, and with real strengths
 `conj(Ẑ[-k]) = Ẑ[k]`. Hence `{1, 2, 2, …}`: one at `kθ = 0`, which is its own partner, two above it.
-There is no third case at the top because the θ axis has odd length `2lmax+3` and so has no
-self-paired Nyquist row — an even axis would need one.
+The θ axis has odd length `2lmax+3`, so it has no self-paired Nyquist row and no third weight.
 """
 @inline function _mode_adjoint_entry(::Type{CT}, Z, lmax::Integer, i::Integer, j::Integer, b::Integer,
                                      offθ::Integer, offφ::Integer, fold::Bool,
@@ -119,11 +112,11 @@ end
     _assemble_modes!(Z, G, lmax)
 
 `G` (bivariate Fourier coefficients, `sph2fourier` layout, `(lmax+1, 2lmax+1, B)`) → `Z`, the complex
-mode array with `Z[kθ+offθ, kφ+offφ]` the coefficient of `exp(i(kθ·θ + kφ·φ))`. Exact: no grid, no
-doubling, no FFT. The device method is a `@kernel` over the same [`_mode_entry`](@ref).
+mode array with `Z[kθ+offθ, kφ+offφ]` the coefficient of `exp(i(kθ·θ + kφ·φ))`, exactly. The device
+method is a `@kernel` over the same `_mode_entry`.
 
-`Z` may be the full `(2lmax+3, 2lmax+1, B)` array or the folded `(lmax+2, …)` half — see
-[`_folded`](@ref). Row `r` is written unconditionally, so no `fill!` is needed.
+`Z` may be the full `(2lmax+3, 2lmax+1, B)` array or the folded `(lmax+2, …)` half (`_folded`). Every
+entry is written, so `Z` needs no `fill!`.
 """
 function _assemble_modes!(Z, G, lmax::Integer)
     CT = eltype(Z)
@@ -141,8 +134,8 @@ end
 """
     _assemble_modes_adjoint!(G, Z, lmax)
 
-Exact Euclidean adjoint of [`_assemble_modes!`](@ref), one entry of `G` per
-[`_mode_adjoint_entry`](@ref). A real `G` takes the real part, which is the adjoint of the
+Exact Euclidean adjoint of [`_assemble_modes!`](@ref), one entry of `G` per `_mode_adjoint_entry`. A
+real `G` takes the real part, which is the adjoint of the
 real→complex embedding; a complex one does not. The device method is a `@kernel` over the same
 per-element map.
 """
