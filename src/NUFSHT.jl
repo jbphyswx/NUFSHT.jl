@@ -29,11 +29,14 @@ module NUFSHT
 
 # First, so its `__init__` selects the OpenMP runtime's thread-local mode before FastTransforms loads
 # that runtime; see `FlowTransformBindings.with_fasttransforms_threads`.
-using FlowTransformBindings: FlowTransformBindings as FTB
+using FlowTransformBindings: FlowTransformBindings, FlowTransformBindings as FTB
 using ComputationalBackends: ComputationalBackends
 using FFTW: FFTW
 using FastSphericalHarmonics: FastSphericalHarmonics
 using LinearAlgebra: LinearAlgebra
+
+public FlowTransformBindings, FTB
+public ComputationalBackends
 
 include("Modes.jl")
 include("NUFFT.jl")

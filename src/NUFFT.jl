@@ -17,6 +17,8 @@
 
 using SpectralBackends: SpectralBackends
 
+public SpectralBackends
+
 const _FTBLibrary = Union{FTB.FINUFFTBackend, FTB.NonuniformFFTsBackend}
 
 """
