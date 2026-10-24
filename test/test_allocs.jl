@@ -57,11 +57,11 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
             NUFSHT.close!(plan)
         end
 
-        Test.@testset "spin transform + solve, FastTransforms engine (B=$B)" begin
+        Test.@testset "spin transform + solve (B=$B)" begin
             s = 1
             plan = NUFSHT.make_spin_plan(θ, φ, lmax, s; tol = 1e-10, ntrans = B, execution = serial,
                                          nufft = FTB.FINUFFTBackend())
-            Test.@test plan.engine isa NUFSHT._FTSpinEngine && isempty(plan.engine.pool)
+            Test.@test plan.engine isa NUFSHT._RingEngine && length(plan.engine.work) == 1
             sf = zeros(ComplexF64, Nθ, Nφ, B); fs = zeros(ComplexF64, M, B); sfo = zeros(ComplexF64, Nθ, Nφ, B)
             for b in 1:B, ℓ in abs(s):min(4, lmax), m in -ℓ:ℓ
                 sf[NUFSHT.spin_coeff_index(ℓ, m, lmax), b] = randn(ComplexF64)
@@ -80,13 +80,13 @@ Test.@testset "allocation: full hot-path surface is allocation-free" begin
             NUFSHT.close!(plan)
         end
 
-        # Single precision runs the Wigner recurrence, here with the direct sum on one thread.
-        Test.@testset "spin transform, Wigner recurrence (ComplexF32, B=$B)" begin
+        # Single precision, here with the direct sum on one thread.
+        Test.@testset "spin transform (ComplexF32, B=$B)" begin
             s = 1
             plan = NUFSHT.make_spin_plan(ComplexF32, Float32.(θ), Float32.(φ), lmax, s; tol = 1e-5,
                                          ntrans = B, execution = serial,
                                          nufft = NUFSHT.SpectralBackends.DirectSumSpectralBackend())
-            Test.@test plan.engine isa NUFSHT._WignerPlanes
+            Test.@test plan.engine isa NUFSHT._RingEngine
             sf = zeros(ComplexF32, Nθ, Nφ, B); fs = zeros(ComplexF32, M, B); sfo = zeros(ComplexF32, Nθ, Nφ, B)
             for b in 1:B, ℓ in abs(s):min(4, lmax), m in -ℓ:ℓ
                 sf[NUFSHT.spin_coeff_index(ℓ, m, lmax), b] = randn(ComplexF32)

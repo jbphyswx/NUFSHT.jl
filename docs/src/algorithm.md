@@ -148,27 +148,45 @@ weights in either direction.
 A spin-``s`` plan synthesizes ``f = \sum_{\ell m} {}_s f_{\ell m}\, {}_sY_{\ell m}`` with
 ``{}_sY_{\ell m}(\theta,\varphi) = N_\ell\, d^\ell_{m,-s}(\theta)\, e^{im\varphi}``, written as the
 bivariate Fourier series ``f = \sum_{m',m} G_{m'm}\, e^{-im'\theta} e^{im\varphi}`` that one NUFFT
-evaluates. On host `Float64` nodes ``G`` comes from FastTransforms' `plan_spinsph2fourier`; for any other
-element type, and on a device, from the Wigner-``d`` recurrence. Both are the same linear map.
+evaluates. ``G`` comes from the ring S-step below.
 
-FastTransforms stores ``{}_s f_{\ell m}`` at row ``\ell - \max(|m|,|s|) + 1`` of column ``1`` (``m = 0``),
-``2m+1`` (``m > 0``) or ``2|m|`` (``m < 0``), as the coefficient of ``\sigma_{ms}\, {}_sY_{\ell m}``, with
-``\sigma_{ms} = (-1)^{m+s}`` for ``m + s > 0`` and ``1`` otherwise. Its Givens rotations and
-Jacobi-to-Chebyshev conversions build the orthonormal functions
-``(1-x)^{|m+s|/2} (1+x)^{|m-s|/2} \tilde P_k^{(|m+s|,|m-s|)}(x)``, ``x = \cos\theta``, each with a
-positive leading coefficient, and ``\sigma_{ms}`` is the sign of ``d^\ell_{m,-s}(\theta)`` as
-``\theta \to 0``. Column ``m`` of its output is
+### The ring S-step
+
+Column ``m`` of ``G`` holds the Fourier coefficients of
+``F_m(\theta) = \sum_\ell {}_s f_{\ell m} N_\ell\, d^\ell_{m,-s}(\theta)``. The ring S-step evaluates
+``F_m`` at ``\theta_j = 2\pi j/N``, ``j = 0, \ldots, N/2``, with ``N \geq 2 l_\text{max} + 2`` even, by the
+three-term recurrence in ``\ell`` (``n = -s``, ``x = \cos\theta``)
 
 ```math
-\frac{e^{im\varphi}}{\sqrt{2\pi}} \sum_{j=0}^{l_\text{max}} B_j \cos(j\theta) \quad (m+s \text{ even}),
-\qquad
-\frac{e^{im\varphi}}{\sqrt{2\pi}} \sum_{j=0}^{l_\text{max}} B_j \sin((j+1)\theta) \quad (m+s \text{ odd}),
+\ell \sqrt{((\ell+1)^2-m^2)((\ell+1)^2-n^2)}\; d^{\ell+1}_{mn}
+= (2\ell+1)\left(\ell(\ell+1)x - mn\right) d^\ell_{mn}
+- (\ell+1)\sqrt{(\ell^2-m^2)(\ell^2-n^2)}\; d^{\ell-1}_{mn},
 ```
 
-so ``G_{0m} = B_0/\sqrt{2\pi}`` and ``G_{\pm k, m} = B_k / (2\sqrt{2\pi})`` on a cosine column, and
-``G_{\pm k, m} = \pm i\, B_{k-1} / (2\sqrt{2\pi})`` on a sine column. The sine row ``B_{l_\text{max}}``,
-of frequency ``l_\text{max}+1``, is zero for degrees ``\ell \le l_\text{max}``. FastTransforms' rotations
-and conversion matrices are real, so its transpose is the exact adjoint.
+started from the closed form of ``d^{\ell_0}_{mn}`` at ``\ell_0 = \max(|m|,|n|)``. Since
+``F_m(2\pi-\theta) = (-1)^{m+s} F_m(\theta)``, the half circle fixes ``F_m`` on all ``N`` samples, and one
+length-``N`` FFT returns ``G_{m'm}`` for ``|m'| \leq l_\text{max}`` exactly.
+
+Written as ``y_{\ell+1} = (\alpha x + \beta)\, y_\ell - \gamma\, y_{\ell-1}``, a rounding error ``\epsilon`` in
+``\alpha x + \beta`` moves the angle the recurrence oscillates at by ``\epsilon / \sin\theta``, large at the
+rings next to the poles; accumulated over the degrees it stays below ``10^{-12}`` in `Float64` at
+``l_\text{max} = 1024``, which keeps that form. In `Float32` the S-step carries
+``e_\ell = y_\ell - \sigma y_{\ell-1}`` with ``u = 1 - \sigma x``, ``\sigma = 1`` for ``\theta \leq \pi/2`` and
+``-1`` beyond (Reinsch's modification),
+
+```math
+e_{\ell+1} = (c_\sigma - \sigma \alpha u)\, y_\ell + \sigma \gamma\, e_\ell, \qquad
+y_{\ell+1} = \sigma y_\ell + e_{\ell+1},
+```
+
+with ``c_+ = \alpha + \beta - 1 - \gamma`` and ``c_- = \beta - \alpha + 1 + \gamma``, each formed as a sum of
+terms of one sign. ``u`` is ``2\sin^2(\theta/2)`` or ``2\cos^2(\theta/2)``, accurate where it is small, and
+the angle moves by ``\epsilon \tan(\theta/2)`` per step. Below its turning point
+``d^\ell_{mn}`` is exponentially small, so the recurrence holds it as ``y\, 2^{Kk}`` with an integer
+scale ``k \leq 0`` and adds it to the sum once ``k \geq -1``. The cost is
+``O(l_\text{max}^3)``, with the work of each ring and degree a few fused multiply–adds on values in
+registers, and the relative error is below ``l_\text{max}\, \epsilon`` in `Float32`. The
+adjoint runs the same recurrence and sums each degree over the rings.
 
 ## References
 

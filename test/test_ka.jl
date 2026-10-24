@@ -21,6 +21,21 @@ function NUFSHT._nufft_exec!(p::HostBouncePlan, input, output)
     return copyto!(output, hout)
 end
 
+# An FFT for JLArrays, which has none, in the same way: each execution moves its array across in bulk.
+const _AbstractFFTs = NUFSHT.FFTW.AbstractFFTs
+struct HostBounceFFT{P}
+    inner::P
+end
+_AbstractFFTs.plan_fft!(x::JLArrays.JLArray, region; kwargs...) =
+    HostBounceFFT(_AbstractFFTs.plan_fft!(Array(x), region))
+_AbstractFFTs.plan_bfft!(x::JLArrays.JLArray, region; kwargs...) =
+    HostBounceFFT(_AbstractFFTs.plan_bfft!(Array(x), region))
+function Base.:*(p::HostBounceFFT, x::JLArrays.JLArray)
+    h = Array(x)
+    p.inner * h
+    return copyto!(x, h)
+end
+
 # The solver steps that are NUFSHT's own, on device arrays with scalar indexing an error: the scatter of
 # the packed iterate into the plan's `(Nθ, Nφ, B)` layout, the gather of the adjoint back into it (with
 # and without the fold of the previous vector, over the first `n` columns), and the write-out of a
@@ -124,6 +139,35 @@ Test.@testset "KernelAbstractions extension: device solves never scalar-index (J
         Test.@test res[4]
         Test.@test relerr(Array(S), sf) < 1e-9
         NUFSHT.close!(p)
+    end
+end
+
+# A device spin plan runs the ring S-step in its kernels; its synthesis and adjoint equal a host plan's
+# of the same element type, batched, on both layouts, with scalar indexing an error.
+Test.@testset "KernelAbstractions extension: device ring S-step equals the host plan (JLArray)" begin
+    J(v) = JLArrays.JLArray(v)
+    no_scalar(f) = task_local_storage(f, :ScalarIndexing, GPUArraysCore.ScalarDisallowed)
+    lmax, B, M = 24, 2, 300
+    θ, φ = iid_points(M, 840)
+    gpu = ComputationalBackends.GPUBackend(JLArrays.JLBackend())
+    DS = NUFSHT.SpectralBackends.DirectSumSpectralBackend()
+    for (FE, s) in ((ComplexF64, 1), (ComplexF64, -2), (Float64, 0), (ComplexF32, 1), (Float32, 0))
+        T = real(FE)
+        pd = NUFSHT.make_spin_plan(FE, T.(θ), T.(φ), lmax, s; execution = gpu, ntrans = B,
+                                   nufft = HostBounceNUFFT(), tol = 1e-12)
+        ph = NUFSHT.make_spin_plan(FE, T.(θ), T.(φ), lmax, s; nthreads = 1, ntrans = B, nufft = DS, tol = 1e-12)
+        Test.@test pd.engine isa NUFSHT._RingEngine
+        sf = Complex{T}.(cat((_spin_coeffs(lmax, s, 841 + b; hermitian = FE <: Real) for b in 1:B)...; dims = 3))
+        fh = zeros(FE, M, B); NUFSHT.nusht_type2_spin!(fh, sf, ph)
+        fd = J(zeros(FE, M, B)); no_scalar(() -> NUFSHT.nusht_type2_spin!(fd, J(sf), pd))
+        Random.seed!(843 + s)
+        y = FE <: Real ? randn(T, M, B) : randn(Complex{T}, M, B)
+        ah = zeros(Complex{T}, size(sf)); NUFSHT.nusht_type1_spin!(ah, y, ph)
+        ad = J(zeros(Complex{T}, size(sf))); no_scalar(() -> NUFSHT.nusht_type1_spin!(ad, J(y), pd))
+        tol = T === Float64 ? 1e-12 : lmax * eps(Float32)
+        Test.@test relerr(Array(fd), fh) < tol
+        Test.@test relerr(Array(ad), ah) < tol
+        NUFSHT.close!(pd); NUFSHT.close!(ph)
     end
 end
 

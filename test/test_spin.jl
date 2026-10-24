@@ -23,38 +23,21 @@ Test.@testset "wigner_d is the rotation matrix ⟨ℓm|exp(-iβ Jy)|ℓn⟩" beg
     end
 end
 
-# Every degree's plane, from its stored `m = ℓ` column, the quarter recurrence and the sign map, against
-# `Jy`, in the transposed storage `Δ^ℓ_{n,m} = d^ℓ_{mn}(π/2)`.
-Test.@testset "Trapani Δ is d(π/2)" begin
-    lmax = 6
-    bnd = NUFSHT._wigner_boundary(Float64, lmax)
-    P = zeros(lmax + 1, lmax + 1, 1)
-    for ℓ in 0:lmax
-        NUFSHT._wigner_quarter!(P, 1, bnd, ℓ)
-        R = _jy_rotation(ℓ, π / 2)
-        for m in -ℓ:ℓ, n in -ℓ:ℓ
-            Δ = NUFSHT._quarter_sign(Float64, ℓ, n, m) * P[abs(n) + 1, abs(m) + 1, 1]
-            Test.@test Δ ≈ real(R[m + ℓ + 1, n + ℓ + 1]) atol = 1e-12
-        end
-    end
-end
-
-# A block of degrees per task changes no sum: each entry adds the same terms in the same order. These
-# host Float64 plans run FastTransforms, so the recurrence is passed to the assembly as its engine.
-Test.@testset "spin contraction on several tasks equals one task" begin
+# Each order is one task's whole computation, so the tasks a transform runs on change no sum.
+Test.@testset "ring S-step on several tasks equals one task" begin
     Random.seed!(9)
     lmax, M = 72, 2000
     θ = acos.(2 .* rand(M) .- 1); φ = 2π .* rand(M)
-    sf = randn(ComplexF64, lmax + 1, 2lmax + 1)
-    one_task, four = (NUFSHT.make_spin_plan(θ, φ, lmax, 1; nthreads = n) for n in (1, 4))
-    e1, e4 = (NUFSHT._wigner_planes(θ, lmax, p.ntasks) for p in (one_task, four))
-    Test.@test NUFSHT._block_tasks(four, NUFSHT._spin_tasks(four), lmax - 3, lmax) == 4
-    Test.@test NUFSHT._block_size(four, e4) == 4
+    sf = randn(ComplexF64, lmax + 1, 2lmax + 1, 3)
+    DS = NUFSHT.SpectralBackends.DirectSumSpectralBackend()
+    one_task, four = (NUFSHT.make_spin_plan(θ, φ, lmax, 1; nthreads = n, ntrans = 3, nufft = DS) for n in (1, 4))
+    e1, e4 = one_task.engine, four.engine
+    Test.@test NUFSHT._ring_tasks(four, e4) == 4
     G1 = copy(NUFSHT._assemble_G_impl!(one_task.G, sf, one_task, e1))
     Test.@test NUFSHT._assemble_G_impl!(four.G, sf, four, e4) == G1
     a1 = NUFSHT._assemble_G_adjoint_impl!(zeros(ComplexF64, size(sf)), G1, one_task, e1)
     a4 = NUFSHT._assemble_G_adjoint_impl!(zeros(ComplexF64, size(sf)), G1, four, e4)
-    Test.@test a4 ≈ a1 rtol = 1e-14
+    Test.@test a4 == a1
     NUFSHT.close!(one_task); NUFSHT.close!(four)
 end
 
@@ -144,7 +127,7 @@ Test.@testset "spin-weighted scattered transforms" begin
 end
 
 # `wigner_d` loses accuracy above ℓ ≈ 40, so at lmax = 128 the references are `₀Y_ℓ0(θ) = N_ℓ P_ℓ(cosθ)`
-# from the Legendre three-term recurrence, the adjoint identity, and the two engines against each other.
+# from the Legendre three-term recurrence and the adjoint identity.
 Test.@testset "spin transforms at large lmax (stable where wigner_d fails)" begin
     Random.seed!(77)
     lmax = 128
@@ -178,16 +161,6 @@ Test.@testset "spin transforms at large lmax (stable where wigner_d fails)" begi
     adj_err = abs(sum(Ax .* conj.(y)) - sum(vec(x) .* conj.(vec(Aty)))) / abs(sum(Ax .* conj.(y)))
     @info "large-lmax s=2: adj_err=$adj_err"
     Test.@test adj_err < 1e-11
-
-    # The Wigner recurrence on the same plan forms FastTransforms' `G`, and its transpose.
-    Test.@test plan.engine isa NUFSHT._FTSpinEngine
-    eng = NUFSHT._wigner_planes(θ, lmax, 1)
-    Gf = copy(NUFSHT._assemble_G_impl!(plan.G, x, plan, plan.engine))
-    Gw = copy(NUFSHT._assemble_G_impl!(plan.G, x, plan, eng))
-    Test.@test relerr(Gf, Gw) < 1e-12
-    af = NUFSHT._assemble_G_adjoint_impl!(zeros(ComplexF64, shp), Gw, plan, plan.engine)
-    aw = NUFSHT._assemble_G_adjoint_impl!(zeros(ComplexF64, shp), Gw, plan, eng)
-    Test.@test relerr(af, aw) < 1e-12
     NUFSHT.close!(plan)
 end
 
@@ -467,55 +440,52 @@ function _spin_field_jacobi(sf, s, lmax, θ, φ)
     return f
 end
 
-# Host Float64 plans run FastTransforms' spin transform: its synthesis at scattered points against the
-# closed-form harmonics, every degree and order populated, at spins 0, ±1, ±2.
-Test.@testset "FastTransforms spin engine: synthesis matches ₛY_ℓm" begin
+# Synthesis at scattered points against the closed-form harmonics, every degree and order populated, at
+# spins 0, ±1, ±2.
+Test.@testset "spin synthesis matches the Jacobi-form ₛY_ℓm" begin
     for lmax in (8, 64), s in (0, 1, -1, 2, -2)
         θ, φ = iid_points(500, 950 + lmax + s)
         sf = _spin_coeffs(lmax, s, 960 + lmax + s)
         p = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, s; tol = 1e-12, nthreads = 1)
-        Test.@test p.engine isa NUFSHT._FTSpinEngine
         f = zeros(ComplexF64, length(θ)); NUFSHT.nusht_type2_spin!(f, sf, p)
         Test.@test relerr(f, _spin_field_jacobi(sf, s, lmax, θ, φ)) < 1e-10
         NUFSHT.close!(p)
     end
 end
 
-# FastTransforms' engine and the Wigner one are the same transform: forward and adjoint of batched
-# complex and real-field plans (both folds) against plans contracting with a `WignerTable`, on random
-# arrays that fill every slot.
-Test.@testset "FastTransforms spin engine equals the Wigner engine" begin
-    lmax, B, M = 24, 3, 700
-    θ, φ = iid_points(M, 970)
+# At lmax = 512 the starting values of high orders near the poles lie far below `floatmin(Float32)`.
+# Single spin-0 modes there against `₀Y_ℓm = Λ_ℓm(θ) e^{imφ}` and `₀Y_ℓ,−m = (−1)^m Λ_ℓm(θ) e^{−imφ}`,
+# `Λ` the normalized associated Legendre function with the Condon–Shortley phase (`plm_column_ref`), in
+# double precision; the single-precision S-step's Fourier coefficients against the double-precision
+# ones within `lmax eps(Float32)`.
+Test.@testset "spin-0 synthesis at lmax = 512 against the associated Legendre functions" begin
+    lmax, M = 512, 64
+    θ, φ = iid_points(M, 980)
     DS = NUFSHT.SpectralBackends.DirectSumSpectralBackend()
-    for (FE, s, nufft) in ((ComplexF64, 1, FTB.FINUFFTBackend()), (ComplexF64, -2, FTB.FINUFFTBackend()),
-                           (ComplexF64, 0, FTB.FINUFFTBackend()), (Float64, 0, FTB.FINUFFTBackend()),
-                           (Float64, 2, DS))
-        kw = (; tol = 1e-12, ntrans = B, nthreads = 1, nufft)
-        pf = NUFSHT.make_spin_plan(FE, θ, φ, lmax, s; kw...)
-        pw = NUFSHT.make_spin_plan(FE, θ, φ, lmax, s; kw..., wigner_table = NUFSHT.WignerTable(lmax, s))
-        Test.@test pf.engine isa NUFSHT._FTSpinEngine && pw.engine isa NUFSHT.WignerTable
-        Random.seed!(971 + s)
-        sf = randn(ComplexF64, lmax + 1, 2lmax + 1, B)
-        ff = zeros(FE, M, B); NUFSHT.nusht_type2_spin!(ff, sf, pf)
-        fw = zeros(FE, M, B); NUFSHT.nusht_type2_spin!(fw, sf, pw)
-        Test.@test relerr(ff, fw) < 1e-12
-        y = FE <: Real ? randn(M, B) : randn(ComplexF64, M, B)
-        af = zeros(ComplexF64, size(sf)); NUFSHT.nusht_type1_spin!(af, y, pf)
-        aw = zeros(ComplexF64, size(sf)); NUFSHT.nusht_type1_spin!(aw, y, pw)
-        Test.@test relerr(af, aw) < 1e-12
-        NUFSHT.close!(pf); NUFSHT.close!(pw)
+    p64 = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 0; nthreads = 1, nufft = DS)
+    p32 = NUFSHT.make_spin_plan(ComplexF32, Float32.(θ), Float32.(φ), lmax, 0; nthreads = 1, nufft = DS)
+    G64 = similar(p64.G); G32 = similar(p32.G)
+    for (ℓ, m) in ((512, 0), (512, 3), (450, 400), (512, 511), (400, -390))
+        sf = zeros(ComplexF64, lmax + 1, 2lmax + 1)
+        sf[NUFSHT.spin_coeff_index(ℓ, m, lmax)] = 1
+        f = zeros(ComplexF64, M); NUFSHT.nusht_type2_spin!(f, sf, p64)
+        σ = m < 0 && isodd(m) ? -1 : 1
+        ref = [σ * plm_column_ref(lmax, abs(m), θ[j])[ℓ + 1] * cis(m * φ[j]) for j in 1:M]
+        Test.@test relerr(f, ref) < 1e-11
+        NUFSHT._assemble_G_impl!(G64, sf, p64, p64.engine)
+        NUFSHT._assemble_G_impl!(G32, ComplexF32.(sf), p32, p32.engine)
+        Test.@test relerr(ComplexF64.(G32), G64) < lmax * eps(Float32)
     end
+    NUFSHT.close!(p64); NUFSHT.close!(p32)
 end
 
-# `⟨A x, y⟩ = ⟨x, A† y⟩` on FastTransforms-engine plans with a batch of two: complex fields, and a real
-# spin-0 field with Hermitian coefficients, whose adjoint is taken over the reals.
-Test.@testset "FastTransforms spin engine: adjoint identity" begin
+# `⟨A x, y⟩ = ⟨x, A† y⟩` with a batch of two: complex fields, and a real spin-0 field with Hermitian
+# coefficients, whose adjoint is taken over the reals.
+Test.@testset "spin adjoint identity" begin
     lmax, B, M = 32, 2, 900
     θ, φ = iid_points(M, 990)
     for (FE, s) in ((ComplexF64, 1), (ComplexF64, -2), (Float64, 0))
         p = NUFSHT.make_spin_plan(FE, θ, φ, lmax, s; tol = 1e-12, ntrans = B, nthreads = 1)
-        Test.@test p.engine isa NUFSHT._FTSpinEngine
         x = cat((_spin_coeffs(lmax, s, 991 + b; hermitian = FE <: Real) for b in 1:B)...; dims = 3)
         Random.seed!(993)
         y = FE <: Real ? randn(M, B) : randn(ComplexF64, M, B)
