@@ -733,6 +733,7 @@ function nusht_filter_renorm!(f_out, mask, filter, plan::NUSHTplan{T};
 end
 
 include("Spin.jl")
+include("RingEngine.jl")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Collections of independent problems, split across an execution backend

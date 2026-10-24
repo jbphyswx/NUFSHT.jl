@@ -45,8 +45,8 @@ nusht_solve!
 ## Spin-weighted transforms
 
 Synthesis/analysis/inversion of spin-weighted (`spin = s`) fields at arbitrary scattered
-points: the coefficients become a bivariate Fourier series (FastTransforms' `plan_spinsph2fourier` on
-host `Float64` nodes, the Wigner-`d` recurrence otherwise) and a 2-D NUFFT evaluates it. Spin-1 is the
+points: the ring S-step turns the coefficients into a bivariate Fourier series and a 2-D NUFFT
+evaluates it. Spin-1 is the
 tangent-vector case (velocity `u_θ + i u_φ`), enabling vector / Helmholtz decomposition on
 scattered spherical data.
 
@@ -56,17 +56,14 @@ SpinNUSHTplan
 nusht_type2_spin!
 nusht_type1_spin!
 nusht_solve_spin!
-WignerTable
 sYlm
 spin_coeff_index
 scalar_to_spin0!
 spin0_to_scalar!
 NUFSHT.wigner_d
-NUFSHT._FTSpinEngine
-NUFSHT._WignerPlanes
-NUFSHT._wigner_boundary
-NUFSHT._wigner_quarter!
-NUFSHT._quarter_sign
+NUFSHT._RingEngine
+NUFSHT._ring_tables
+NUFSHT._ring_check_interval
 ```
 
 ## Filtering

@@ -33,9 +33,8 @@ at arbitrary scattered (colatitude, longitude) points on the sphere.
 ## Spin-weighted transforms (spin-`s`)
 
 NUFSHT also synthesizes/analyzes **spin-weighted** fields at arbitrary scattered points: the
-spin-weighted coefficients become a bivariate Fourier series, which a 2-D NUFFT evaluates. On host
-`Float64` nodes that first step is FastTransforms' `plan_spinsph2fourier`; for any other element type,
-and on a device, it is the Wigner-`d` recurrence. Both give the same transform in the convention below.
+spin-weighted coefficients become a bivariate Fourier series, by the ring S-step described under
+[Algorithm](#algorithm), which a 2-D NUFFT evaluates, in the convention below.
 Spin-1 is the tangent-vector case (a velocity `U = u_θ + i u_φ` is a spin-1 field), which enables
 vector/Helmholtz decomposition on scattered spherical data.
 
@@ -122,8 +121,8 @@ only when you load their trigger package, so a plain `using NUFSHT` never pulls 
   it when a dataset does not otherwise fit.
 - **Mixed precision.** `Float32` and `ComplexF32` are supported. The sphere plans FastTransforms
   provides are `Float64`/`ComplexF64` only, so single-precision scalar plans run their S-step through a
-  double-precision slice buffer, single-precision spin plans run the Wigner recurrence, and everything
-  else runs at the requested precision.
+  double-precision slice buffer, and everything else, the ring S-step of single-precision spin plans
+  included, runs at the requested precision.
 - **Parallel extensions** (each keyed on its trigger package, selected by the `execution` keyword):
   - `using OhMyThreads` — thread-parallel over independent problems (one plan per task),
     `nusht_type2!(fs, Cs, plans; execution = ThreadedBackend())`.
@@ -142,9 +141,9 @@ only when you load their trigger package, so a plain `using NUFSHT` never pulls 
   > own thread count, the OhMyThreads farm and the per-column loop's tasks on one thread each, a
   > Distributed worker at its own thread count.
 - **GPU** (`using KernelAbstractions` with the device array package). The array-indexed steps (the
-  spin Wigner-`d` recurrence + bivariate-Fourier assembly, the S-step of every device spin plan, and the
-  per-column solver primitives) are KA
-  `@kernel`s — **written once, run on any backend**. FlowTransformBindings builds the NUFFT on the nodes'
+  ring S-step of every device spin plan and the per-column solver primitives) are KA `@kernel`s,
+  **written once, run on any backend**; the ring S-step's FFTs are the device array package's
+  (`AbstractFFTs` plans, CUFFT on `CuArray`). FlowTransformBindings builds the NUFFT on the nodes'
   device: NonuniformFFTs on their KernelAbstractions backend, FINUFFT as cuFINUFFT on `CuArray` nodes
   (`using CUDA, FINUFFT`). A device node set, or `execution = GPUBackend(b)` with host nodes, yields a
   device-resident plan (buffers `similar` to the nodes). The device kernels are validated against the
@@ -171,11 +170,11 @@ doubling. For order `m`, the θ basis is
 `cos((i-1)θ)` when `|m|` is even and `sin(iθ)` when it is odd, which is the parity the glide
 reflection encodes: the DFS extension of `Y_lm` in θ is `sin^|m|θ · Q(cosθ)`.
 
-(The **spin** path's **S** is FastTransforms' `plan_spinsph2fourier` on host `Float64` nodes, its
-coefficients mapped to FastTransforms' layout and harmonic sign and its cosine and sine series to the
-NUFFT's exponentials. Every other element type, and the device, run the Trapani–Navaza Wigner-`d`
-recurrence, each degree's plane built from its stored `m = ℓ` column, so blocks of degrees run on
-separate tasks — `ntasks·(lmax+1)²` plane values, numerically stable to lmax ≈ 1024.)
+(The **spin** path's **S** is the ring S-step: for each order `m`, the degree sum
+`Σ_ℓ ₛf_ℓm N_ℓ d^ℓ_{m,−s}(θ)` on `lmax + 2` or more equispaced colatitudes by the three-term
+recurrence of `d^ℓ_{m,−s}` in `ℓ`, held in scaled form where it is exponentially small, then one FFT
+per order gives its column of the bivariate Fourier series. The orders run on separate tasks, in the
+plan's precision, with a relative error below `lmax eps`.)
 
 ### The real fast path
 

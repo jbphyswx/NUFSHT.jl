@@ -69,7 +69,6 @@ Test.@testset "OhMyThreads extension: threaded == serial, main task intact" begi
         Test.@test Cs_a[i] ≈ Ca
     end
 
-    # Spin plans on host Float64 nodes call FastTransforms too.
     splans = [NUFSHT.make_spin_plan(probs[i][1], probs[i][2], lmax, 1; tol = 1e-10, nthreads = 1) for i in 1:P]
     sfs = [randn(ComplexF64, N, Nφ) for _ in 1:P]
     gref = [zeros(ComplexF64, M) for _ in 1:P]
@@ -141,8 +140,8 @@ Test.@testset "threaded sphere loops agree with serial" begin
     Test.@test maximum(abs, fT .- fS) / maximum(abs, fS) < 1e-10
     foreach(NUFSHT.close!, (pS, pT, pT1))
 
-    # A spin plan takes the same `execution`. On host Float64 nodes a batch's columns run through
-    # FastTransforms on one plan pair per task, and each column equals the one-column plan's.
+    # A spin plan takes the same `execution`: its S-step divides the orders among the plan's tasks, one
+    # workspace each, and each column of a batch equals the one-column plan's.
     s = 1
     sS = NUFSHT.make_spin_plan(θ, φ, lmax, s; execution = CB.SerialBackend())
     sT = NUFSHT.make_spin_plan(θ, φ, lmax, s; execution = CB.ThreadedBackend())
@@ -155,8 +154,8 @@ Test.@testset "threaded sphere loops agree with serial" begin
     Test.@test maximum(abs, gT .- gS) / maximum(abs, gS) < 1e-10
 
     sB = NUFSHT.make_spin_plan(θ, φ, lmax, s; execution = CB.ThreadedBackend(), ntrans = B)
-    Test.@test sB.engine isa NUFSHT._FTSpinEngine
-    Test.@test length(sB.engine.pool) == (nT > 1 ? nT : 0)
+    Test.@test sB.engine isa NUFSHT._RingEngine
+    Test.@test length(sB.engine.work) == Threads.nthreads()
     sfB = randn(ComplexF64, lmax + 1, 2lmax + 1, B)
     gB = zeros(ComplexF64, M, B); NUFSHT.nusht_type2_spin!(gB, sfB, sB)
     aB = zeros(ComplexF64, size(sfB)); NUFSHT.nusht_type1_spin!(aB, gB, sB)
@@ -183,7 +182,7 @@ Test.@testset "sphere plans are built on FFTW.jl's planner and leave its count a
     Test.@test FFTW.get_num_threads() == 3
     Test.@test !islocked(FFTW.fftwlock)
     sp = NUFSHT.make_spin_plan(θ, φ, 8, 1; ntrans = 2)
-    Test.@test sp.engine isa NUFSHT._FTSpinEngine
+    Test.@test sp.engine isa NUFSHT._RingEngine
     Test.@test FFTW.get_num_threads() == 3
     Test.@test !islocked(FFTW.fftwlock)
     NUFSHT.close!(p); NUFSHT.close!(sp)
@@ -207,40 +206,31 @@ Test.@testset "a plan's FastTransforms calls run at its thread count" begin
     lmax, M, B = 8, 300, 2
     θ = acos.(2 .* rand(M) .- 1); φ = 2π .* rand(M)
     kw = (; nufft = FTB.FINUFFTBackend(), ntrans = B)
-    serial = (NUFSHT.make_plan(Float64, θ, φ, lmax; kw..., execution = CB.SerialBackend()),
-              NUFSHT.make_spin_plan(θ, φ, lmax, 1; kw..., execution = CB.SerialBackend()))
-    threaded = (NUFSHT.make_plan(Float64, θ, φ, lmax; kw..., execution = CB.ThreadedBackend(), nthreads = 3),
-                NUFSHT.make_spin_plan(θ, φ, lmax, 1; kw..., execution = CB.ThreadedBackend(), nthreads = 3))
-    Test.@test serial[2].engine isa NUFSHT._FTSpinEngine && threaded[2].engine isa NUFSHT._FTSpinEngine
+    serial = NUFSHT.make_plan(Float64, θ, φ, lmax; kw..., execution = CB.SerialBackend())
+    threaded = NUFSHT.make_plan(Float64, θ, φ, lmax; kw..., execution = CB.ThreadedBackend(), nthreads = 3)
     Test.@test _omp_threads() == 5
 
     r = Ref(0)
-    for p in serial
-        Test.@test p.ntasks == 1
-        NUFSHT._ft_lmul!(_OMPProbe(), r, p)
-        Test.@test r[] == 1
-    end
-    for p in threaded
-        Test.@test p.ntasks == 3
-        NUFSHT._ft_lmul!(_OMPProbe(), r, p)
-        Test.@test r[] == 3
-        Base.ScopedValues.with(() -> NUFSHT._ft_lmul!(_OMPProbe(), r, p), FTB.FASTTRANSFORMS_THREADS => 1)
-        Test.@test r[] == 1
-        rs = (Ref(0), Ref(0))
-        NUFSHT._pool_columns!((q, b) -> NUFSHT._ft_lmul!(_OMPProbe(), q, p), (Ref(0),),
-                              [(rs[1],), (rs[2],)], 2)
-        Test.@test rs[1][] == 1 && rs[2][] == 1
-    end
+    Test.@test serial.ntasks == 1
+    NUFSHT._ft_lmul!(_OMPProbe(), r, serial)
+    Test.@test r[] == 1
+    Test.@test threaded.ntasks == 3
+    NUFSHT._ft_lmul!(_OMPProbe(), r, threaded)
+    Test.@test r[] == 3
+    Base.ScopedValues.with(() -> NUFSHT._ft_lmul!(_OMPProbe(), r, threaded), FTB.FASTTRANSFORMS_THREADS => 1)
+    Test.@test r[] == 1
+    rs = (Ref(0), Ref(0))
+    NUFSHT._pool_columns!((q, b) -> NUFSHT._ft_lmul!(_OMPProbe(), q, threaded), (Ref(0),),
+                          [(rs[1],), (rs[2],)], 2)
+    Test.@test rs[1][] == 1 && rs[2][] == 1
     Test.@test _omp_threads() == 5
 
-    # The transforms of both kinds of plan, through the single column and the column pool.
+    # The transforms, through the single column and the column pool.
     C = randn(lmax + 1, 2lmax + 1, B); f = zeros(M, B)
-    sf = randn(ComplexF64, lmax + 1, 2lmax + 1, B); g = zeros(ComplexF64, M, B)
-    for (sc, sp) in (serial, threaded)
-        NUFSHT.nusht_type2!(f, C, sc); NUFSHT.nusht_type1!(C, f, sc)
-        NUFSHT.nusht_type2_spin!(g, sf, sp); NUFSHT.nusht_type1_spin!(sf, g, sp)
+    for p in (serial, threaded)
+        NUFSHT.nusht_type2!(f, C, p); NUFSHT.nusht_type1!(C, f, p)
         Test.@test _omp_threads() == 5
     end
-    foreach(NUFSHT.close!, (serial..., threaded...))
+    foreach(NUFSHT.close!, (serial, threaded))
     NUFSHT.FastTransforms.ft_set_num_threads(prev)
 end
