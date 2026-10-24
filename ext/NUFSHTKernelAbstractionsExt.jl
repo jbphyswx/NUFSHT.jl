@@ -6,8 +6,8 @@ dispatched on `GPUArraysCore.AbstractGPUArray`. They run on any KernelAbstractio
 Metal, oneAPI, and the `JLArray` / KA-CPU reference backends) and take precedence over the host methods
 for a device array.
 
-The kernels cover the scalar mode assembly and its adjoint, the spin Wigner recurrence and contraction,
-the solver's per-column steps, the weighted strengths and Hermitian projection of an analysis, the
+The kernels cover the scalar mode assembly and its adjoint, the spin ring S-step and its adjoint, the
+solver's per-column steps, the weighted strengths and Hermitian projection of an analysis, the
 scalar ↔ spin-0 conversions and the spectral filter. The NUFFT goes through the `_nufft_*` functions to
 FlowTransformBindings, which builds the plan on the nodes' device.
 
@@ -18,7 +18,7 @@ module NUFSHTKernelAbstractionsExt
 using NUFSHT: NUFSHT
 # `@kernel`, `@index` and `@Const` are imported by bare name: the `@kernel` macro recognizes the DSL
 # keywords only unqualified, and a qualified `KA.@index` is not rewritten and miscompiles.
-using KernelAbstractions: KernelAbstractions, @kernel, @index, @Const
+using KernelAbstractions: KernelAbstractions, @kernel, @index, @Const, @localmem, @private, @synchronize
 using GPUArraysCore: GPUArraysCore
 using ComputationalBackends: ComputationalBackends
 
@@ -75,121 +75,225 @@ function NUFSHT._assemble_modes_adjoint!(G::GPUArraysCore.AbstractGPUArray, Z, l
     return G
 end
 
-# ── Device spin S-engine: the blocked plane build and contraction of `src/Spin.jl` ──
-# A block of `K` degrees is three launches: the quarter planes from the stored `m = ℓ` columns, one
-# workitem per (row, degree); their lower triangles by transpose; and the contraction, one workitem per
-# output entry, summing the block's degrees in ascending order as the host does. Launches on one
-# backend run in order, so only a host read needs a sync.
+# ── Device spin S-step: the ring recurrence of `src/RingEngine.jl` ──────────────────
+# Forward: one workitem per (ring, order, column) carries `d^ℓ_{m,−s}` up the degrees and writes its
+# ring value and its reflection into the circle `C`; one batched FFT along the circle; a gather into the
+# rows of `G`. Adjoint: the transpose, the sum over rings of each degree a workgroup reduction, one
+# workgroup per (ring block, order, column), the blocks added by a last kernel. The step coefficients
+# are tables over `(ℓ, |m|)`, `c₊` and `c₋` stored for `m ≥ 0`: `c₊(−m) = −c₋(m)`, `c₋(−m) = −c₊(m)`.
+# Launches on one backend run in order, so only a host read needs a sync.
 
-# Quarter planes per block on a device.
-const _DEVICE_PLANES = 32
-NUFSHT._plane_count(::GPUArraysCore.AbstractGPUArray, ::Integer) = _DEVICE_PLANES
+"""
+    _RingDevice
 
-# Row `n` of plane `k` (degree `ℓ0 + k − 1`): its column `m = ℓ`, then the downward recurrence in `m` on
-# `n ≤ m`. A row depends on itself alone, and consecutive workitems touch consecutive addresses.
-@kernel function _quarter_kern!(P, @Const(bnd), ℓ0)
-    i, k = @index(Global, NTuple)
-    n = i - 1; ℓ = ℓ0 + k - 1
-    RT = eltype(P)
-    if n <= ℓ
+A device ring engine's buffers: the circle `C`, `(N, 2lmax+1, B)`; the adjoint's per-block degree sums
+`P`, `(lmax+1, nblk, 2lmax+1, B)`; the step coefficient tables `A`, `Cp`, `Cm`, `Γ` (`α`, `c₊`, `c₋`,
+`γ`), `(lmax+1, lmax+1)`; the in-place FFTs along the circle; and the adjoint's workgroup width `wg`.
+"""
+struct _RingDevice{CA, PA, MA, PF, PB}
+    C::CA
+    P::PA
+    A::MA
+    Cp::MA
+    Cm::MA
+    Γ::MA
+    fwd::PF
+    bwd::PB
+    wg::Int
+end
+
+# The coefficient tables of `n = −s` in `R`, formed in `Float64`.
+function _ring_coeff_tables(::Type{R}, lmax::Int, n::Int) where {R}
+    A, Cp, Cm, Γ = (zeros(R, lmax + 1, lmax + 1) for _ in 1:4)
+    for μ in 0:lmax, ℓ in max(μ, abs(n)):lmax
+        α, c₊, c₋, γ = NUFSHT._ring_coeffs(promote_type(R, Float64), ℓ, μ, n)
+        A[ℓ + 1, μ + 1] = α; Cp[ℓ + 1, μ + 1] = c₊; Cm[ℓ + 1, μ + 1] = c₋; Γ[ℓ + 1, μ + 1] = γ
+    end
+    return A, Cp, Cm, Γ
+end
+
+# The ring S-step for a device plan over nodes `θ`, in their element type; its starting values in
+# `Float64` where the device has it.
+function NUFSHT._spin_engine(θ::GPUArraysCore.AbstractGPUArray{R}, lmax::Int, s::Int, ::Int,
+                             B::Int) where {R}
+    backend = KernelAbstractions.get_backend(θ)
+    S = KernelAbstractions.supports_float64(backend) ? promote_type(R, Float64) : R
+    nring = NUFSHT._ring_samples(lmax) ÷ 2 + 1
+    t = NUFSHT._ring_tables(R, S, lmax, s, nring)
+    dev(a) = NUFSHT._to_like(θ, a)
+    A, Cp, Cm, Γ = _ring_coeff_tables(R, lmax, -s)
+    C = NUFSHT._zeros_like(θ, Complex{R}, t.N, 2lmax + 1, B)
+    wg = min(1024, nextpow(2, nring))
+    P = NUFSHT._zeros_like(θ, Complex{R}, lmax + 1, cld(nring, wg), 2lmax + 1, B)
+    work = _RingDevice(C, P, dev(A), dev(Cp), dev(Cm), dev(Γ), NUFSHT.FFTW.plan_fft!(C, 1),
+                       NUFSHT.FFTW.plan_bfft!(C, 1), wg)
+    return NUFSHT._RingEngine(t.N, t.nring, NUFSHT._ring_check_interval(R, lmax), dev(t.u), dev(t.pos),
+                              dev(t.x), dev(t.xl), dev(t.lc), dev(t.ls), dev(t.lC), dev(t.p1), dev(t.p2),
+                              dev(t.sg), work)
+end
+
+# `(α, c₊, c₋, γ)` of the step from `ℓ` at order `m` from the tables.
+@inline function _ring_table_coeffs(A, Cp, Cm, Γ, ℓ::Int, m::Int)
+    μ = abs(m) + 1
+    α, p, q, γ = @inbounds (A[ℓ + 1, μ], Cp[ℓ + 1, μ], Cm[ℓ + 1, μ], Γ[ℓ + 1, μ])
+    neg = m < 0
+    return α, ifelse(neg, -q, p), ifelse(neg, -p, q), γ
+end
+
+# One degree up from `(y, e)` at a ring on side `pos`, by the host's step.
+@inline function _ring_device_step(A, Cp, Cm, Γ, ℓ::Int, m::Int, pos::Bool, u, y, e)
+    α, c₊, c₋, γ = _ring_table_coeffs(A, Cp, Cm, Γ, ℓ, m)
+    σα, c, σγ, σ = NUFSHT._ring_signed(pos, α, c₊, c₋, γ)
+    e′ = NUFSHT._ring_e(σα, c, σγ, u, y, e)
+    return NUFSHT._ring_y(σ, y, e′), e′
+end
+
+@kernel function _ring_forward_kern!(C, @Const(sf), @Const(u), @Const(pos), @Const(lc), @Const(ls),
+                                     @Const(lC), @Const(p1), @Const(p2), @Const(sg), @Const(A), @Const(Cp),
+                                     @Const(Cm), @Const(Γ), lmax, s, N, nring)
+    j, i, b = @index(Global, NTuple)
+    R = eltype(u)
+    m = i - lmax - 1
+    up, dn = NUFSHT._ring_bounds(R)
+    @inbounds begin
+        y, k = NUFSHT._ring_start(R, lC[i], p1[i], p2[i], sg[i], lc[j], ls[j])
+        uj = u[j]; pj = pos[j]
+        e = y
+        acc = zero(Complex{R})
+        for ℓ in max(abs(m), abs(s)):lmax
+            c = Complex{R}(sf[ℓ + 1, i, b]) * NUFSHT._ring_norm(R, ℓ)
+            acc += c * (y * NUFSHT._ring_weight(k, dn))
+            yn, en = _ring_device_step(A, Cp, Cm, Γ, ℓ, m, pj, uj, y, e)
+            big = (k < Int32(0)) & (abs(yn) > up)
+            sc = ifelse(big, dn, one(R))
+            e = en * sc; y = yn * sc; k += Int32(big)
+        end
+        C[j, i, b] = acc
+        if 1 < j < nring
+            C[N - j + 2, i, b] = NUFSHT._parity(R, m + s) * acc
+        end
+    end
+end
+
+# Row `r` of the layout holds `m' = r − 1 + mp0`: `mp0 = −lmax` on the full layout, `0` on a folded one.
+@kernel function _ring_modes_kern!(G, @Const(C), N, mp0)
+    r, i, b = @index(Global, NTuple)
+    R = real(eltype(C))
+    @inbounds G[r, i, b] = eltype(G)(C[mod(r - 1 + mp0, N) + 1, i, b] / R(N))
+end
+
+@kernel function _ring_scatter_kern!(C, @Const(Ĝ), N, mp0)
+    r, i, b = @index(Global, NTuple)
+    @inbounds C[mod(r - 1 + mp0, N) + 1, i, b] = Ĝ[r, i, b]
+end
+
+# Rows `1 … nring` of `C` become the transpose of the reflection and of `1/N`; a row reads only rows
+# past `nring`, which no workitem writes.
+@kernel function _ring_half_kern!(C, lmax, s, N, nring)
+    j, i, b = @index(Global, NTuple)
+    R = real(eltype(C))
+    @inbounds if j == 1 || j == nring
+        C[j, i, b] = C[j, i, b] / R(N)
+    else
+        C[j, i, b] = (C[j, i, b] + NUFSHT._parity(R, i - lmax - 1 + s) * C[N - j + 2, i, b]) / R(N)
+    end
+end
+
+# Each degree's `Σ_rings d^ℓ h` over a block of `WG` rings, into `P[ℓ+1, block, i, b]`. State a
+# workitem carries across a barrier is in `@private` arrays, and everything else is formed again after
+# each barrier.
+@kernel function _ring_adjoint_kern!(P, @Const(C), @Const(u), @Const(pos), @Const(lc), @Const(ls),
+                                     @Const(lC), @Const(p1), @Const(p2), @Const(sg), @Const(A), @Const(Cp),
+                                     @Const(Cm), @Const(Γ), lmax, s, nring, ::Val{WG}) where {WG}
+    t = @index(Local, Linear)
+    blk, i, b = @index(Group, NTuple)
+    st = @private eltype(u) (4,)            # y, e, Re h, Im h
+    kk = @private Int32 (1,)
+    sr = @localmem eltype(u) (WG,)
+    si = @localmem eltype(u) (WG,)
+    @inbounds begin
+        j = (blk - 1) * WG + t
+        if j <= nring
+            y0, k0 = NUFSHT._ring_start(eltype(u), lC[i], p1[i], p2[i], sg[i], lc[j], ls[j])
+            st[1] = y0; st[2] = y0; kk[1] = k0
+            st[3] = real(C[j, i, b]); st[4] = imag(C[j, i, b])
+        else
+            st[1] = zero(eltype(u)); st[2] = zero(eltype(u)); kk[1] = Int32(0)
+            st[3] = zero(eltype(u)); st[4] = zero(eltype(u))
+        end
+    end
+    for ℓ in 0:lmax
         @inbounds begin
-            P[n + 1, ℓ + 1, k] = bnd[n + 1, ℓ + 1]
-            for m in (ℓ - 1):-1:n
-                c1 = RT(2) / sqrt(RT(ℓ - m) * RT(ℓ + m + 1))
-                if m == ℓ - 1
-                    P[n + 1, m + 1, k] = c1 * RT(n) * P[n + 1, m + 2, k]
-                else
-                    s2 = sqrt(RT(ℓ - m - 1) * RT(ℓ + m + 2) / (RT(ℓ - m) * RT(ℓ + m + 1)))
-                    P[n + 1, m + 1, k] = c1 * RT(n) * P[n + 1, m + 2, k] - s2 * P[n + 1, m + 3, k]
+            R = eltype(u)
+            m = i - lmax - 1
+            up, dn = NUFSHT._ring_bounds(R)
+            on = ℓ >= max(abs(m), abs(s))
+            v = ifelse(on, st[1] * NUFSHT._ring_weight(kk[1], dn), zero(R))
+            sr[t] = v * st[3]; si[t] = v * st[4]
+            if on
+                jj = min((blk - 1) * WG + t, nring)
+                k = kk[1]
+                yn, en = _ring_device_step(A, Cp, Cm, Γ, ℓ, m, pos[jj], u[jj], st[1], st[2])
+                big = (k < Int32(0)) & (abs(yn) > up)
+                sc = ifelse(big, dn, one(R))
+                st[2] = en * sc; st[1] = yn * sc; kk[1] = k + Int32(big)
+            end
+        end
+        @synchronize
+        for lev in 1:trailing_zeros(WG)
+            @inbounds begin
+                h = WG >> lev
+                if t <= h
+                    sr[t] += sr[t + h]; si[t] += si[t + h]
                 end
             end
+            @synchronize
         end
+        @inbounds if t == 1
+            P[ℓ + 1, blk, i, b] = complex(sr[1], si[1])
+        end
+        @synchronize
     end
 end
 
-# `Δ_{n,m} = (−1)^{m+n} Δ_{m,n}` below the diagonal; it reads only above it.
-@kernel function _quarter_transpose_kern!(P, ℓ0)
-    i, j, k = @index(Global, NTuple)
-    n = i - 1; m = j - 1
-    if m < n <= ℓ0 + k - 1
-        @inbounds P[n + 1, m + 1, k] = NUFSHT._parity(eltype(P), m + n) * P[m + 1, n + 1, k]
+@kernel function _ring_blocks_kern!(sf, @Const(P), nblk)
+    r, i, b = @index(Global, NTuple)
+    R = real(eltype(P))
+    acc = zero(eltype(P))
+    @inbounds for q in 1:nblk
+        acc += P[r, q, i, b]
     end
-end
-
-# `G_{m'm} += Σ_ℓ i^{m+s} N_ℓ sf_{ℓm} Δ^ℓ_{m'm} Δ^ℓ_{m',−s}` over the block, one workitem per entry.
-# Row `i` holds `m' = i − 1 + mp0`: `mp0 = −lmax` on the full layout, `0` on a folded one.
-@kernel function _contract_block_kern!(G, @Const(P), @Const(sf), ℓ0, ℓ1, s, lmax, mp0)
-    i, j, b = @index(Global, NTuple)
-    mp = i - 1 + mp0; m = j - 1 - lmax
-    CT = eltype(G); RT = real(CT)
-    @inbounds begin
-        acc = G[i, j, b]
-        ph0 = NUFSHT._im_pow(CT, -(m + s))
-        for ℓ in max(ℓ0, abs(mp), abs(m)):ℓ1
-            ph = ph0 * sqrt(RT(2ℓ + 1) / (4 * RT(π))) * sf[ℓ + 1, j, b]
-            acc += ph * NUFSHT._qprod(P, ℓ - ℓ0 + 1, RT, ℓ, mp, m, s)
-        end
-        G[i, j, b] = acc
-    end
-end
-
-# `sf_{ℓm} = conj(i^{m+s}) N_ℓ Σ_{m'} Δ^ℓ_{m'm} Δ^ℓ_{m',−s} Ĝ_{m'm}`, one workitem per (order, column,
-# degree of the block).
-@kernel function _contract_block_adj_kern!(sf, @Const(P), @Const(Ĝ), ℓ0, s, lmax, mp0)
-    j, b, k = @index(Global, NTuple)
-    m = j - 1 - lmax; ℓ = ℓ0 + k - 1
-    CT = eltype(sf); RT = real(CT)
-    if abs(m) <= ℓ
-        @inbounds begin
-            acc = zero(CT)
-            for mp in max(mp0, -ℓ):ℓ
-                acc += NUFSHT._qprod(P, k, RT, ℓ, mp, m, s) * Ĝ[mp - mp0 + 1, j, b]
-            end
-            sf[ℓ + 1, j, b] = conj(NUFSHT._im_pow(CT, -(m + s))) * sqrt(RT(2ℓ + 1) / (4 * RT(π))) * acc
-        end
-    end
+    @inbounds sf[r, i, b] = eltype(sf)(acc * NUFSHT._ring_norm(R, r - 1))
 end
 
 @inline _row_origin(G, lmax) = size(G, 1) == 2lmax + 1 ? -lmax : 0
 
-function _device_planes!(backend, eng::NUFSHT._WignerPlanes, ℓ0, ℓ1)
-    nb = ℓ1 - ℓ0 + 1
-    _quarter_kern!(backend)(eng.planes, eng.bnd, ℓ0; ndrange = (ℓ1 + 1, nb))
-    _quarter_transpose_kern!(backend)(eng.planes, ℓ0; ndrange = (ℓ1 + 1, ℓ1 + 1, nb))
-    return nothing
-end
-
-function NUFSHT._assemble_G_impl!(G::GPUArraysCore.AbstractGPUArray, sf,
-                                  plan::NUFSHT.SpinNUSHTplan{T}, eng::NUFSHT._WignerPlanes) where {T}
-    lmax = plan.lmax; K = size(eng.planes, 3)
+function NUFSHT._assemble_G_impl!(G::GPUArraysCore.AbstractGPUArray, sf, plan::NUFSHT.SpinNUSHTplan,
+                                  eng::NUFSHT._RingEngine)
+    lmax = plan.lmax; w = eng.work
     backend = KernelAbstractions.get_backend(G)
-    fill!(G, zero(Complex{T}))
-    mp0 = _row_origin(G, lmax)
-    ℓ0 = abs(plan.s)
-    while ℓ0 <= lmax
-        ℓ1 = min(lmax, ℓ0 + K - 1)
-        _device_planes!(backend, eng, ℓ0, ℓ1)
-        _contract_block_kern!(backend)(G, eng.planes, sf, ℓ0, ℓ1, plan.s, lmax, mp0; ndrange = size(G))
-        ℓ0 = ℓ1 + 1
-    end
+    _ring_forward_kern!(backend)(w.C, _as3(sf, lmax), eng.u, eng.pos, eng.lc, eng.ls, eng.lC, eng.p1, eng.p2,
+                                 eng.sg, w.A, w.Cp, w.Cm, w.Γ, lmax, plan.s, eng.N, eng.nring;
+                                 ndrange = (eng.nring, 2lmax + 1, plan.B))
+    w.bwd * w.C
+    _ring_modes_kern!(backend)(G, w.C, eng.N, _row_origin(G, lmax); ndrange = size(G))
     _sync(backend)
     return G
 end
 
-function NUFSHT._assemble_G_adjoint_impl!(sf::GPUArraysCore.AbstractGPUArray, Ĝ,
-                                          plan::NUFSHT.SpinNUSHTplan{T}, eng::NUFSHT._WignerPlanes) where {T}
-    lmax = plan.lmax; K = size(eng.planes, 3)
+function NUFSHT._assemble_G_adjoint_impl!(sf::GPUArraysCore.AbstractGPUArray, Ĝ, plan::NUFSHT.SpinNUSHTplan,
+                                          eng::NUFSHT._RingEngine)
+    lmax = plan.lmax; w = eng.work
     backend = KernelAbstractions.get_backend(sf)
-    fill!(sf, zero(Complex{T}))
-    mp0 = _row_origin(Ĝ, lmax)
-    ℓ0 = abs(plan.s)
-    while ℓ0 <= lmax
-        ℓ1 = min(lmax, ℓ0 + K - 1)
-        _device_planes!(backend, eng, ℓ0, ℓ1)
-        _contract_block_adj_kern!(backend)(sf, eng.planes, Ĝ, ℓ0, plan.s, lmax, mp0;
-                                           ndrange = (2lmax + 1, plan.B, ℓ1 - ℓ0 + 1))
-        ℓ0 = ℓ1 + 1
-    end
+    fill!(w.C, zero(eltype(w.C)))
+    _ring_scatter_kern!(backend)(w.C, Ĝ, eng.N, _row_origin(Ĝ, lmax); ndrange = size(Ĝ))
+    w.fwd * w.C
+    _ring_half_kern!(backend)(w.C, lmax, plan.s, eng.N, eng.nring; ndrange = (eng.nring, 2lmax + 1, plan.B))
+    nblk = size(w.P, 2)
+    _ring_adjoint_kern!(backend, (w.wg, 1, 1))(w.P, w.C, eng.u, eng.pos, eng.lc, eng.ls, eng.lC, eng.p1,
+                                               eng.p2, eng.sg, w.A, w.Cp, w.Cm, w.Γ, lmax, plan.s, eng.nring,
+                                               Val(w.wg); ndrange = (nblk * w.wg, 2lmax + 1, plan.B))
+    _ring_blocks_kern!(backend)(_as3(sf, lmax), w.P, nblk; ndrange = (lmax + 1, 2lmax + 1, plan.B))
     _sync(backend)
     return sf
 end
@@ -380,15 +484,5 @@ function NUFSHT.apply_transfer!(C::GPUArraysCore.AbstractGPUArray, filter, lmax)
     C .*= _device_transfer(C, filter, lmax)
     return C
 end
-
-# A precomputed WignerTable is a host array read elementwise, which a device contraction cannot read,
-# so a device plan refuses one.
-_no_device_table() = throw(ArgumentError(
-    "a device spin plan cannot use a precomputed WignerTable; build it with wigner_table = nothing " *
-    "so the Δ planes are generated on device by the recurrence kernels."))
-NUFSHT._assemble_G_impl!(::GPUArraysCore.AbstractGPUArray, sf, plan::NUFSHT.SpinNUSHTplan,
-                         ::NUFSHT.WignerTable) = _no_device_table()
-NUFSHT._assemble_G_adjoint_impl!(::GPUArraysCore.AbstractGPUArray, Ĝ, plan::NUFSHT.SpinNUSHTplan,
-                                 ::NUFSHT.WignerTable) = _no_device_table()
 
 end # module NUFSHTKernelAbstractionsExt

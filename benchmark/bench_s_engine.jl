@@ -4,12 +4,11 @@
 # evaluates. Two engines do that:
 #
 #   scalar : FastTransforms `plan_sph2fourier` (Givens rotations, triangular products), O(L³)
-#   spin   : the Wigner-d recurrence at s = 0, passed to `_assemble_G_impl!` as the engine, O(L³)
+#   spin   : the ring S-step of an s = 0 spin plan, O(L³): each order's degree sum on equispaced rings
+#            by the recurrence of `d^ℓ_{m,0}`, then one FFT per order
 #
-#     d^ℓ_{mn}(θ) = i^{m−n} Σ_{m'} Δ^ℓ_{m'm} Δ^ℓ_{m'n} e^{−im'θ},   Y_ℓm = N_ℓ d^ℓ_{m,0}(θ) e^{imφ}
-#
-# so at s = 0 the spin contraction is a scalar S-engine, threaded, Float32-generic and device-capable.
-# Only the S step is timed: no NUFFT, no real/complex basis conversion.
+# With `Y_ℓm = N_ℓ d^ℓ_{m,0}(θ) e^{imφ}`, the ring S-step at s = 0 is a scalar S-engine, threaded, in any
+# precision and on devices. Only the S step is timed: no NUFFT, no real/complex basis conversion.
 using NUFSHT: NUFSHT
 using FlowTransformBindings: FlowTransformBindings as FTB
 using FINUFFT: FINUFFT
@@ -29,9 +28,8 @@ function timed(f, n)
     return cold, warm
 end
 
-# Work the spin contraction does: Σ_ℓ (2ℓ+1)² triples, plus the same again for the Δ recurrence.
-# Reported next to the time so the O(L³) claim is checkable without a stopwatch.
-spin_triples(L) = sum((2ℓ + 1)^2 for ℓ in 0:L)
+# Ring steps of the s = 0 ring S-step: every order's degrees on every ring.
+ring_steps(eng, L) = sum(m -> (L - abs(m) + 1) * length(eng.u), -L:L)
 
 function main()
     Printf.@printf("julia -t%d | BLAS=%d | FFTW planner=%d | FastTransforms nthreads=%d\n",
@@ -43,8 +41,8 @@ function main()
             strip(read(`sysctl -n hw.ncpu`, String)))
     println("="^104)
     Printf.@printf("%-6s %-12s | %-11s %-11s | %-11s %-11s | %-9s %s\n",
-            "lmax", "spin triples", "S FastTr.", "(cold)", "S spin s=0", "(cold)",
-            "spin/FT", "verdict")
+            "lmax", "ring steps", "S FastTr.", "(cold)", "S ring s=0", "(cold)",
+            "ring/FT", "verdict")
 
     for lmax in (32, 64, 128, 256, 512)
         # A handful of points: the NUFFT is not timed here, but a plan needs nodes.
@@ -70,15 +68,14 @@ function main()
         # FastTransforms arm: exactly what `nusht_type2!` does for S — load the slice buffer, apply P.
         # `_sph_evaluate!` is in-place on plan.F, so the reload is part of the step, as in production.
         bc, bw = timed(() -> (copyto!(ps.F, C); NUFSHT._sph_evaluate!(ps)), 5)
-        # Recurrence arm: coefficients -> G, the same DFS Fourier coefficients, into the plan's mode
-        # buffer. A host Float64 spin plan runs FastTransforms, so the recurrence is passed as the engine.
-        eng = NUFSHT._wigner_planes(NUFSHT._θnodes(pg), lmax, pg.ntasks)
+        # Ring arm: coefficients -> G, the same DFS Fourier coefficients, into the plan's mode buffer.
+        eng = pg.engine
         gc, gw = timed(() -> NUFSHT._assemble_G_impl!(pg.G, sf, pg, eng), 5)
 
         r = gw / bw
         Printf.@printf("%-6d %-12.3g | %-11.3f %-11.3f | %-11.3f %-11.3f | %-9.2f %s\n",
-                lmax, float(spin_triples(lmax)), 1e3bw, 1e3bc, 1e3gw, 1e3gc, r,
-                r < 1 ? "recurrence wins" : "FastTransforms wins")
+                lmax, float(ring_steps(eng, lmax)), 1e3bw, 1e3bc, 1e3gw, 1e3gc, r,
+                r < 1 ? "ring wins" : "FastTransforms wins")
         flush(stdout)
         NUFSHT.close!(ps); NUFSHT.close!(pg)
     end
