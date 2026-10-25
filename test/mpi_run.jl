@@ -9,6 +9,7 @@
 using MPI: MPI
 using NUFSHT: NUFSHT
 using ComputationalBackends: ComputationalBackends
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FastSphericalHarmonics: FastSphericalHarmonics
 using Random: Random
 
@@ -72,6 +73,10 @@ Cw_mpi = zeros(Nθ, Nφ); Cw_all = zeros(Nθ, Nφ)
 check(wsolve(Cw_all, f_noisy, planfull, w_all)[4], "all-points weighted solve converged")
 check(wsolve(Cw_mpi, f_noisy[idx], plan_loc, w_all[idx], mpi)[4], "MPI weighted solve converged")
 check(rel(Cw_mpi, Cw_all) < 1e-8, "MPI weighted solve equals the all-points weighted solve")
+# This rank's weighted operator, built once, on the share of every rank's points.
+Co_mpi = zeros(Nθ, Nφ)
+NUFSHT.nusht_solve!(Co_mpi, f_noisy[idx], FTB.RangeWeighted(plan_loc, w_all[idx]), mpi; rtol = 1e-10, maxiter = 1000)
+check(rel(Co_mpi, Cw_all) < 1e-8, "MPI solve through a built weighted operator equals the all-points weighted solve")
 
 # The same for a complex spin-1 field, each rank's spin plan over its own points.
 u = complex.(f_noisy, f_band)
@@ -83,6 +88,9 @@ check(NUFSHT.nusht_solve_spin!(Sw_all, u, sp_all; weights = w_all, rtol = 1e-10,
 check(NUFSHT.nusht_solve_spin!(Sw_mpi, u[idx], sp_loc, mpi; weights = w_all[idx], rtol = 1e-10,
                                maxiter = 1000)[4], "MPI weighted spin solve converged")
 check(rel(Sw_mpi, Sw_all) < 1e-8, "MPI weighted spin solve equals the all-points weighted spin solve")
+So_mpi = NUFSHT.allocate_coefficients(sp_loc)
+NUFSHT.nusht_solve_spin!(So_mpi, u[idx], FTB.RangeWeighted(sp_loc, w_all[idx]), mpi; rtol = 1e-10, maxiter = 1000)
+check(rel(So_mpi, Sw_all) < 1e-8, "MPI spin solve through a built weighted operator equals the all-points one")
 NUFSHT.close!(sp_all); NUFSHT.close!(sp_loc)
 
 # `make_plan(…; execution = MPIBackend())` takes every point and takes and returns whole fields.

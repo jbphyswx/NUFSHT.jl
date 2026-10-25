@@ -21,6 +21,9 @@ function NUFSHT._nufft_exec!(p::HostBouncePlan, input, output)
     return copyto!(output, hout)
 end
 
+# JLArrays' backend runs each kernel to completion before returning and defines no `synchronize`.
+KernelAbstractions.synchronize(::JLArrays.JLBackend) = nothing
+
 # An FFT for JLArrays, which has none, in the same way: each execution moves its array across in bulk.
 const _AbstractFFTs = NUFSHT.FFTW.AbstractFFTs
 struct HostBounceFFT{P}

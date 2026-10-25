@@ -3,8 +3,7 @@
 
 Device-generic methods for the array-indexed steps of the transform, as KernelAbstractions `@kernel`s
 dispatched on `GPUArraysCore.AbstractGPUArray`. They run on any KernelAbstractions backend (CUDA, ROCm,
-Metal, oneAPI, and the `JLArray` / KA-CPU reference backends) and take precedence over the host methods
-for a device array.
+Metal, oneAPI, the CPU backend) and take precedence over the host methods for a device array.
 
 The kernels cover the scalar mode assembly and its adjoint, the spin ring S-step and its adjoint, the
 solver's per-column steps, the weighted strengths and Hermitian projection of an analysis, the
@@ -32,9 +31,9 @@ NUFSHT._make_spin_plan(::Type{FE}, θ, φ, lmax, s, b::ComputationalBackends.GPU
     NUFSHT._build_spin_plan(FE, _on_device(b, θ), _on_device(b, φ), lmax, s; kwargs...)
 
 # Kernel launches are asynchronous on device backends (CUDA/ROCm/…), so results are synchronized before
-# the host reads them; JLArrays' reference backend is synchronous and defines no `synchronize`.
+# the host reads them.
 @inline function _sync(backend)
-    applicable(KernelAbstractions.synchronize, backend) && KernelAbstractions.synchronize(backend)
+    KernelAbstractions.synchronize(backend)
     return nothing
 end
 

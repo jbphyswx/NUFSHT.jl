@@ -3,13 +3,16 @@
 # `A = N·F·S`: the Legendre step (FastTransforms butterfly), the mode assembly, and the NUFFT. Nothing
 # should be optimised before this says which of them dominates, and at which sizes.
 #
-# Three rules, each answering a way an earlier measurement in this package went wrong:
+# Three rules:
 #   * self-describing — every run prints its resolved backend and every thread count, because a flat or
 #     surprising number is a configuration smell before it is a finding;
 #   * counts beside times — grid cells and spread points, so a complexity claim is checkable without a
 #     stopwatch;
 #   * cold and warm separately — a min-over-repeats hides first-call specialization, and for a shape
 #     used once that is the number the user actually experiences.
+#
+# The last two columns are the fit with every setting at its default, run to convergence: its LSMR
+# iterations, and its time as a multiple of one synthesis and one adjoint, the work each iteration does.
 using NUFSHT: NUFSHT
 using FlowTransformBindings: FlowTransformBindings as FTB
 using FINUFFT: FINUFFT
@@ -28,7 +31,7 @@ function timed(f, n)
     return cold, warm
 end
 
-# Oversampled grid the backend actually plans, so the FFT's size is reported rather than assumed.
+# The smallest 5-smooth size at or above `n`, the oversampled grid size the backend plans.
 function smooth(n::Integer)
     m = Int(n)
     while true
@@ -49,10 +52,10 @@ function header()
             NUFSHT.FFTW.get_num_threads(),
             ccall((:omp_get_max_threads, NUFSHT.FastTransforms.libfasttransforms), Cint, ()),
             strip(read(`sysctl -n vm.loadavg`, String)))
-    println("="^118)
-    Printf.@printf("%-5s %-8s %-9s %-15s | %-8s %-8s %-8s | %-7s | %-8s %-9s | %s\n",
+    println("="^140)
+    Printf.@printf("%-5s %-8s %-9s %-15s | %-8s %-8s %-8s | %-7s | %-8s %-9s | %-8s | %-7s %s\n",
             "lmax", "M", "backend", "grid (σ-rounded)", "S", "F", "N", "S share",
-            "type2", "solve/it", "plan MiB")
+            "type2", "solve/it", "plan MiB", "fit it", "fit/pair")
 end
 
 function run(lmax, M, FE, be, tol = 1e-8)
@@ -81,12 +84,16 @@ function run(lmax, M, FE, be, tol = 1e-8)
     _, tsolve = timed(() -> NUFSHT.nusht_solve!(S, f, p; ws = ws, rtol = 1e-6, maxiter = 20), 2)
     _, iters, = NUFSHT.nusht_solve!(S, f, p; ws = ws, rtol = 1e-6, maxiter = 20)
 
+    _, t1 = timed(() -> NUFSHT.nusht_type1!(S, f, p), 5)
+    _, tfit = timed(() -> NUFSHT.nusht_solve!(S, f, p; ws = ws), 1)
+    fit = NUFSHT.nusht_solve!(S, f, p; ws = ws)
+
     g1, g2 = smooth(round(Int, 1.25 * (2lmax + 3))), smooth(round(Int, 1.25 * (2lmax + 1)))
     mem = NUFSHT.plan_memory(p)
-    Printf.@printf("%-5d %-8d %-9s %-15s | %-8.3f %-8.3f %-8.3f | %-6.0f%% | %-8.3f %-9.3f | %.1f\n",
+    Printf.@printf("%-5d %-8d %-9s %-15s | %-8.3f %-8.3f %-8.3f | %-6.0f%% | %-8.3f %-9.3f | %-8.1f | %-7d %.1f\n",
             lmax, M, be isa FTB.FINUFFTBackend ? "FINUFFT" : "NUFFTs",
             string(g1, "x", g2), 1e3tS, 1e3tF, 1e3tN, 100 * tS / t2,
-            1e3t2, 1e3tsolve / max(iters, 1), mem.total / 2^20)
+            1e3t2, 1e3tsolve / max(iters, 1), mem.total / 2^20, fit.iterations, tfit / (t2 + t1))
     NUFSHT.close!(p)
     return nothing
 end

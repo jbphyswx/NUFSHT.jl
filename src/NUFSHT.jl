@@ -560,15 +560,21 @@ nusht_solve!(C, f, plan::NUSHTplan; ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(pl
 
 """
     nusht_solve!(C, f_local, plan, execution; ws, weights = nothing, …) -> (; C, iterations, residual, converged)
+    nusht_solve!(C, f_local, FlowTransformBindings.RangeWeighted(plan, weights), execution; ws, …)
 
 The fit over the points of every process `execution` names, `plan`, `f_local` and `weights` being this
 process's: under `MPIBackend(; comm)` (with MPI loaded) each rank's share, the coefficients replicated
 on every rank of `comm`. A local or `AutoBackend()` backend names this process alone, and gives
-`nusht_solve!(C, f_local, plan)`. The keywords are those of `nusht_solve!(C, f, plan)`.
+`nusht_solve!(C, f_local, plan)`. The keywords are those of `nusht_solve!(C, f, plan)`; the second form
+takes this process's weighted operator built once.
 """
 nusht_solve!(C, f_local, plan::NUSHTplan, execution::ComputationalBackends.AbstractExecutionBackend;
              ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan), weights = nothing, kwargs...) =
     _solve!(C, f_local, _weighted(_point_share(plan, execution), weights), ws; kwargs...)
+
+nusht_solve!(C, f_local, op::FTB.RangeWeighted{<:NUSHTplan}, execution::ComputationalBackends.AbstractExecutionBackend;
+             ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(op), kwargs...) =
+    _solve!(C, f_local, _weighted_share(op, execution), ws; kwargs...)
 
 _weighted(plan, ::Nothing) = plan
 _weighted(plan, weights) = FTB.RangeWeighted(plan, weights)
@@ -578,6 +584,10 @@ _weighted(plan, weights) = FTB.RangeWeighted(plan, weights)
 _point_share(op, ::_OneProcess) = op
 _point_share(op, e::ComputationalBackends.AbstractExecutionBackend) =
     _execution_unavailable(e, "a point-decomposed solve")
+
+# A weighted operator's weights on the share of its plan's points `execution` names.
+_weighted_share(op::FTB.RangeWeighted, ::_OneProcess) = op
+_weighted_share(op::FTB.RangeWeighted, execution) = FTB.RangeWeighted(_point_share(op.op, execution), op)
 
 nusht_solve!(C, f, op::FTB.RangeWeighted{<:NUSHTplan}; ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(op),
              kwargs...) =

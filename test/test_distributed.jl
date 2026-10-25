@@ -15,9 +15,9 @@ Test.@testset "Distributed extension: farm over worker processes" begin
             using FlowTransformBindings: FlowTransformBindings as FTB
         end
 
-        # A problem runs on a worker, with FastTransforms at the worker's own thread count.
-        runs = ext._farm(i -> (Distributed.myid(), Threads.nthreads(), FTB.FASTTRANSFORMS_THREADS[]), 4)
-        Test.@test all(r -> r[1] in added && r[2] == 2 && r[3] == 2, runs)
+        # The farm runs each item on a worker.
+        runs = ext._farm(_ -> (Distributed.myid(), Threads.nthreads()), 1:4)
+        Test.@test length(runs) == 4 && all(r -> r[1] in added && r[2] == 2, runs)
 
         Random.seed!(21)
         lmax = 10
@@ -99,6 +99,11 @@ Test.@testset "Distributed extension: farm over worker processes" begin
         rq = NUFSHT.nusht_analyze!(Ad, g, dp; weights = wq)
         Test.@test rq.iterations == 0 && rq.converged
         Test.@test relerr(Ad[:, :, 1], quadrature_ref(g, wq, lmax, θ, φ)) < 1e-9
+        # The weighted fit, each worker weighing its block, against the weighted fit on the calling process.
+        Cws = NUFSHT.allocate_coefficients(serial); Cwd = NUFSHT.allocate_coefficients(dp)
+        NUFSHT.nusht_solve!(Cws, g, serial; weights = wq, rtol = 1e-10, maxiter = 1000)
+        NUFSHT.nusht_solve!(Cwd, g, dp; weights = wq, rtol = 1e-10, maxiter = 1000)
+        Test.@test relerr(Cwd, Cws) < 1e-8
         gs = zeros(M); gd = zeros(M)
         NUFSHT.nusht_filter!(gs, g, filt, serial; rtol = 1e-10, maxiter = 1000)
         NUFSHT.nusht_filter!(gd, g, filt, dp; rtol = 1e-10, maxiter = 1000)

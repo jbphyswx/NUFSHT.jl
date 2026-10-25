@@ -154,4 +154,20 @@ function rand_coeffs(lmax::Integer, seed::Integer, B::Integer = 1)
     return B == 1 ? C[:, :, 1] : C
 end
 
+# Random spin coefficients for `ℓ ≥ max(|m|, |s|)`, Hermitian when `hermitian`: the coefficients of a real
+# spin-0 field.
+function _spin_coeffs(lmax, s, seed; hermitian = false)
+    Random.seed!(seed)
+    sf = zeros(ComplexF64, lmax + 1, 2lmax + 1)
+    for ℓ in abs(s):lmax
+        sf[NUFSHT.spin_coeff_index(ℓ, 0, lmax)] = hermitian ? randn() : randn(ComplexF64)
+        for m in 1:ℓ
+            a = randn(ComplexF64)
+            sf[NUFSHT.spin_coeff_index(ℓ, m, lmax)] = a
+            sf[NUFSHT.spin_coeff_index(ℓ, -m, lmax)] = hermitian ? (-1)^m * conj(a) : randn(ComplexF64)
+        end
+    end
+    return sf
+end
+
 relerr(a, b) = sqrt(sum(abs2, a .- b) / sum(abs2, b))

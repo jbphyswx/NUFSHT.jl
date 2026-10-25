@@ -550,14 +550,15 @@ _fold!(v, plan::SpinNUSHTplan, w, c, n::Integer, ::Union{FoldedComplex,FoldedRea
                       maxiter = 500, rtol = 1e-6, conlim = 0)
     nusht_solve_spin!(sf, f, FlowTransformBindings.RangeWeighted(plan, weights); ws, …)
     nusht_solve_spin!(sf, f_local, plan, execution; ws, weights = nothing, …)
+    nusht_solve_spin!(sf, f_local, FlowTransformBindings.RangeWeighted(plan, weights), execution; ws, …)
 
 Exact inversion of the spin-weighted synthesis at arbitrary scattered points: solve
 `min ‖A sf − f‖` by LSMR on the Golub–Kahan bidiagonalization of `A`. Batched (`B > 1`) runs the
 columns as independent single-column solves. Same contract, return and `weights` as
 [`nusht_solve!`](@ref): `weights`, nonnegative and one per point, makes the fit
-`min Σⱼ wⱼ |(A sf − f)ⱼ|²`, a zero weight leaving its point out, and the second form takes that weighted operator built once. The
-four-argument form is the fit over the points of every process `execution` names, `plan`, `f_local` and
-`weights` being this process's.
+`min Σⱼ wⱼ |(A sf − f)ⱼ|²`, a zero weight leaving its point out, and the forms taking a
+`RangeWeighted` take that weighted operator built once. The four-argument forms are the fit over the
+points of every process `execution` names, `plan`, `f_local` and `weights` being this process's.
 
 On a real-field plan the fit runs over the `(lmax+1)²` real degrees of a real field's coefficients
 (`_hermitian_domain`), a quarter of the unknowns.
@@ -583,6 +584,13 @@ function nusht_solve_spin!(sf, f_local, plan::SpinNUSHTplan, execution::Computat
                            ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan), weights = nothing, kwargs...)
     _check_spin_solvable(plan)
     return _solve!(sf, f_local, _weighted(_point_share(plan, execution), weights), ws; kwargs...)
+end
+
+function nusht_solve_spin!(sf, f_local, op::FTB.RangeWeighted{<:SpinNUSHTplan},
+                           execution::ComputationalBackends.AbstractExecutionBackend;
+                           ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(op), kwargs...)
+    _check_spin_solvable(op.op)
+    return _solve!(sf, f_local, _weighted_share(op, execution), ws; kwargs...)
 end
 
 # `nusht_analyze!` without weights on a spin plan: the fit.

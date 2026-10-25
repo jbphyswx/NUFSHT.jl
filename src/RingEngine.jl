@@ -266,20 +266,20 @@ Base.show(io::IO, e::_RingEngine{R}) where {R} =
 # One degree up across a chunk's lanes, on side `P`. The chunk's ring constants `g` select the form:
 # `u` lanes step in Reinsch's form from `(y, e)`, `(x, xl)` lanes in the plain one from `(y, y_{ℓ−1})`,
 # where the step coefficients read `(α, β, ·, γ)`.
-@inline function _ring_step(::Val{P}, α, c₊, c₋, γ, u::NTuple{L,R}, y, e) where {P,L,R<:AbstractFloat}
+@inline function _ring_step(::Val{P}, α, c₊, c₋, γ, u::Tuple{AbstractFloat,Vararg{AbstractFloat}}, y, e) where {P}
     σα, c, σγ, σ = _ring_signed(P, α, c₊, c₋, γ)
     e′ = map((uj, yj, ej) -> _ring_e(σα, c, σγ, uj, yj, ej), u, y, e)
     return map((yj, ej) -> _ring_y(σ, yj, ej), y, e′), e′
 end
-@inline _ring_step(::Val, α, β, _, γ, (x, xl)::Tuple{NTuple{L,R},NTuple{L,R}}, y, yo) where {L,R} =
+@inline _ring_step(::Val, α, β, _, γ, (x, xl)::Tuple{Tuple,Tuple}, y, yo) =
     map((xj, lj, yj, oj) -> muladd(muladd(α, xj, muladd(α, lj, β)), yj, -γ * oj), x, xl, y, yo), y
 
 # The ring constants of the chunk at `j0` its step reads, and the second state value at the start degree:
 # `e = y` in Reinsch's form, `y_{ℓ0−1} = 0` in the plain one.
 @inline _ring_geometry(eng::_RingEngine{R}, j0::Int) where {R} =
     _ring_reinsch(R) ? _load_lanes(eng.u, j0, R) : (_load_lanes(eng.x, j0, R), _load_lanes(eng.xl, j0, R))
-@inline _ring_e0(::NTuple{L,R}, y) where {L,R<:AbstractFloat} = y
-@inline _ring_e0(::Tuple{NTuple,NTuple}, y) = map(zero, y)
+@inline _ring_e0(::Tuple{AbstractFloat,Vararg{AbstractFloat}}, y) = y
+@inline _ring_e0(::Tuple{Tuple,Tuple}, y) = map(zero, y)
 
 # A scaled value above `up` and its `e` scaled by `dn` together.
 @inline function _ring_rescale(y, e, k, up::R, dn::R) where {R}

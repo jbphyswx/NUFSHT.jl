@@ -262,22 +262,6 @@ Test.@testset "real-field spin solve fits the Hermitian degrees" begin
     NUFSHT.close!(ps)
 end
 
-# Random coefficients for `ℓ ≥ max(|m|, |s|)`, Hermitian when `hermitian`: the coefficients of a real
-# spin-0 field.
-function _spin_coeffs(lmax, s, seed; hermitian = false)
-    Random.seed!(seed)
-    sf = zeros(ComplexF64, lmax + 1, 2lmax + 1)
-    for ℓ in abs(s):lmax
-        sf[NUFSHT.spin_coeff_index(ℓ, 0, lmax)] = hermitian ? randn() : randn(ComplexF64)
-        for m in 1:ℓ
-            a = randn(ComplexF64)
-            sf[NUFSHT.spin_coeff_index(ℓ, m, lmax)] = a
-            sf[NUFSHT.spin_coeff_index(ℓ, -m, lmax)] = hermitian ? (-1)^m * conj(a) : randn(ComplexF64)
-        end
-    end
-    return sf
-end
-
 # The direct sum `Σ sf ₛY_ℓm` at the points.
 _spin_field(sf, s, lmax, θ, φ) =
     [sum(sf[NUFSHT.spin_coeff_index(ℓ, m, lmax)] * NUFSHT.sYlm(s, ℓ, m, θ[j], φ[j])

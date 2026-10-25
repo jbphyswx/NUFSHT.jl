@@ -201,9 +201,9 @@ NUFSHT.nusht_synthesize!(f_out, C, filter, p::DistributedNUSHTplan) = _synthesiz
 function _part_adjoint(f, f_block, w_block)
     part = fetch(f)
     C = NUFSHT.allocate_coefficients(part.plan)
+    w = _part_weights(part.plan, w_block)
     _at_part_threads(part.nthreads) do
-        w_block === nothing ? NUFSHT.nusht_type1!(C, f_block, part.plan) :
-                              NUFSHT._quadrature!(C, f_block, w_block, part.plan)
+        w === nothing ? NUFSHT.nusht_type1!(C, f_block, part.plan) : NUFSHT._quadrature!(C, f_block, w, part.plan)
     end
     return _to_host(C)
 end
@@ -211,12 +211,20 @@ end
 _block_weights(::Nothing, block) = nothing
 _block_weights(w::AbstractVector, block) = w[block]
 
+# A block's weights in the memory and real type of the worker's plan.
+_part_weights(plan, ::Nothing) = nothing
+_part_weights(plan, w::AbstractVector) =
+    copyto!(NUFSHT._zeros_like(NUFSHT._fbuf(plan), real(eltype(NUFSHT._fbuf(plan))), length(w)), w)
+
+_check_weights(::Nothing, p) = nothing
+_check_weights(w::AbstractVector, p) = length(w) == p.npts ||
+    throw(DimensionMismatch("the plan covers $(p.npts) points; got $(length(w)) weights"))
+
 # The adjoint and the quadrature are sums over points: each worker's over its block, added in worker
 # order.
 function _sum_blocks!(C, f, w, p::DistributedNUSHTplan{FE,CE}) where {FE,CE}
     size(f, 1) == p.npts || throw(DimensionMismatch("the plan covers $(p.npts) points; got $(size(f, 1))"))
-    (w === nothing || length(w) == p.npts) ||
-        throw(DimensionMismatch("the plan covers $(p.npts) points; got $(length(w)) weights"))
+    _check_weights(w, p)
     parts = Vector{Array{CE,3}}(undef, length(p.workers))
     @sync for (k, wk) in enumerate(p.workers)
         @async parts[k] = Distributed.remotecall_fetch(_part_adjoint, wk, p.parts[k], _rows(f, p.blocks[k]),
@@ -259,7 +267,7 @@ struct _Abort end
 _Part{T,CE} = Union{Nothing, Exception, Vector{T}, Array{CE,3}}
 _Total{T,CE} = Union{_Abort, Vector{T}, Array{CE,3}}
 
-function _part_solve(f, f_block, inbox, outbox, k::Int, kwargs)
+function _part_solve(f, f_block, w_block, inbox, outbox, k::Int, kwargs)
     p = fetch(f)
     C = NUFSHT.allocate_coefficients(p.plan)
     reduce!(A) = begin
@@ -269,8 +277,8 @@ function _part_solve(f, f_block, inbox, outbox, k::Int, kwargs)
         copyto!(A, total)
     end
     result = try
-        _at_part_threads(() -> NUFSHT._solve!(C, f_block, NUFSHT._PointShare(p.plan, reduce!), p.ws; kwargs...),
-                         p.nthreads)
+        op = NUFSHT._weighted(NUFSHT._PointShare(p.plan, reduce!), _part_weights(p.plan, w_block))
+        _at_part_threads(() -> NUFSHT._solve!(C, f_block, op, p.ws; kwargs...), p.nthreads)
     catch err
         put!(inbox, (k, err isa Exception ? err : ErrorException(sprint(showerror, err))))
         rethrow()
@@ -304,19 +312,24 @@ function _coordinate(inbox, outboxes, ::Type{T}, ::Type{CE}, nw::Int) where {T,C
 end
 
 """
-    nusht_solve!(C, f, plan::DistributedNUSHTplan; maxiter, rtol, conlim) -> (; C, iterations, residual, converged)
+    nusht_solve!(C, f, plan::DistributedNUSHTplan; weights = nothing, maxiter, rtol, conlim)
+        -> (; C, iterations, residual, converged)
 
 The least-squares fit over every worker's points: [`nusht_solve!`](@ref)'s recurrence on every worker at
-once, the sums over points added across the workers. `f` holds every point, in the plan's order.
+once, the sums over points added across the workers. `f` and `weights` hold every point, in the plan's
+order; with `weights` the fit is `min Σⱼ wⱼ |(A c − f)ⱼ|²`.
 """
-function NUFSHT.nusht_solve!(C, f, p::DistributedNUSHTplan{FE,CE}; ws::Nothing = nothing, kwargs...) where {FE,CE}
+function NUFSHT.nusht_solve!(C, f, p::DistributedNUSHTplan{FE,CE}; ws::Nothing = nothing, weights = nothing,
+                             kwargs...) where {FE,CE}
     size(f, 1) == p.npts || throw(DimensionMismatch("the plan covers $(p.npts) points; got $(size(f, 1))"))
+    _check_weights(weights, p)
     T = real(CE)
     nw = length(p.workers)
     kw = NamedTuple(kwargs)
     inbox = Distributed.RemoteChannel(() -> Channel{Tuple{Int,_Part{T,CE}}}(nw))
     outboxes = [Distributed.RemoteChannel(() -> Channel{_Total{T,CE}}(1), w) for w in p.workers]
-    solves = [Distributed.remotecall(_part_solve, w, p.parts[k], _rows(f, p.blocks[k]), inbox, outboxes[k], k, kw)
+    solves = [Distributed.remotecall(_part_solve, w, p.parts[k], _rows(f, p.blocks[k]),
+                                     _block_weights(weights, p.blocks[k]), inbox, outboxes[k], k, kw)
               for (k, w) in enumerate(p.workers)]
     failed = _coordinate(inbox, outboxes, T, CE, nw)
     failed === nothing || fetch(solves[failed])   # raises that worker's own exception
