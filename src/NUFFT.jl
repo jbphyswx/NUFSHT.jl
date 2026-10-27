@@ -168,7 +168,7 @@ _nufft_destroy!(h::_FTBNUFFT) = FTB.close!(h.plan)
 
 Handle for the direct-summation backend: built once over its nodes, points rewritten by
 `_nufft_setpts!`, executed repeatedly. `nthreads` is resolved at construction (`0` meaning all Julia
-threads) and bounds the split in [`_nufft_exec!`](@ref).
+threads) and bounds the split in `_nufft_exec!`.
 
 The phase separates, `e^{is(k₁x + k₂y)} = e^{isk₁x} e^{isk₂y}`, so a point's `n₁·n₂` exponentials are
 the products of two tables of `n₁` and `n₂`. `ex` and `ey` hold those tables, one column per thread.

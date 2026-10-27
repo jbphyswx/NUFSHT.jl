@@ -129,11 +129,16 @@ only when you load their trigger package, so a plain `using NUFSHT` never pulls 
   - `using Distributed` — farm independent problems across worker **processes** (`addprocs`), each
     worker at the thread count it was started with, `nusht_type2(θs, φs, Cs, lmax; execution =
     DistributedBackend())`; serial when there are none. `make_plan(…; execution = DistributedBackend())`
-    divides one transform's points among the workers.
+    and `make_spin_plan(…)` divide one transform among the workers: a batch of at least as many fields
+    as workers by field, each worker transforming and fitting its own fields over every point, and
+    otherwise by point.
   - `using MPI` — point-decomposition: partition the `M` points across ranks; `A` needs no
     communication, `A†` and the point-space norm are `Allreduce`d. Either each rank passes its own
     plan with `nusht_solve!(C, f_local, plan, MPIBackend(; comm))`, or
-    `make_plan(…; execution = MPIBackend())` divides the points itself.
+    `make_plan(…; execution = MPIBackend())` and `make_spin_plan(…)` divide one transform themselves,
+    by field for a batch of at least as many fields as ranks and by point otherwise, taking and
+    returning whole fields on every rank. Dividing one field's points divides only the NUFFT's
+    spreading; dividing a batch by field divides the whole transform.
   > FastTransforms runs its S-step in OpenMP regions. NUFSHT loads FlowTransformBindings first, which
   > on macOS selects the OpenMP runtime's thread-local mode (`KMP_GTID_MODE=2`) before FastTransforms
   > loads it, so calls from Julia tasks are exact; in a session that loaded FastTransforms earlier with

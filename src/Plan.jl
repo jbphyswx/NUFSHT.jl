@@ -106,8 +106,8 @@ end
     _nufft_size_pool(backend, nufft_type2, nufft_type1, widths) -> pool
 
 The store of reduced-width plan sets a batched solve narrows into, filled on demand through
-[`_with_pool_entry`](@ref). Where the backend's plans share one type at every width
-([`_width_polymorphic`](@ref)) it is an empty `Vector` typed from the plan's full-width pair. Otherwise
+`_with_pool_entry`. Where the backend's plans share one type at every width
+(`_width_polymorphic`) it is an empty `Vector` typed from the plan's full-width pair. Otherwise
 it holds one slot per width, a `Ref` whose element type `FlowTransformBindings.plan_type` derives
 without building anything, so a width nobody uses is never built and never specialised.
 

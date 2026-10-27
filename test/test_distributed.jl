@@ -109,18 +109,57 @@ Test.@testset "Distributed extension: farm over worker processes" begin
         NUFSHT.nusht_filter!(gd, g, filt, dp; rtol = 1e-10, maxiter = 1000)
         Test.@test relerr(gd, gs) < 1e-8
 
-        # A batch, on workers running their parts threaded.
+        # A batch of as many fields as workers divides by field, each worker's plan over every point for
+        # its own fields, on workers running their parts threaded.
         G = hcat(g, g .^ 2)
         serial2 = NUFSHT.make_plan(Float64, θ, φ, lmax; nthreads = 1, ntrans = 2, kw...)
         dp2 = NUFSHT.make_plan(Float64, θ, φ, lmax; execution = CB.DistributedBackend(CB.ThreadedBackend()),
                                ntrans = 2, kw...)
+        Test.@test dp2.columns && !dp.columns
         C2 = solve(serial2, G)[1]
         Test.@test relerr(solve(dp2, G)[1], C2) < 1e-8
         Fs = zeros(M, 2); Fd = zeros(M, 2)
+        NUFSHT.nusht_type2!(Fs, C2, serial2); NUFSHT.nusht_type2!(Fd, C2, dp2)
+        Test.@test isapprox(Fd, Fs; rtol = 1e-12)
         NUFSHT.nusht_synthesize!(Fs, C2, filt, serial2)
         NUFSHT.nusht_synthesize!(Fd, C2, filt, dp2)
         Test.@test isapprox(Fd, Fs; rtol = 1e-12)
+        A2s = NUFSHT.allocate_coefficients(serial2); A2d = NUFSHT.allocate_coefficients(dp2)
+        NUFSHT.nusht_type1!(A2s, G, serial2); NUFSHT.nusht_type1!(A2d, G, dp2)
+        Test.@test isapprox(A2d, A2s; rtol = 1e-12)
+        NUFSHT.nusht_analyze!(A2s, G, serial2; weights = wq); NUFSHT.nusht_analyze!(A2d, G, dp2; weights = wq)
+        Test.@test isapprox(A2d, A2s; rtol = 1e-12)
+        NUFSHT.nusht_solve!(A2s, G, serial2; weights = wq, rtol = 1e-10, maxiter = 1000)
+        NUFSHT.nusht_solve!(A2d, G, dp2; weights = wq, rtol = 1e-10, maxiter = 1000)
+        Test.@test relerr(A2d, A2s) < 1e-8
+        NUFSHT.nusht_filter!(Fs, G, filt, serial2; rtol = 1e-10, maxiter = 1000)
+        NUFSHT.nusht_filter!(Fd, G, filt, dp2; rtol = 1e-10, maxiter = 1000)
+        Test.@test relerr(Fd, Fs) < 1e-8
         foreach(NUFSHT.close!, (serial, dp, serial2, dp2))
+
+        # Spin plans, a complex spin-1 field by point and a batch of two by field, against the same plans on
+        # the calling process; a real spin-1 field has no fit.
+        u = complex.(g, fs)
+        U = hcat(u, conj.(u))
+        for (B, f) in ((1, u), (2, U))
+            ss = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 1; nthreads = 1, ntrans = B, kw...)
+            sd = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 1; execution = CB.DistributedBackend(),
+                                       ntrans = B, kw...)
+            Test.@test sd.columns == (B == 2)
+            Ss = NUFSHT.allocate_coefficients(ss); Sd = NUFSHT.allocate_coefficients(sd)
+            NUFSHT.nusht_type1_spin!(Ss, f, ss); NUFSHT.nusht_type1_spin!(Sd, f, sd)
+            Test.@test isapprox(Sd, Ss; rtol = 1e-12)
+            hs = zero(f); hd = zero(f)
+            NUFSHT.nusht_type2_spin!(hs, Ss, ss); NUFSHT.nusht_type2_spin!(hd, Ss, sd)
+            Test.@test isapprox(hd, hs; rtol = 1e-12)
+            NUFSHT.nusht_solve_spin!(Ss, f, ss; rtol = 1e-10, maxiter = 1000)
+            r = NUFSHT.nusht_solve_spin!(Sd, f, sd; rtol = 1e-10, maxiter = 1000)
+            Test.@test r.converged && relerr(Sd, Ss) < 1e-8
+            foreach(NUFSHT.close!, (ss, sd))
+        end
+        sr = NUFSHT.make_spin_plan(Float64, θ, φ, lmax, 1; execution = CB.DistributedBackend(), kw...)
+        Test.@test_throws ArgumentError NUFSHT.nusht_solve_spin!(NUFSHT.allocate_coefficients(sr), g, sr)
+        NUFSHT.close!(sr)
     finally
         Distributed.rmprocs(intersect(added, Distributed.workers()))
     end

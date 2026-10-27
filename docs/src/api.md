@@ -15,6 +15,8 @@ RingNUSHTplan
 close!
 set_nodes!
 plan_memory
+coefficient_size
+allocate_coefficients
 ```
 
 ### Which directions a plan holds
@@ -80,6 +82,7 @@ NUFSHT._ring_check_interval
 ## Filtering
 
 ```@docs
+nusht_synthesize!
 nusht_filter!
 nusht_filter_renorm!
 ```
@@ -125,4 +128,42 @@ NUFSHT.apply_transfer!
 NUFSHT._nusht_true_adjoint!
 NUFSHT._assemble_modes!
 NUFSHT._assemble_modes_adjoint!
+NUFSHT._mode_entry
+NUFSHT._mode_adjoint_entry
+NUFSHT._filter_scratch
+NUFSHT._valid_indices
+NUFSHT._sph_pool
+NUFSHT._plan_threads
+NUFSHT._resolve_execution
+NUFSHT._PointShare
+```
+
+### NUFFT backends and batched widths
+
+```@docs
+NUFSHT.DirectSumNUFFTPlan
+NUFSHT._FTBNUFFT
+NUFSHT._resolve_nufft
+NUFSHT._real_capable
+NUFSHT._nufft_share_directions
+NUFSHT._nufft_derived
+NUFSHT._width_narrowable
+NUFSHT._pool_sizes
+NUFSHT._nufft_size_pool
+NUFSHT._pool_recipe
+NUFSHT._build_width!
+NUFSHT._pool_lookup!
+NUFSHT._pool_built
+```
+
+### Spin plans: folds, the real-field fit and the ring engine
+
+```@docs
+NUFSHT.FullModes
+NUFSHT._hermitian_domain
+NUFSHT._herm_entry
+NUFSHT._pack_entry
+NUFSHT._pack_herm!
+NUFSHT._unpack_herm!
+NUFSHT._ring_engine
 ```

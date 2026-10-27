@@ -17,8 +17,9 @@ threads — or an explicit `nthreads`. FastTransforms runs at the same count
 data. With no worker processes the problems run one after another on the calling process.
 
 A *single* transform divides among the workers through
-`make_plan(FE, θ, φ, lmax; execution = DistributedBackend())`, a [`DistributedNUSHTplan`](@ref): each
-worker holds a plan over its block of the points.
+`make_plan(FE, θ, φ, lmax; execution = DistributedBackend())` or `make_spin_plan(…)`, a
+[`DistributedNUSHTplan`](@ref): a batch of at least as many fields as workers by its fields, each worker
+holding a plan over every point for a block of them, and otherwise by its points.
 """
 module NUFSHTDistributedExt
 
@@ -74,22 +75,32 @@ function NUFSHT._nodeset_solve(θs, φs, fs, lmax, execution::ComputationalBacke
 end
 
 # ── One transform divided among the worker processes ─────────────────────────────────────────────────
-# Synthesis and the adjoint of a block need no other block. The solve runs `nusht_solve!`'s recurrence
-# on every worker at once; its two sums over points go to the caller, which adds the workers' parts in
+# By fields, each worker transforms, analyses and fits its own block of the batch alone. By points, the
+# synthesis and the adjoint of a block need no other block, and the fit runs `nusht_solve!`'s recurrence on
+# every worker at once, its two sums over points sent to the caller, which adds the workers' parts in
 # worker order and returns the same total to each, so every worker runs the same recurrence.
+
+# Which transforms a plan's workers hold: `nothing` for a scalar plan, the spin for a spin plan.
+struct _Scalar end
+struct _Spin
+    s::Int
+end
 
 """
     DistributedNUSHTplan
 
-A NUSHT plan whose points are divided among the worker processes: each worker's plan over its block and
-its least-squares workspace, held on that worker, with the block of the points each covers and the NUFFT
-tolerance the plans were built at. The coefficients are the caller's.
+A scalar or spin NUSHT plan divided among the worker processes, each worker's plan and least-squares
+workspace held on that worker: with `columns` each worker's plan covers every point for the block of the
+`B` fields in `blocks`, otherwise the block of the `npts` points. The coefficients and fields are the
+caller's, whole.
 """
-struct DistributedNUSHTplan{FE<:Number, CE<:Number, VD<:AbstractVector{Distributed.Future},
+struct DistributedNUSHTplan{FE<:Number, CE<:Number, K, VD<:AbstractVector{Distributed.Future},
                             VI<:AbstractVector{<:Integer}, VU<:AbstractVector{UnitRange{Int}}, TL<:Real}
+    kind::K
     parts::VD
     workers::VI
     blocks::VU
+    columns::Bool
     npts::Int
     lmax::Int
     B::Int
@@ -99,7 +110,7 @@ end
 
 Base.show(io::IO, p::DistributedNUSHTplan{FE}) where {FE} =
     print(io, "DistributedNUSHTplan{", FE, "}(lmax=", p.lmax, ", M=", p.npts, ", ntrans=", p.B, " on ",
-          length(p.workers), " workers)")
+          length(p.workers), " workers by ", p.columns ? "field" : "point", ")")
 
 _block(k::Int, nw::Int, n::Int) = (div((k - 1) * n, nw) + 1):div(k * n, nw)
 
@@ -110,43 +121,64 @@ _part_threads(inner, nthreads) = NUFSHT._task_count(NUFSHT._plan_threads(inner, 
 # `f()` at the part's FastTransforms thread count.
 _at_part_threads(f, nthreads::Int) = Base.ScopedValues.with(f, FTB.FASTTRANSFORMS_THREADS => nthreads)
 
-function _part_plan(::Type{FE}, θ, φ, lmax, inner, kwargs) where {FE}
+_build(::_Scalar, ::Type{FE}, θ, φ, lmax; kw...) where {FE} = NUFSHT.make_plan(FE, θ, φ, lmax; kw...)
+_build(k::_Spin, ::Type{FE}, θ, φ, lmax; kw...) where {FE} = NUFSHT.make_spin_plan(FE, θ, φ, lmax, k.s; kw...)
+
+function _part_plan(kind, ::Type{FE}, θ, φ, lmax, inner, kwargs) where {FE}
     n = _part_threads(inner, get(kwargs, :nthreads, nothing))
     plan = _at_part_threads(n) do
-        NUFSHT.make_plan(FE, θ, φ, lmax; kwargs..., execution = inner, nthreads = n)
+        _build(kind, FE, θ, φ, lmax; kwargs..., execution = inner, nthreads = n)
     end
     return (; plan, ws = FTB.LSMRWorkspace(plan), nthreads = n)
 end
-_part_info(f) = (p = fetch(f).plan; (NUFSHT.coefficient_size(p), p.B, p.tol))
+_part_info(f) = (p = fetch(f).plan; (NUFSHT.coefficient_size(p), p.tol))
 
-# `make_plan(FE, θ, φ, lmax; execution::DistributedBackend, kwargs...)`: the `M` points in contiguous
-# blocks, one per worker process (with none, the caller's over all of them), each worker's plan built
-# with `kwargs` over its block under `local_backend(execution)`. A worker runs its NUFFT and
-# FastTransforms at that backend's thread count there, as `make_plan` sets it: 1 under `SerialBackend()`,
-# else `nthreads` when given and the worker's `Threads.nthreads()` when not. The workers need NUFSHT and
-# the NUFFT library their plans use loaded.
-function NUFSHT._make_plan(::Type{FE}, θ_nodes, φ_nodes, lmax,
-                           execution::ComputationalBackends.AbstractDistributedBackend; kwargs...) where {FE<:Number}
+# The workers and their blocks: by field when the batch has at least as many fields as there are workers,
+# by point otherwise. With no worker processes, the caller holds every point.
+function _divide(M::Int, B::Int)
+    nw = min(Distributed.nworkers(), M)
+    ws = Distributed.workers()[1:nw]
+    columns = Distributed.nprocs() > 1 && B >= nw
+    n = columns ? B : M
+    return ws, [_block(k, nw, n) for k in 1:nw], columns
+end
+
+function _distributed_plan(kind, ::Type{FE}, ::Type{CE}, θ_nodes, φ_nodes, lmax, execution; kwargs...) where {FE,CE}
     length(θ_nodes) == length(φ_nodes) || throw(DimensionMismatch("θ and φ must have equal length"))
     M = length(θ_nodes)
-    ws = Distributed.workers()[1:min(Distributed.nworkers(), M)]
-    nw = length(ws)
-    blocks = [_block(k, nw, M) for k in 1:nw]
     kw = NamedTuple(kwargs)
+    B = Int(get(kw, :ntrans, 1))
     inner = ComputationalBackends.local_backend(execution)
     # A count `inner` refuses raises here, before any worker builds.
     NUFSHT._plan_threads(inner, get(kw, :nthreads, nothing))
-    parts = [Distributed.remotecall(_part_plan, w, FE, collect(θ_nodes[blocks[k]]), collect(φ_nodes[blocks[k]]),
-                                    lmax, inner, kw) for (k, w) in enumerate(ws)]
-    infos = Vector{Tuple{NTuple{3,Int},Int,Float64}}(undef, nw)
+    ws, blocks, columns = _divide(M, B)
+    parts = map(enumerate(ws)) do (k, w)
+        b = blocks[k]
+        θ, φ = columns ? (collect(θ_nodes), collect(φ_nodes)) : (collect(θ_nodes[b]), collect(φ_nodes[b]))
+        Distributed.remotecall(_part_plan, w, kind, FE, θ, φ, lmax, inner,
+                               columns ? merge(kw, (; ntrans = length(b))) : kw)
+    end
+    infos = Vector{Tuple{NTuple{3,Int},Float64}}(undef, length(ws))
     @sync for (k, w) in enumerate(ws)
         @async infos[k] = Distributed.remotecall_fetch(_part_info, w, parts[k])
     end
-    csize, B, tol = first(infos)
-    # A scalar plan's coefficients have the field's element type.
-    return DistributedNUSHTplan{FE,FE,typeof(parts),typeof(ws),typeof(blocks),typeof(tol)}(
-        parts, ws, blocks, M, Int(lmax), B, csize, tol)
+    csize, tol = first(infos)
+    return DistributedNUSHTplan{FE,CE,typeof(kind),typeof(parts),typeof(ws),typeof(blocks),typeof(tol)}(
+        kind, parts, ws, blocks, columns, M, Int(lmax), B, (csize[1], csize[2], B), tol)
 end
+
+# `make_plan(FE, θ, φ, lmax; execution::DistributedBackend, kwargs...)` and its spin counterpart: each
+# worker's plan built with `kwargs` under `local_backend(execution)`. A worker runs its NUFFT and
+# FastTransforms at that backend's thread count there, as `make_plan` sets it: 1 under `SerialBackend()`,
+# else `nthreads` when given and the worker's `Threads.nthreads()` when not. The workers need NUFSHT and
+# the NUFFT library their plans use loaded.
+NUFSHT._make_plan(::Type{FE}, θ, φ, lmax, execution::ComputationalBackends.AbstractDistributedBackend;
+                  kwargs...) where {FE<:Number} =
+    _distributed_plan(_Scalar(), FE, FE, θ, φ, lmax, execution; kwargs...)
+
+NUFSHT._make_spin_plan(::Type{FE}, θ, φ, lmax, s, execution::ComputationalBackends.AbstractDistributedBackend;
+                       kwargs...) where {FE<:Number} =
+    _distributed_plan(_Spin(Int(s)), FE, Complex{real(FE)}, θ, φ, lmax, execution; kwargs...)
 
 NUFSHT.allocate_coefficients(p::DistributedNUSHTplan{FE,CE}) where {FE,CE} = zeros(CE, p.coefficient_size...)
 NUFSHT.coefficient_size(p::DistributedNUSHTplan) = p.coefficient_size
@@ -159,60 +191,73 @@ function NUFSHT.close!(p::DistributedNUSHTplan)
     return nothing
 end
 
-# Rows `block` of every column of `f`, and the reverse.
-_rows(f::AbstractVector, block) = f[block]
-_rows(f::AbstractMatrix, block) = f[block, :]
-_put_rows!(f::AbstractVector, block, v) = (f[block] .= v; f)
-_put_rows!(f::AbstractMatrix, block, v) = (f[block, :] .= v; f)
-
-# The field at this worker's points, a vector or a column per transform like the caller's.
-_block_field(p, nrows::Int, batched::Bool) =
-    batched ? zeros(NUFSHT._field_eltype(p), nrows, p.B) : zeros(NUFSHT._field_eltype(p), nrows)
-
-function _part_synthesis(f, C, filter, nrows::Int, batched::Bool)
-    part = fetch(f)
-    p = part.plan
-    out = _block_field(p, nrows, batched)
-    _at_part_threads(part.nthreads) do
-        filter === nothing ? NUFSHT.nusht_type2!(out, C, p) : NUFSHT.nusht_synthesize!(out, C, filter, p)
-    end
-    return _to_host(out)
-end
+# The part of a whole-field or whole-coefficient array a worker takes: rows `block` of every column, or
+# with `columns` the fields `block` along the last axis; and the reverse.
+_take(A::AbstractVector, block, columns::Bool) = A[block]
+_take(A::AbstractArray{<:Any,N}, block, columns::Bool) where {N} =
+    columns ? A[ntuple(_ -> Colon(), N - 1)..., block] : A[block, ntuple(_ -> Colon(), N - 1)...]
+_put!(A::AbstractVector, block, v, columns::Bool) = (A[block] .= v; A)
+_put!(A::AbstractArray{<:Any,N}, block, v, columns::Bool) where {N} =
+    columns ? (A[ntuple(_ -> Colon(), N - 1)..., block] .= v; A) : (A[block, ntuple(_ -> Colon(), N - 1)...] .= v; A)
 
 _to_host(A::Array) = A
 _to_host(A::AbstractArray) = Array(A)
 
-function _synthesize!(out::AbstractArray{<:Any,N}, C, filter, p::DistributedNUSHTplan{FE,CE}) where {N,FE,CE}
+# The transforms a worker's plan runs, scalar or spin by its type.
+_synth!(out, C, plan::NUFSHT.AbstractScalarNUSHTplan, ::Nothing) = NUFSHT.nusht_type2!(out, C, plan)
+_synth!(out, C, plan::NUFSHT.AbstractScalarNUSHTplan, filter) = NUFSHT.nusht_synthesize!(out, C, filter, plan)
+_synth!(out, sf, plan::NUFSHT.SpinNUSHTplan, ::Nothing) = NUFSHT.nusht_type2_spin!(out, sf, plan)
+_adjoint!(C, f, plan::NUFSHT.AbstractScalarNUSHTplan) = NUFSHT.nusht_type1!(C, f, plan)
+_adjoint!(sf, f, plan::NUFSHT.SpinNUSHTplan) = NUFSHT.nusht_type1_spin!(sf, f, plan)
+
+# A worker's field: its points' rows of every field, or every point of its fields, shaped like the
+# caller's whole field.
+function _part_field(p, nrows::Int, ncols::Int, batched::Bool)
+    E = _field_eltype(p)
+    return batched ? zeros(E, nrows, ncols) : zeros(E, nrows)
+end
+_field_eltype(p::NUFSHT.AbstractScalarNUSHTplan) = NUFSHT._field_eltype(p)
+_field_eltype(p::NUFSHT.SpinNUSHTplan{T}) where {T} = NUFSHT._hermitian_domain(p) ? T : Complex{T}
+
+function _part_synthesis(f, C, filter, nrows::Int, ncols::Int, batched::Bool)
+    part = fetch(f)
+    out = _part_field(part.plan, nrows, ncols, batched)
+    _at_part_threads(() -> _synth!(out, C, part.plan, filter), part.nthreads)
+    return _to_host(out)
+end
+
+function _synthesize!(out::AbstractArray, C, filter, p::DistributedNUSHTplan)
     size(out, 1) == p.npts || throw(DimensionMismatch("the plan covers $(p.npts) points; got $(size(out, 1))"))
-    parts = Vector{Array{CE,N}}(undef, length(p.workers))
+    parts = Vector{Any}(undef, length(p.workers))
     @sync for (k, w) in enumerate(p.workers)
-        @async parts[k] = Distributed.remotecall_fetch(_part_synthesis, w, p.parts[k], C, filter,
-                                                       length(p.blocks[k]), out isa AbstractMatrix)
+        b = p.blocks[k]
+        Ck = p.columns ? _take(C, b, true) : C
+        nrows, ncols = p.columns ? (p.npts, length(b)) : (length(b), p.B)
+        @async parts[k] = Distributed.remotecall_fetch(_part_synthesis, w, p.parts[k], Ck, filter, nrows,
+                                                       ncols, out isa AbstractMatrix)
     end
     for (k, v) in enumerate(parts)
-        _put_rows!(out, p.blocks[k], v)
+        _put!(out, p.blocks[k], v, p.columns)
     end
     return out
 end
 
-NUFSHT.nusht_type2!(f, C, p::DistributedNUSHTplan) = _synthesize!(f, C, nothing, p)
-NUFSHT.nusht_synthesize!(f_out, C, filter, p::DistributedNUSHTplan) = _synthesize!(f_out, C, filter, p)
+NUFSHT.nusht_type2!(f, C, p::DistributedNUSHTplan{FE,CE,_Scalar}) where {FE,CE} = _synthesize!(f, C, nothing, p)
+NUFSHT.nusht_synthesize!(f_out, C, filter, p::DistributedNUSHTplan{FE,CE,_Scalar}) where {FE,CE} =
+    _synthesize!(f_out, C, filter, p)
+NUFSHT.nusht_type2_spin!(f, sf, p::DistributedNUSHTplan{FE,CE,_Spin}) where {FE,CE} = _synthesize!(f, sf, nothing, p)
 
-# The adjoint of a worker's block, or with the block's weights its quadrature.
-function _part_adjoint(f, f_block, w_block)
+# The adjoint of a worker's part, or with its weights its quadrature.
+function _part_adjoint(f, f_part, w_part)
     part = fetch(f)
     C = NUFSHT.allocate_coefficients(part.plan)
-    w = _part_weights(part.plan, w_block)
+    w = _part_weights(part.plan, w_part)
     _at_part_threads(part.nthreads) do
-        w === nothing ? NUFSHT.nusht_type1!(C, f_block, part.plan) : NUFSHT._quadrature!(C, f_block, w, part.plan)
+        w === nothing ? _adjoint!(C, f_part, part.plan) : NUFSHT._quadrature!(C, f_part, w, part.plan)
     end
     return _to_host(C)
 end
 
-_block_weights(::Nothing, block) = nothing
-_block_weights(w::AbstractVector, block) = w[block]
-
-# A block's weights in the memory and real type of the worker's plan.
 _part_weights(plan, ::Nothing) = nothing
 _part_weights(plan, w::AbstractVector) =
     copyto!(NUFSHT._zeros_like(NUFSHT._fbuf(plan), real(eltype(NUFSHT._fbuf(plan))), length(w)), w)
@@ -221,15 +266,26 @@ _check_weights(::Nothing, p) = nothing
 _check_weights(w::AbstractVector, p) = length(w) == p.npts ||
     throw(DimensionMismatch("the plan covers $(p.npts) points; got $(length(w)) weights"))
 
-# The adjoint and the quadrature are sums over points: each worker's over its block, added in worker
-# order.
-function _sum_blocks!(C, f, w, p::DistributedNUSHTplan{FE,CE}) where {FE,CE}
+# A worker's weights: its points', or every point's for its fields.
+_part_w(::Nothing, block, columns::Bool) = nothing
+_part_w(w::AbstractVector, block, columns::Bool) = columns ? w : w[block]
+
+# The adjoint and the quadrature: by field, each worker's fields' coefficients; by point, the sum of the
+# workers' parts over their blocks, added in worker order.
+function _adjoint_blocks!(C, f, w, p::DistributedNUSHTplan{FE,CE}) where {FE,CE}
     size(f, 1) == p.npts || throw(DimensionMismatch("the plan covers $(p.npts) points; got $(size(f, 1))"))
     _check_weights(w, p)
     parts = Vector{Array{CE,3}}(undef, length(p.workers))
     @sync for (k, wk) in enumerate(p.workers)
-        @async parts[k] = Distributed.remotecall_fetch(_part_adjoint, wk, p.parts[k], _rows(f, p.blocks[k]),
-                                                       _block_weights(w, p.blocks[k]))
+        b = p.blocks[k]
+        @async parts[k] = Distributed.remotecall_fetch(_part_adjoint, wk, p.parts[k], _take(f, b, p.columns),
+                                                       _part_w(w, b, p.columns))
+    end
+    if p.columns
+        for (k, v) in enumerate(parts)
+            _put!(C, p.blocks[k], reshape(v, size(v, 1), size(v, 2), :), true)
+        end
+        return C
     end
     fill!(C, zero(eltype(C)))
     for v in parts, i in eachindex(v)
@@ -238,28 +294,44 @@ function _sum_blocks!(C, f, w, p::DistributedNUSHTplan{FE,CE}) where {FE,CE}
     return C
 end
 
-NUFSHT.nusht_type1!(C, f, p::DistributedNUSHTplan) = _sum_blocks!(C, f, nothing, p)
+NUFSHT.nusht_type1!(C, f, p::DistributedNUSHTplan{FE,CE,_Scalar}) where {FE,CE} = _adjoint_blocks!(C, f, nothing, p)
+NUFSHT.nusht_type1_spin!(sf, f, p::DistributedNUSHTplan{FE,CE,_Spin}) where {FE,CE} =
+    _adjoint_blocks!(sf, f, nothing, p)
 
-# `nusht_analyze!` with whole-field `f` and `weights`: the quadrature summed over the workers' blocks,
-# or the fit.
+# `nusht_analyze!` with whole-field `f` and `weights`: the quadrature, or the fit.
 NUFSHT.nusht_analyze!(C, f, p::DistributedNUSHTplan; weights = nothing, kwargs...) =
     _analyze!(C, f, weights, p; kwargs...)
 
-_analyze!(C, f, ::Nothing, p::DistributedNUSHTplan; kwargs...) = NUFSHT.nusht_solve!(C, f, p; kwargs...)
+_analyze!(C, f, ::Nothing, p::DistributedNUSHTplan{FE,CE,_Scalar}; kwargs...) where {FE,CE} =
+    NUFSHT.nusht_solve!(C, f, p; kwargs...)
+_analyze!(C, f, ::Nothing, p::DistributedNUSHTplan{FE,CE,_Spin}; kwargs...) where {FE,CE} =
+    NUFSHT.nusht_solve_spin!(C, f, p; kwargs...)
 
 function _analyze!(C, f, w::AbstractVector, p::DistributedNUSHTplan{FE,CE}; ws = nothing, maxiter = nothing,
                    rtol = nothing, conlim = nothing) where {FE,CE}
-    _sum_blocks!(C, f, w, p)
+    _adjoint_blocks!(C, f, w, p)
     return (; C, iterations = 0, residual = zero(real(CE)), converged = true)
 end
 
-function NUFSHT.nusht_filter!(f_out, f_in, filter, p::DistributedNUSHTplan; ws::Nothing = nothing, kwargs...)
+function NUFSHT.nusht_filter!(f_out, f_in, filter, p::DistributedNUSHTplan{FE,CE,_Scalar}; ws::Nothing = nothing,
+                              kwargs...) where {FE,CE}
     C = NUFSHT.allocate_coefficients(p)
     NUFSHT.nusht_solve!(C, f_in, p; kwargs...)
     return _synthesize!(f_out, C, filter, p)
 end
 
-# ── The solve ────────────────────────────────────────────────────────────────────────────────────────
+# ── The fit ──────────────────────────────────────────────────────────────────────────────────────────
+
+# A worker's fields fitted alone, with its plan's own workspace.
+function _part_solve_fields(f, f_part, w_part, kwargs)
+    part = fetch(f)
+    C = NUFSHT.allocate_coefficients(part.plan)
+    w = _part_weights(part.plan, w_part)
+    r = _at_part_threads(part.nthreads) do
+        NUFSHT._solve!(C, f_part, NUFSHT._weighted(part.plan, w), part.ws; kwargs...)
+    end
+    return (C = _to_host(C), iterations = r.iterations, residual = r.residual, converged = r.converged)
+end
 
 # The caller's reply once a worker's solve has failed. A worker sends its part of each sum, `nothing`
 # when its solve has finished, and its exception if it fails. The sums are the per-column `‖u‖²`, a host
@@ -312,25 +384,13 @@ function _coordinate(inbox, outboxes, ::Type{T}, ::Type{CE}, nw::Int) where {T,C
     end
 end
 
-"""
-    nusht_solve!(C, f, plan::DistributedNUSHTplan; weights = nothing, maxiter, rtol, conlim)
-        -> (; C, iterations, residual, converged)
-
-The least-squares fit over every worker's points: [`nusht_solve!`](@ref)'s recurrence on every worker at
-once, the sums over points added across the workers. `f` and `weights` hold every point, in the plan's
-order; with `weights` the fit is `min Σⱼ wⱼ |(A c − f)ⱼ|²`.
-"""
-function NUFSHT.nusht_solve!(C, f, p::DistributedNUSHTplan{FE,CE}; ws::Nothing = nothing, weights = nothing,
-                             kwargs...) where {FE,CE}
-    size(f, 1) == p.npts || throw(DimensionMismatch("the plan covers $(p.npts) points; got $(size(f, 1))"))
-    _check_weights(weights, p)
+function _solve_points!(C, f, weights, p::DistributedNUSHTplan{FE,CE}, kw) where {FE,CE}
     T = real(CE)
     nw = length(p.workers)
-    kw = NamedTuple(kwargs)
     inbox = Distributed.RemoteChannel(() -> Channel{Tuple{Int,_Part{T,CE}}}(nw))
     outboxes = [Distributed.RemoteChannel(() -> Channel{_Total{T,CE}}(1), w) for w in p.workers]
-    solves = [Distributed.remotecall(_part_solve, w, p.parts[k], _rows(f, p.blocks[k]),
-                                     _block_weights(weights, p.blocks[k]), inbox, outboxes[k], k, kw)
+    solves = [Distributed.remotecall(_part_solve, w, p.parts[k], _take(f, p.blocks[k], false),
+                                     _part_w(weights, p.blocks[k], false), inbox, outboxes[k], k, kw)
               for (k, w) in enumerate(p.workers)]
     failed = _coordinate(inbox, outboxes, T, CE, nw)
     failed === nothing || fetch(solves[failed])   # raises that worker's own exception
@@ -339,5 +399,51 @@ function NUFSHT.nusht_solve!(C, f, p::DistributedNUSHTplan{FE,CE}; ws::Nothing =
     copyto!(C, Cw)
     return (; C = C, iterations = iters, residual = rel, converged = converged)
 end
+
+function _solve_fields!(C, f, weights, p::DistributedNUSHTplan, kw)
+    parts = Vector{Any}(undef, length(p.workers))
+    @sync for (k, w) in enumerate(p.workers)
+        b = p.blocks[k]
+        @async parts[k] = Distributed.remotecall_fetch(_part_solve_fields, w, p.parts[k], _take(f, b, true),
+                                                       weights, kw)
+    end
+    for (k, r) in enumerate(parts)
+        _put!(C, p.blocks[k], reshape(r.C, size(r.C, 1), size(r.C, 2), :), true)
+    end
+    return (; C = C, iterations = maximum(r -> r.iterations, parts), residual = maximum(r -> r.residual, parts),
+            converged = all(r -> r.converged, parts))
+end
+
+# A real spin field exists only at `s = 0`, as `nusht_solve_spin!` checks on one process.
+_check_solvable(::DistributedNUSHTplan{FE,CE,_Scalar}) where {FE,CE} = nothing
+_check_solvable(p::DistributedNUSHTplan{FE,CE,_Spin}) where {FE,CE} =
+    (FE <: Real && p.kind.s != 0) ? throw(ArgumentError(
+        "a spin-$(p.kind.s) field cannot be real, so a real-field plan at s ≠ 0 has no coefficient subspace " *
+        "on which a fit is determined; build the plan with a complex element type to fit")) : nothing
+
+function _solve!(C, f, p::DistributedNUSHTplan; weights = nothing, kwargs...)
+    _check_solvable(p)
+    size(f, 1) == p.npts || throw(DimensionMismatch("the plan covers $(p.npts) points; got $(size(f, 1))"))
+    _check_weights(weights, p)
+    kw = NamedTuple(kwargs)
+    return p.columns ? _solve_fields!(C, f, weights, p, kw) : _solve_points!(C, f, weights, p, kw)
+end
+
+"""
+    nusht_solve!(C, f, plan::DistributedNUSHTplan; weights = nothing, maxiter, rtol, conlim)
+        -> (; C, iterations, residual, converged)
+
+The least-squares fit over every point: by field each worker fits its own fields, by point
+[`nusht_solve!`](@ref)'s recurrence runs on every worker at once, the sums over points added across the
+workers. `f` and `weights` hold every point, in the plan's order; with `weights` the fit is
+`min Σⱼ wⱼ |(A c − f)ⱼ|²`. `iterations` and `residual` are the largest over the fields, `converged` whether
+every field converged.
+"""
+NUFSHT.nusht_solve!(C, f, p::DistributedNUSHTplan{FE,CE,_Scalar}; ws::Nothing = nothing, kwargs...) where {FE,CE} =
+    _solve!(C, f, p; kwargs...)
+
+NUFSHT.nusht_solve_spin!(sf, f, p::DistributedNUSHTplan{FE,CE,_Spin}; ws::Nothing = nothing,
+                         kwargs...) where {FE,CE} =
+    _solve!(sf, f, p; kwargs...)
 
 end # module NUFSHTDistributedExt
