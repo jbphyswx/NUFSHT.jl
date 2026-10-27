@@ -123,6 +123,12 @@ function _nufft_size_pool(backend, nufft_type2, nufft_type1, widths::AbstractVec
     return pool
 end
 
+# The plan pair of width `k`, empty until a solve first narrows to it, `E` its entry type.
+struct _WidthSlot{E}
+    k::Int
+    pair::Base.RefValue{Union{Nothing,E}}
+end
+
 # One empty, concretely typed slot per width, the handle type read off `FTB.plan_type`.
 function _typed_width_slots(nufft_type2::_FTBNUFFT, nufft_type1, widths::AbstractVector{Int})
     return ntuple(length(widths)) do i
@@ -130,7 +136,7 @@ function _typed_width_slots(nufft_type2::_FTBNUFFT, nufft_type1, widths::Abstrac
         H = _FTBNUFFT{FTB.plan_type(typeof(nufft_type2.plan), k)}
         E = NamedTuple{(:k, :nufft_type2, :nufft_type1),
                        Tuple{Int, H, nufft_type1 === nothing ? Nothing : H}}
-        (k = k, pair = Ref{Union{Nothing,E}}(nothing))
+        _WidthSlot{E}(k, Ref{Union{Nothing,E}}(nothing))
     end
 end
 
@@ -200,7 +206,7 @@ end
     slot.k == k || return _with_pool_entry(f, Base.tail(pool), k, build)
     e = slot.pair[]
     e === nothing || return f(e)
-    return f(_fill_slot!(slot.pair, k, build))
+    return f(_fill_slot!(slot, k, build))
 end
 
 # A solve narrows only to the pool's widths (`_fit_width`), so running off the end is a caller's width.
@@ -208,9 +214,9 @@ end
     "width $k is not one of the plan's NUFFT widths, the powers of two below its batch size and the " *
     "batch size"))
 
-function _fill_slot!(slot::Base.RefValue{Union{Nothing,E}}, k::Integer, build) where {E}
+function _fill_slot!(slot::_WidthSlot{E}, k::Integer, build) where {E}
     e = build(k, E)::E
-    slot[] = e
+    slot.pair[] = e
     return e
 end
 
