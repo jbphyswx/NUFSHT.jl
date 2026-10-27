@@ -1,9 +1,6 @@
 # Spectral filter transfer functions H(ℓ) for spherical harmonic filtering. A spectral filter on the
 # sphere multiplies each harmonic coefficient c_ℓm by H(ℓ), ℓ the angular degree: a convolution with a
 # kernel whose Legendre spectrum is H(ℓ).
-#
-# References: Aluie et al. (2018), coarse-graining as a measurement operator on fields over the
-# sphere; Lilly & Gascard (2006), wavelet ridge diagnosis of time-varying elliptical signals.
 
 export TopHatTransfer, GaussianTransfer, SharpSpectralTransfer
 export kernel_transfer, cutoff_degree, gaussian_from_scale
@@ -41,11 +38,9 @@ end
 
 Gaussian spectral filter: H(ℓ) = exp(-ℓ(ℓ+1) σ²/2)
 
-where σ = scale_m / R_m is the dimensionless filter width.
-In physical space this corresponds to convolution with a Gaussian-like kernel
-on the sphere. At degree ℓ the spatial scale is approximately R/ℓ.
-
-Reference: Eq. (3) of Aluie et al. (2018), analogous to Gaussian in Fourier space.
+where σ = scale_m / R_m is the dimensionless filter width. It is the heat kernel of the unit sphere at
+time `σ²/2`, `exp(σ²Δ/2)` with `Δ Y_ℓm = -ℓ(ℓ+1) Y_ℓm`, the sphere's counterpart of a Gaussian
+convolution in the plane. At degree ℓ the spatial scale is approximately R/ℓ.
 """
 struct GaussianTransfer <: AbstractSpectralTransfer
     σ²::Float64
@@ -111,20 +106,4 @@ function apply_transfer!(C, filter, lmax)
         end
     end
     return C
-end
-
-# Host-built `(lmax+1, 2lmax+1)` transfer matrix (element type `RT`): `H(ℓ)` at every slot, at that
-# slot's own degree. Used by the device `apply_transfer!` (one broadcast); the CPU path uses the
-# zero-alloc loop above, and the two must agree everywhere.
-function _transfer_matrix(filter, lmax, ::Type{RT}) where {RT}
-    n1, n2 = lmax + 1, 2lmax + 1
-    H = Matrix{RT}(undef, n1, n2)
-    for ℓ in 0:(2lmax)                      # every slot has exactly one degree here, so `undef` is filled
-        h = RT(kernel_transfer(filter, ℓ))
-        for j in 1:n2
-            i = ℓ - (j ÷ 2) + 1
-            1 <= i <= n1 && (H[i, j] = h)
-        end
-    end
-    return H
 end

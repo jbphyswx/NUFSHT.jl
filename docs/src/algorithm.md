@@ -1,5 +1,9 @@
 # Algorithm
 
+```@meta
+CurrentModule = NUFSHT
+```
+
 ## Overview
 
 NUFSHT.jl evaluates a spherical harmonic expansion at arbitrary scattered points by
@@ -19,7 +23,8 @@ A = N \cdot F \cdot S
 | **N** | NUFFT type 2 | Fourier modes ``\to \mathbb{R}^M`` | ``O(K \log K + M)``, via the chosen backend |
 
 where ``K = (l_\text{max}+1)(2l_\text{max}+1)`` is the number of SH coefficients and
-``N_\theta = l_\text{max}+1``, ``N_\phi = 2l_\text{max}+1``.
+``N_\theta = l_\text{max}+1``, ``N_\phi = 2l_\text{max}+1``. A scalar plan over device nodes takes the
+ring S-step of the spin plans instead (see *Scalar plans on a device*).
 
 ## The bivariate Fourier series
 
@@ -169,8 +174,9 @@ length-``N`` FFT returns ``G_{m'm}`` for ``|m'| \leq l_\text{max}`` exactly.
 
 Written as ``y_{\ell+1} = (\alpha x + \beta)\, y_\ell - \gamma\, y_{\ell-1}``, a rounding error ``\epsilon`` in
 ``\alpha x + \beta`` moves the angle the recurrence oscillates at by ``\epsilon / \sin\theta``, large at the
-rings next to the poles; accumulated over the degrees it stays below ``10^{-12}`` in `Float64` at
-``l_\text{max} = 1024``, which keeps that form. In `Float32` the S-step carries
+rings next to the poles; accumulated over the degrees it is of order
+``\sqrt{\ell}\, l_\text{max}\, \epsilon / \pi``, which `Float64` and wider precisions afford, so they keep
+that form. In `Float32` the S-step carries
 ``e_\ell = y_\ell - \sigma y_{\ell-1}`` with ``u = 1 - \sigma x``, ``\sigma = 1`` for ``\theta \leq \pi/2`` and
 ``-1`` beyond (Reinsch's modification),
 
@@ -185,8 +191,21 @@ the angle moves by ``\epsilon \tan(\theta/2)`` per step. Below its turning point
 ``d^\ell_{mn}`` is exponentially small, so the recurrence holds it as ``y\, 2^{Kk}`` with an integer
 scale ``k \leq 0`` and adds it to the sum once ``k \geq -1``. The cost is
 ``O(l_\text{max}^3)``, with the work of each ring and degree a few fused multiply–adds on values in
-registers, and the relative error is below ``l_\text{max}\, \epsilon`` in `Float32`. The
+registers, and the relative error is of order ``l_\text{max}\, \epsilon`` in `Float32`. The
 adjoint runs the same recurrence and sums each degree over the rings.
+
+### Scalar plans on a device
+
+FastTransforms runs on the host, so a scalar plan over device nodes is a `RingNUSHTplan`: a spin-0 plan,
+whose S-step is the ring S-step above, with its coefficients converted to and from the scalar layout
+by `scalar_to_spin0!` and `spin0_to_scalar!`. With
+``\Lambda_{\ell m}(\theta) = N_\ell\, d^\ell_{m0}(\theta)``, the scalar harmonics are
+``\sqrt{2}(-1)^m \Lambda_{\ell m} \cos m\varphi`` and ``\sqrt{2}(-1)^m \Lambda_{\ell m} \sin m\varphi``, and
+the spin-0 ones ``\Lambda_{\ell m} e^{im\varphi}`` and ``(-1)^m \Lambda_{\ell m} e^{-im\varphi}``, so the
+conversion is a unitary ``2 \times 2`` map on each pair ``(\ell, \pm m)``. Synthesis, adjoint, fit and
+analysis are therefore the scalar plan's, every step in the plan's precision on the device. The
+conversion reads only the slots of degree ``\ell \leq l_\text{max}``, and the adjoint writes zero in the
+supernumerary ones.
 
 ## References
 

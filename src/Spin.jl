@@ -17,7 +17,6 @@
 # tangent-vector case, `U = u_θ + i u_φ`.
 
 using LinearAlgebra: LinearAlgebra
-using SpecialFunctions: loggamma
 
 export SpinNUSHTplan, make_spin_plan
 export nusht_type2_spin!, nusht_type1_spin!, nusht_solve_spin!
@@ -27,22 +26,13 @@ export scalar_to_spin0!, spin0_to_scalar!
 """
     wigner_d(ℓ, m, n, β)
 
-Wigner small-d matrix element `d^ℓ_{mn}(β) = ⟨ℓm|exp(-iβ Jy)|ℓn⟩` in the Condon–Shortley basis, via
-the explicit alternating sum with log-gamma factorials for stability.
-
-Accuracy degrades above `ℓ ≈ 40`.
+Wigner small-d matrix element `d^ℓ_{mn}(β) = ⟨ℓm|exp(-iβ Jy)|ℓn⟩` in the Condon–Shortley basis, by the
+three-term recurrence in `ℓ` (`FlowTransformBindings.wigner_d!`), within `ℓ eps` of the exact value.
 """
 function wigner_d(ℓ::Integer, m::Integer, n::Integer, β::Real)
-    (abs(m) > ℓ || abs(n) > ℓ) && return 0.0
-    c = cos(β / 2); s = sin(β / 2)
-    kmin = max(0, n - m); kmax = min(ℓ + n, ℓ - m)
-    pref = 0.5 * (loggamma(ℓ + m + 1) + loggamma(ℓ - m + 1) + loggamma(ℓ + n + 1) + loggamma(ℓ - n + 1))
-    tot = 0.0
-    for k in kmin:kmax
-        den = loggamma(ℓ + n - k + 1) + loggamma(k + 1) + loggamma(ℓ - m - k + 1) + loggamma(k + m - n + 1)
-        tot += ((-1)^(k + m - n)) * exp(pref - den) * (c^(2ℓ + n - m - 2k)) * (s^(2k + m - n))
-    end
-    return tot
+    T = float(typeof(β))
+    (abs(m) > ℓ || abs(n) > ℓ) && return zero(T)
+    return FTB.wigner_d!(zeros(T, Int(ℓ) + 1), β, m, n)[end]
 end
 
 @inline _Nℓ(ℓ) = sqrt((2ℓ + 1) / (4π))
@@ -70,8 +60,8 @@ Plan for spin-`s` non-uniform spherical harmonic transforms at `M` scattered poi
 type 1 `iflag=−1`) over the nodes `(−θ, φ)`, and the ring S-step ([`_RingEngine`](@ref)) that takes
 coefficients to the bivariate Fourier series `G` and back: each order's degree sum on equispaced
 colatitudes by the recurrence of `d^ℓ_{m,−s}` in `ℓ`, then one FFT per order, in the plan's precision
-`T`, on the host or on the nodes' device; the relative error is below `lmax · eps(T)` in Float32 and
-below `10⁻¹²` in Float64 at lmax 1024.
+`T`, on the host or on the nodes' device; its relative error grows as `lmax eps(T)` in Float32 and as
+`lmax^{3/2} eps(T)` in wider precisions.
 """
 struct SpinNUSHTplan{T<:AbstractFloat, CT3<:AbstractArray{Complex{T},3}, ND<:AbstractNodeSet, E,
                      FT} <: AbstractNUSHTplan
@@ -125,13 +115,12 @@ _make_spin_plan(::Type{FE}, θ, φ, lmax, s, e::ComputationalBackends.AbstractEx
 function _build_spin_plan(::Type{FE}, θ_nodes, φ_nodes, lmax::Integer, s::Integer;
                           tol = 1e-10, ntrans::Integer = 1,
                           nufft::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
-                          variable_npts::Bool = false,
+                          point_count::AbstractPointCount = FixedCount(),
                           directions::AbstractPlanDirections = SynthesisAndAnalysis(),
                           nthreads::Union{Nothing,Integer} = nothing,
                           upsampfac::Union{Nothing,Real} = nothing) where {FE<:Number}
-    @assert length(θ_nodes) == length(φ_nodes)
-    B = Int(ntrans)
-    @assert B ≥ 1
+    _check_nodes(θ_nodes, φ_nodes)
+    B = _check_ntrans(ntrans)
     T = real(FE)
     T <: AbstractFloat ||
         throw(ArgumentError("field element type must be a float or complex float, got $FE"))
@@ -173,12 +162,12 @@ function _build_spin_plan(::Type{FE}, θ_nodes, φ_nodes, lmax::Integer, s::Inte
     n_modes = Int64[r2c ? L : Lθ, L]
     _warn_if_directsum(nufft, nub, M, Lθ * L)
     nt = nthreads === nothing ? 0 : Int(nthreads)
-    uf = upsampfac === nothing ? 0.0 : Float64(upsampfac)
+    uf = _upsampfac(upsampfac)
     # See `_nufft_share_directions`: where the backend's plan carries no direction, one object serves
     # both and the second is a handle onto it, already pointed at the same nodes.
     nufft_type2 = _make_nufft(nub, (negθ, φ), 2, n_modes, +1, B, tol64, T, nt, uf, ZS)
     nufft_type1 = _build_analysis(directions, nub, negθ, φ, n_modes, B, tol64, T, nt, uf, ZS, nufft_type2)
-    nodes =_node_set(Val(variable_npts), θ, φ, negθ, θ_shift, fbuf, nufft_type2, nufft_type1)
+    nodes = _node_set(point_count, θ, φ, negθ, θ_shift, fbuf, nufft_type2, nufft_type1)
 
     return SpinNUSHTplan{T, typeof(G), typeof(nodes), typeof(engine), typeof(tol64)}(
         lmax, Int(s), B, tol64, ntasks, nodes, G, engine, Base.RefValue{Union{Nothing,typeof(G)}}(nothing))
@@ -259,11 +248,15 @@ Base.show(io::IO, plan::SpinNUSHTplan{T}) where {T} =
 
 @inline _spin_npts(plan::SpinNUSHTplan) = length(_θnodes(plan))
 
-@inline function _assert_spin_coeffs(sf, plan::SpinNUSHTplan)
-    @assert length(sf) == (plan.lmax + 1) * (2plan.lmax + 1) * plan.B "spin coefficient array has $(length(sf)) entries, expected (lmax+1)·(2lmax+1)·B"
+@inline function _check_spin_coeffs(sf, plan::SpinNUSHTplan)
+    n = (plan.lmax + 1) * (2plan.lmax + 1) * plan.B
+    length(sf) == n || _length_mismatch("spin coefficient array", length(sf), n, "(lmax+1)·(2lmax+1)·B")
+    return nothing
 end
-@inline function _assert_spin_field(f, plan::SpinNUSHTplan)
-    @assert length(f) == _spin_npts(plan) * plan.B "spin field array has $(length(f)) entries, expected M·B"
+@inline function _check_spin_field(f, plan::SpinNUSHTplan)
+    n = _spin_npts(plan) * plan.B
+    length(f) == n || _length_mismatch("spin field array", length(f), n, "M·B")
+    return nothing
 end
 
 # Assemble bivariate Fourier coefficients G_{m'm} (CMCL-centered) from coefficients `sf`, in place.
@@ -295,8 +288,8 @@ points, writing complex values into `f`. Batched: `sf` is `(lmax+1, 2lmax+1[, B]
 length-`M` / `(M, B)`.
 """
 function nusht_type2_spin!(f, sf, plan::SpinNUSHTplan{T}) where {T}
-    _assert_spin_coeffs(sf, plan)
-    _assert_spin_field(f, plan)
+    _check_spin_coeffs(sf, plan)
+    _check_spin_field(f, plan)
     _assemble_G!(plan.G, sf, plan)
     _nufft_exec!(_nufft2(plan), plan.G, _fbuf(plan))
     _rephase!(_fbuf(plan), _θshift(plan))
@@ -311,8 +304,8 @@ Exact Euclidean adjoint of `nusht_type2_spin!`: scattered values `f` → spin-`s
 no quadrature weights; [`nusht_analyze!`](@ref) gives the coefficients of `f`.
 """
 function nusht_type1_spin!(sf, f, plan::SpinNUSHTplan{T}) where {T}
-    _assert_spin_field(f, plan)
-    _assert_spin_coeffs(sf, plan)
+    _check_spin_field(f, plan)
+    _check_spin_coeffs(sf, plan)
     copyto!(_fbuf(plan), f)
     return _strengths_adjoint!(sf, plan)
 end
@@ -329,9 +322,9 @@ end
 # part is the complex adjoint of the real data: for every Hermitian `x`, `Re⟨x, A†y⟩ = ⟨Ax, y⟩`.
 function _quadrature!(sf, f, w, plan::SpinNUSHTplan)
     _check_spin_solvable(plan)
-    _assert_spin_field(f, plan)
-    _assert_spin_coeffs(sf, plan)
-    _assert_weights(w, plan)
+    _check_spin_field(f, plan)
+    _check_spin_coeffs(sf, plan)
+    _check_weights(w, plan)
     _copy_weighted!(_fbuf(plan), f, w)
     _strengths_adjoint!(sf, plan)
     return _hermitian_part!(sf, plan)
@@ -388,7 +381,7 @@ FTB.lsmr_allocate_domain(plan::SpinNUSHTplan{T}) where {T} =
                                                _zeros_like(plan.G, Complex{T}, coefficient_size(plan)...))
 FTB.lsmr_allocate_range(plan::SpinNUSHTplan) =
     _zeros_like(_fbuf(plan), eltype(_fbuf(plan)), _spin_npts(plan), plan.B)
-FTB.lsmr_check_solution(sf, plan::SpinNUSHTplan, ws) = _assert_spin_coeffs(sf, plan)
+FTB.lsmr_check_solution(sf, plan::SpinNUSHTplan, ws) = _check_spin_coeffs(sf, plan)
 
 # The caller's `sf` is the full complex array whatever the iterate is, so a packed solution expands on
 # the way out.

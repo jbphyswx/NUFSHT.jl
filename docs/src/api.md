@@ -1,10 +1,17 @@
 # API Reference
 
+```@meta
+CurrentModule = NUFSHT
+```
+
 ## Plan construction
 
 ```@docs
 make_plan
+AbstractNUSHTplan
+AbstractScalarNUSHTplan
 NUSHTplan
+RingNUSHTplan
 close!
 set_nodes!
 plan_memory
@@ -24,13 +31,16 @@ NUFSHT.SynthesisAndAnalysis
 
 ### Node sets
 
-A plan's points can be moved without rebuilding it. The node set fixes whether the point *count* may
-change too.
+A plan's points can be moved without rebuilding it. The node set, chosen by `point_count`, fixes
+whether the point *count* may change too.
 
 ```@docs
 NUFSHT.AbstractNodeSet
 NUFSHT.FixedCountNodes
 NUFSHT.VariableCountNodes
+NUFSHT.AbstractPointCount
+NUFSHT.FixedCount
+NUFSHT.VariableCount
 ```
 
 ## Core transforms
@@ -62,6 +72,7 @@ scalar_to_spin0!
 spin0_to_scalar!
 NUFSHT.wigner_d
 NUFSHT._RingEngine
+NUFSHT._RingWork
 NUFSHT._ring_tables
 NUFSHT._ring_check_interval
 ```

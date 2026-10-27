@@ -22,8 +22,8 @@
 # in the plan's precision `R`.
 #
 # Float32 plans take that form. Wider precisions take the plain one, `cos θ` carried as `x + xl`: its
-# error at the polar rings, of order `√ℓ lmax eps / π`, is below `10⁻¹²` in Float64 at lmax 1024, and its
-# step is one dependent operation where Reinsch's is two.
+# error at the polar rings is of order `√ℓ lmax eps / π`, and its step is one dependent operation where
+# Reinsch's is two.
 #
 # Below its turning point `d^ℓ` is exponentially small, so a ring value is held as `y·2^{Kk}` with an
 # integer scale `k ≤ 0`, rescaled as it grows, and enters the sum once `k ≥ −1`; a term left out is below
@@ -38,9 +38,6 @@
 @inline _ring_reinsch(::Type{Float32}) = true
 @inline _ring_reinsch(::Type{<:AbstractFloat}) = false
 const _RING_MIN_WORK = 50_000            # ring steps of a transform below which it runs on one task
-
-@inline _ring_span(::Type{Float32}) = 64
-@inline _ring_span(::Type{<:AbstractFloat}) = 256
 
 # The circle's sample count for degree `lmax`: even, at least `2lmax + 2`, with factors 2, 3 and 5 only.
 @inline _ring_samples(lmax::Integer) = 2nextprod((2, 3, 5), lmax + 1)
@@ -105,80 +102,21 @@ function _ring_tables(::Type{R}, ::Type{S}, lmax::Int, s::Int, padded::Int) wher
     lC = zeros(S, no); sg = zeros(S, no)
     p1 = zeros(Int32, no); p2 = zeros(Int32, no)
     for m in -lmax:lmax
-        ℓ0 = max(abs(m), abs(n))
-        a, q1, q2, even = if m >= abs(n)
-            (n, m + n, m - n, iseven(m - n))
-        elseif -m >= abs(n)
-            (n, ℓ0 - n, ℓ0 + n, true)
-        elseif n >= abs(m)
-            (m, n + m, n - m, true)
-        else
-            (m, ℓ0 - m, ℓ0 + m, iseven(m - n))
-        end
+        st = FTB.wigner_d_start(S, m, n)
         i = m + lmax + 1
-        lC[i] = S((loggamma(F(2ℓ0 + 1)) - loggamma(F(ℓ0 + a + 1)) - loggamma(F(ℓ0 - a + 1))) / (2log(F(2))))
-        p1[i] = q1; p2[i] = q2
-        sg[i] = even ? one(S) : -one(S)
+        lC[i] = st.lC; p1[i] = st.p1; p2[i] = st.p2; sg[i] = st.sg
     end
     return (; N, nring, u, pos, x, xl, lc, ls, lC, p1, p2, sg)
 end
 
-# `d^{ℓ0}` at one ring as `(y, k)` with `d = y·2^{Kk}`, `|y| ≤ 2^{K/2}`, from the order constants and the
-# ring's logarithms; `(0, 0)` where it vanishes. One per ring and order, so a host chunk and a device
-# work-item evaluate the same expression.
-@inline function _ring_start(::Type{R}, lC::S, p1::Int32, p2::Int32, sg::S, lc::S, ls::S) where {R,S}
-    K = _ring_span(R)
-    e = lC + ifelse(p1 == 0, zero(S), p1 * lc) + ifelse(p2 == 0, zero(S), p2 * ls)
-    isfinite(e) || return (zero(R), Int32(0))
-    k = min(Int32(0), unsafe_trunc(Int32, ceil((e - S(K ÷ 2)) / S(K))))
-    return (R(sg * exp2(e - S(K) * S(k))), k)
-end
-
-"""
-    _ring_coeffs(F, ℓ, m, n) -> (α, c₊, c₋, γ)
-
-The step `d^{ℓ+1} = (αx + β) d^ℓ − γ d^{ℓ−1}` from degree `ℓ` in `F`, with `c₊ = α + β − 1 − γ` and
-`c₋ = β − α + 1 + γ`. With `D = ℓ b`, `a = √((ℓ²−m²)(ℓ²−n²))`, `b = √(((ℓ+1)²−m²)((ℓ+1)²−n²))` and
-`(ℓ² ∓ mn)² − a² = ℓ²(m ∓ n)²`,
-
-    c₊ D = (ℓ+1) ℓ²(m−n)² / (ℓ² − mn + a) + ℓ (ℓ+1)²(m−n)² / ((ℓ+1)² − mn + b),
-    c₋ D = −(ℓ+1) ℓ²(m+n)² / (ℓ² + mn + a) − ℓ (ℓ+1)²(m+n)² / ((ℓ+1)² + mn + b),
-
-sums of terms of one sign, so each is accurate to `eps(F)` relative to itself.
-"""
-@inline function _ring_coeffs(::Type{F}, ℓ::Int, m::Int, n::Int) where {F}
-    ℓ == 0 && return (one(F), zero(F), zero(F), zero(F))
-    l = F(ℓ); L = F(ℓ + 1); mn = F(m) * F(n); m2 = F(m)^2; n2 = F(n)^2
-    a = sqrt(max(l^2 - m2, zero(F)) * max(l^2 - n2, zero(F)))
-    b = sqrt((L^2 - m2) * (L^2 - n2))
-    D = l * b
-    α = F(2ℓ + 1) * l * L / D
-    γ = L * a / D
-    dm = F(m - n)^2; dp = F(m + n)^2
-    c₊ = (L * _ring_gap(l^2 * dm, l^2 - mn + a) + l * _ring_gap(L^2 * dm, L^2 - mn + b)) / D
-    c₋ = -(L * _ring_gap(l^2 * dp, l^2 + mn + a) + l * _ring_gap(L^2 * dp, L^2 + mn + b)) / D
-    return (α, c₊, c₋, γ)
-end
-
-# `num / den`, zero where `num` is: the denominator vanishes only with its numerator.
-@inline _ring_gap(num, den) = iszero(num) ? zero(num) : num / den
-
-# The step constants of a ring on side `pos`: `(σα, c_σ, σγ, σ)`.
-@inline function _ring_signed(pos::Bool, α, c₊, c₋, γ)
-    σ = ifelse(pos, one(α), -one(α))
-    return (σ * α, ifelse(pos, c₊, c₋), σ * γ, σ)
-end
-
-# One degree up from `(y, e)` at one ring: `e' = (c_σ − σαu) y + σγ e`, `y' = σ y + e'`.
-@inline _ring_e(σα, c, σγ, u, y, e) = muladd(muladd(-σα, u, c), y, σγ * e)
-@inline _ring_y(σ, y, e′) = muladd(σ, y, e′)
+# `d^{ℓ0}` at one ring as `(y, k)` from the order constants, held per order in `lC`, `p1`, `p2`, `sg` so a
+# device work-item reads them from arrays, and the ring's logarithms.
+@inline _ring_start(::Type{R}, lC::S, p1::Int32, p2::Int32, sg::S, lc::S, ls::S) where {R,S} =
+    FTB.wigner_d_start_value(R, FTB.WignerDStart{S}(lC, p1, p2, sg), lc, ls)
 
 # The weight of a value at scale `k`: whole at `0`, `dn = 2^{−K}` at `−1`, left out below.
 @inline _ring_weight(k::Int32, dn::R) where {R} =
     ifelse(k == Int32(0), one(R), ifelse(k == Int32(-1), dn, zero(R)))
-
-# `2^{K/2}`, above which a scaled value is scaled down, and `2^{−K}`, the factor.
-@inline _ring_bounds(::Type{R}) where {R} = (ldexp(one(R), _ring_span(R) ÷ 2), ldexp(one(R), -_ring_span(R)))
 
 """
     _ring_check_interval(R, lmax) -> Int
@@ -188,7 +126,7 @@ Steps a host chunk takes between scale checks. One step multiplies a value by at
 `2^{K−8}`, and a value held at weight zero stays below `2^{−K−8}` of the largest.
 """
 _ring_check_interval(::Type{R}, lmax::Integer) where {R} =
-    max(1, floor(Int, (_ring_span(R) ÷ 2 - 8) / log2(sqrt(2lmax + 1) + 2)))
+    max(1, floor(Int, (FTB.wigner_d_span(R) ÷ 2 - 8) / log2(sqrt(2lmax + 1) + 2)))
 
 const _RING_DEGREES = 16                 # degrees the adjoint carries every ring through per sweep
 
@@ -267,12 +205,12 @@ Base.show(io::IO, e::_RingEngine{R}) where {R} =
 # `u` lanes step in Reinsch's form from `(y, e)`, `(x, xl)` lanes in the plain one from `(y, y_{ℓ−1})`,
 # where the step coefficients read `(α, β, ·, γ)`.
 @inline function _ring_step(::Val{P}, α, c₊, c₋, γ, u::Tuple{AbstractFloat,Vararg{AbstractFloat}}, y, e) where {P}
-    σα, c, σγ, σ = _ring_signed(P, α, c₊, c₋, γ)
-    e′ = map((uj, yj, ej) -> _ring_e(σα, c, σγ, uj, yj, ej), u, y, e)
-    return map((yj, ej) -> _ring_y(σ, yj, ej), y, e′), e′
+    σα, c, σγ, σ = FTB.wigner_d_signed(P, α, c₊, c₋, γ)
+    ye = map((uj, yj, ej) -> FTB.wigner_d_step(σα, c, σγ, σ, uj, yj, ej), u, y, e)
+    return map(first, ye), map(last, ye)
 end
 @inline _ring_step(::Val, α, β, _, γ, (x, xl)::Tuple{Tuple,Tuple}, y, yo) =
-    map((xj, lj, yj, oj) -> muladd(muladd(α, xj, muladd(α, lj, β)), yj, -γ * oj), x, xl, y, yo), y
+    map((xj, lj, yj, oj) -> first(FTB.wigner_d_step_plain(α, β, γ, xj, lj, yj, oj)), x, xl, y, yo), y
 
 # The ring constants of the chunk at `j0` its step reads, and the second state value at the start degree:
 # `e = y` in Reinsch's form, `y_{ℓ0−1} = 0` in the plain one.
@@ -281,11 +219,10 @@ end
 @inline _ring_e0(::Tuple{AbstractFloat,Vararg{AbstractFloat}}, y) = y
 @inline _ring_e0(::Tuple{Tuple,Tuple}, y) = map(zero, y)
 
-# A scaled value above `up` and its `e` scaled by `dn` together.
+# A scaled value above `up` and its `e` scaled by `dn` together, across the chunk's lanes.
 @inline function _ring_rescale(y, e, k, up::R, dn::R) where {R}
-    big = map((kj, z) -> (kj < Int32(0)) & (abs(z) > up), k, y)
-    sc = map(b -> ifelse(b, dn, one(R)), big)
-    return map(*, y, sc), map(*, e, sc), map((kj, b) -> kj + Int32(b), k, big)
+    r = map((yj, ej, kj) -> FTB.wigner_d_rescale(yj, ej, kj, up, dn), y, e, k)
+    return map(t -> t[1], r), map(t -> t[2], r), map(t -> t[3], r)
 end
 
 # The chunk of rings `j0 + 1 … j0 + _ring_lanes(R)` at its starting degree: its ring constants, `y`, `k`.
@@ -306,7 +243,7 @@ end
 @inline function _ring_chunk!(w::_RingWork, eng::_RingEngine{R}, i::Int, ℓ0::Int, lmax::Int, j0::Int,
                               ::Val{G}, side::Val) where {R,G}
     u, y, k = _ring_chunk_start(eng, i, j0)
-    up, dn = _ring_bounds(R)
+    up, dn = FTB.wigner_d_bounds(R)
     e = _ring_e0(u, y)
     ar = ntuple(_ -> _lanes(_ -> zero(R), R), Val(G)); ai = ar
     A = w.A; Cp = w.Cp; Cm = w.Cm; Γ = w.Γ; cr = w.cr; ci = w.ci
@@ -356,7 +293,7 @@ end
 
 @inline function _ring_chunk_adjoint!(w::_RingWork, eng::_RingEngine{R}, ℓb::Int, nb::Int, j0::Int,
                                       ::Val{G}, side::Val) where {R,G}
-    up, dn = _ring_bounds(R)
+    up, dn = FTB.wigner_d_bounds(R)
     u = _ring_geometry(eng, j0)
     y = _load_lanes(w.Ys, j0, R); e = _load_lanes(w.Es, j0, R); k = _load_lanes(w.Ks, j0, R)
     hr = ntuple(g -> _lanes(l -> @inbounds(w.Fr[j0 + l, g]), R), Val(G))
@@ -449,16 +386,12 @@ end
 function _ring_order_coeffs!(w::_RingWork{R}, m::Int, n::Int, ℓ0::Int, lmax::Int) where {R}
     F = promote_type(R, Float64)
     @inbounds for ℓ in ℓ0:lmax
-        α, c₊, c₋, γ = _ring_coeffs(F, ℓ, m, n)
+        α, β, γ, c₊, c₋ = FTB.wigner_d_coeffs(F, ℓ, m, n)
         w.A[ℓ + 1] = α; w.Cm[ℓ + 1] = c₋; w.Γ[ℓ + 1] = γ
-        w.Cp[ℓ + 1] = _ring_reinsch(R) ? c₊ : _ring_beta(F, ℓ, m, n)
+        w.Cp[ℓ + 1] = _ring_reinsch(R) ? c₊ : β
     end
     return w
 end
-
-# `β = −(2ℓ+1) mn / D` of the step from degree `ℓ`.
-@inline _ring_beta(::Type{F}, ℓ::Int, m::Int, n::Int) where {F} =
-    ℓ == 0 ? zero(F) : -F(2ℓ + 1) * F(m) * F(n) / (F(ℓ) * sqrt((F(ℓ + 1)^2 - F(m)^2) * (F(ℓ + 1)^2 - F(n)^2)))
 
 @inline _ring_norm(::Type{R}, ℓ::Int) where {R} = sqrt(R(2ℓ + 1) / (4 * R(π)))
 

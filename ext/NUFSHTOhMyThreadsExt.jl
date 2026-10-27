@@ -17,6 +17,8 @@ using ComputationalBackends: ComputationalBackends
 using FlowTransformBindings: FlowTransformBindings as FTB
 using OhMyThreads: OhMyThreads
 
+NUFSHT._threaded_collections_available(::NUFSHT._ThreadedCollections) = true
+
 @inline _farm(f::F) where {F} = Base.ScopedValues.with(f, FTB.FASTTRANSFORMS_THREADS => 1)
 
 # ── Scalar collections ────────────────────────────────────────────────────────

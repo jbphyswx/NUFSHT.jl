@@ -10,9 +10,11 @@ struct HostBounceNUFFT <: NUFSHT.SpectralBackends.AbstractNUFFTSpectralBackend e
 struct HostBouncePlan{P}
     inner::P
 end
-NUFSHT._nufft_makeplan(::HostBounceNUFFT, nodes, type, n_modes, iflag, ntrans, tol; kwargs...) =
+NUFSHT._nufft_makeplan(::HostBounceNUFFT, nodes, type, n_modes, iflag, ntrans, tol, ::Type{T}, ::Type{Z},
+                       nthreads, upsampfac) where {T,Z} =
     HostBouncePlan(NUFSHT._nufft_makeplan(NUFSHT.SpectralBackends.DirectSumSpectralBackend(),
-                                          map(Array, nodes), type, n_modes, iflag, ntrans, tol; kwargs...))
+                                          map(Array, nodes), type, n_modes, iflag, ntrans, tol, T, Z,
+                                          nthreads, upsampfac))
 NUFSHT._nufft_setpts!(p::HostBouncePlan, x, y) = (NUFSHT._nufft_setpts!(p.inner, Array(x), Array(y)); p)
 NUFSHT._nufft_destroy!(::HostBouncePlan) = nothing
 function NUFSHT._nufft_exec!(p::HostBouncePlan, input, output)
@@ -39,49 +41,9 @@ function Base.:*(p::HostBounceFFT, x::JLArrays.JLArray)
     return copyto!(x, h)
 end
 
-# The solver steps that are NUFSHT's own, on device arrays with scalar indexing an error: the scatter of
-# the packed iterate into the plan's `(Nθ, Nφ, B)` layout, the gather of the adjoint back into it (with
-# and without the fold of the previous vector, over the first `n` columns), and the write-out of a
-# finished column to another column. Each is compared with the host loop.
-Test.@testset "KernelAbstractions extension: device packing never scalar-indexes (JLArray)" begin
-    Random.seed!(707)
-    lmax, B, n = 6, 4, 3
-    N, Nf = lmax + 1, 2lmax + 1
-    full = N * Nf
-    J(v) = JLArrays.JLArray(v)
-    no_scalar(f) = task_local_storage(f, :ScalarIndexing, GPUArraysCore.ScalarDisallowed)
-    Test.@test_throws ErrorException no_scalar(() -> J(zeros(3))[1])   # the guard bites
-
-    idx = NUFSHT._valid_indices(zeros(0), lmax)
-    K = length(idx)
-    xp = randn(K, B); w = randn(N, Nf, B); v = randn(K, B); c = randn(B)
-
-    Fc = zeros(N, Nf, B); NUFSHT._unpack_coeffs!(Fc, xp, idx, full, B)
-    vc = copy(v); NUFSHT._col_pbp_pack!(vc, w, c, idx, full, n)
-    pc = zeros(K, B); NUFSHT._pack_coeffs!(pc, w, idx, full, B)
-    Cc = zeros(N, Nf, B); NUFSHT._write_solution!(Cc, xp, idx, full, 2, 3)
-
-    Fj = J(zeros(N, Nf, B)); vj = J(copy(v)); pj = J(zeros(K, B)); Cj = J(zeros(N, Nf, B))
-    idxj = J(idx)
-    no_scalar() do
-        NUFSHT._unpack_coeffs!(Fj, J(xp), idxj, full, B)
-        NUFSHT._col_pbp_pack!(vj, J(w), J(c), idxj, full, n)
-        NUFSHT._pack_coeffs!(pj, J(w), idxj, full, B)
-        NUFSHT._write_solution!(Cj, J(xp), idxj, full, 2, 3)
-    end
-    Test.@test Array(Fj) == Fc
-    Test.@test Array(vj) ≈ vc
-    Test.@test Array(vj)[:, (n + 1):end] == v[:, (n + 1):end]   # the count bounded the fold
-    Test.@test Array(pj) == pc
-    Test.@test Array(Cj) == Cc
-    # Column 2 of the iterate lands in column 3, at the valid slots, with zero everywhere else.
-    Test.@test Cc[:, :, 3][idx] == xp[:, 2]
-    Test.@test all(iszero, vec(Cc[:, :, 3])[setdiff(1:full, idx)])
-end
-
 # `nusht_solve!` and `nusht_solve_spin!` end to end on device arrays with scalar indexing an error,
 # scored against the coefficients the fields were synthesised from by an independent evaluation. The
-# plans are built with `execution = GPUBackend(JLBackend())`.
+# plans are built with `execution = GPUBackend(JLBackend())`, the scalar one a `RingNUSHTplan`.
 Test.@testset "KernelAbstractions extension: device solves never scalar-index (JLArray)" begin
     J(v) = JLArrays.JLArray(v)
     no_scalar(f) = task_local_storage(f, :ScalarIndexing, GPUArraysCore.ScalarDisallowed)
@@ -103,6 +65,7 @@ Test.@testset "KernelAbstractions extension: device solves never scalar-index (J
             FE <: Complex && (f[:, b] .+= im .* synth_ref(imag.(Ct[:, :, b]), lmax, θ, φ))
         end
         p = NUFSHT.make_plan(FE, θ, φ, lmax; execution = gpu, ntrans = B, nufft = nb)
+        Test.@test p isa NUFSHT.RingNUSHTplan
         ws = FTB.LSMRWorkspace(p)
         C = NUFSHT.allocate_coefficients(p)
         Test.@test C isa GPUArraysCore.AbstractGPUArray
@@ -174,10 +137,8 @@ Test.@testset "KernelAbstractions extension: device ring S-step equals the host 
     end
 end
 
-# Single-precision device scalar plans: the sphere step runs in double precision on the host, so each
-# batch slice crosses between the plan's element type on the device and Float64 on the host, in both
-# directions. Synthesis is scored against the direct sum, the adjoint against `Σⱼ yⱼ Y_lm(xⱼ)` evaluated
-# directly, at single-precision accuracy.
+# Single-precision device scalar plans, every step in Float32 on the device. Synthesis is scored against
+# the direct sum, the adjoint against `Σⱼ yⱼ Y_lm(xⱼ)` evaluated directly, at single-precision accuracy.
 Test.@testset "KernelAbstractions extension: single-precision device scalar plans (JLArray)" begin
     J(v) = JLArrays.JLArray(v)
     no_scalar(f) = task_local_storage(f, :ScalarIndexing, GPUArraysCore.ScalarDisallowed)
@@ -273,6 +234,28 @@ Test.@testset "KernelAbstractions extension: device analysis and spin-0 conversi
     Cd2 = J(zeros(lmax + 1, 2lmax + 1))
     no_scalar(() -> NUFSHT.spin0_to_scalar!(Cd2, J(sh)))
     Test.@test relerr(synth_ref(Array(Cd2), lmax, θ, φ), f0) < 1e-12
+end
+
+# The direct-sum NUFFT on device nodes runs its kernels, never the host loops (which scalar-index), and
+# equals the host direct sum in both directions, batched.
+Test.@testset "KernelAbstractions extension: device direct-sum NUFFT (JLArray)" begin
+    J(v) = JLArrays.JLArray(v)
+    no_scalar(f) = task_local_storage(f, :ScalarIndexing, GPUArraysCore.ScalarDisallowed)
+    Random.seed!(850)
+    M, n1, n2, B = 70, 9, 7, 2
+    x = 2π .* rand(M) .- π; y = 2π .* rand(M)
+    DS = NUFSHT.SpectralBackends.DirectSumSpectralBackend()
+    for (type, iflag) in ((2, 1), (1, -1))
+        ph = NUFSHT._nufft_makeplan(DS, (x, y), type, Int64[n1, n2], iflag, B, 1e-12, Float64, ComplexF64, 1, nothing)
+        pd = NUFSHT._nufft_makeplan(DS, (J(x), J(y)), type, Int64[n1, n2], iflag, B, 1e-12, Float64, ComplexF64,
+                                    1, nothing)
+        input = type == 2 ? randn(ComplexF64, n1, n2, B) : randn(ComplexF64, M, B)
+        oh = type == 2 ? zeros(ComplexF64, M, B) : zeros(ComplexF64, n1, n2, B)
+        NUFSHT._nufft_exec!(ph, input, oh)
+        od = J(zero(oh))
+        no_scalar(() -> NUFSHT._nufft_exec!(pd, J(input), od))
+        Test.@test relerr(Array(od), oh) < 1e-13
+    end
 end
 
 # The device spectral filter against the host slot loop, for a smooth and a sharp transfer.

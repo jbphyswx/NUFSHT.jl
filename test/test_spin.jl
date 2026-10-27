@@ -23,6 +23,58 @@ Test.@testset "wigner_d is the rotation matrix ⟨ℓm|exp(-iβ Jy)|ℓn⟩" beg
     end
 end
 
+# Wigner's explicit sum (`d^ℓ_{m'm} = ⟨ℓm'|exp(-iβ Jy)|ℓm⟩`), whose alternating terms reach `2^{2ℓ}`, in
+# `4ℓ + 256`-bit arithmetic: the reference for `wigner_d` and the ring S-step at degrees where that sum
+# is useless in Float64.
+function _wigner_sum(ℓ::Int, m::Int, n::Int, β::Real)
+    setprecision(BigFloat, 4ℓ + 256) do
+        c = cos(BigFloat(β) / 2); s = sin(BigFloat(β) / 2)
+        f = cumprod([big(1); big.(1:2ℓ)])          # f[k + 1] = k!
+        pre = sqrt(BigFloat(f[ℓ + m + 1] * f[ℓ - m + 1] * f[ℓ + n + 1] * f[ℓ - n + 1]))
+        acc = zero(BigFloat)
+        for k in max(0, n - m):min(ℓ + n, ℓ - m)
+            acc += (-1)^(m - n + k) * c^(2ℓ + n - m - 2k) * s^(m - n + 2k) /
+                   BigFloat(f[ℓ + n - k + 1] * f[k + 1] * f[m - n + k + 1] * f[ℓ - m - k + 1])
+        end
+        return Float64(pre * acc)
+    end
+end
+
+Test.@testset "wigner_d at large degree against the explicit sum" begin
+    for (ℓ, m, n, β) in ((256, 0, 0, 0.7), (256, 37, -2, 1.3), (300, 150, 1, 2.9), (300, -5, 3, 0.05),
+                         (257, 256, -250, π / 2), (320, -2, -1, 3.1))
+        Test.@test abs(NUFSHT.wigner_d(ℓ, m, n, β) - _wigner_sum(ℓ, m, n, β)) <= ℓ * eps()
+    end
+end
+
+# The ring S-step's error at lmax 1024: the bivariate Fourier series it returns for single modes,
+# summed in BigFloat at colatitudes from either pole to the equator, against `N_ℓ d^ℓ_{m0}(θ)` from the
+# explicit sum, relative to the largest value. Below `10⁻¹²` in Float64 (the plain form), below
+# `lmax eps` in Float32 (Reinsch's form).
+Test.@testset "ring S-step error at lmax 1024" begin
+    lmax = 1024
+    modes = ((1024, 0), (1024, 1024), (1000, 37), (700, -350))
+    θs = (1e-3, 0.02, 0.3, 1.2, π / 2, 2.5, π - 0.02, π - 1e-3)
+    DS = NUFSHT.SpectralBackends.DirectSumSpectralBackend()
+    for (T, bound) in ((Float64, 1e-12), (Float32, lmax * eps(Float32)))
+        p = NUFSHT.make_spin_plan(Complex{T}, T.(collect(θs)), zeros(T, length(θs)), lmax, 0;
+                                  nufft = DS, ntrans = length(modes))
+        sf = zeros(Complex{T}, lmax + 1, 2lmax + 1, length(modes))
+        for (b, (ℓ, m)) in enumerate(modes)
+            sf[NUFSHT.spin_coeff_index(ℓ, m, lmax), b] = 1
+        end
+        NUFSHT._assemble_G!(p.G, sf, p)
+        for (b, (ℓ, m)) in enumerate(modes)
+            col = Complex{BigFloat}.(p.G[:, m + lmax + 1, b])
+            got = [Float64(real(sum(col[r] * cis(-(r - lmax - 1) * BigFloat(T(θ))) for r in eachindex(col))))
+                   for θ in θs]
+            ref = [sqrt((2ℓ + 1) / 4π) * _wigner_sum(ℓ, m, 0, T(θ)) for θ in θs]
+            Test.@test maximum(abs.(got .- ref)) / maximum(abs, ref) < bound
+        end
+        NUFSHT.close!(p)
+    end
+end
+
 # Each order is one task's whole computation, so the tasks a transform runs on change no sum.
 Test.@testset "ring S-step on several tasks equals one task" begin
     Random.seed!(9)
@@ -126,9 +178,9 @@ Test.@testset "spin-weighted scattered transforms" begin
     end
 end
 
-# `wigner_d` loses accuracy above ℓ ≈ 40, so at lmax = 128 the references are `₀Y_ℓ0(θ) = N_ℓ P_ℓ(cosθ)`
-# from the Legendre three-term recurrence and the adjoint identity.
-Test.@testset "spin transforms at large lmax (stable where wigner_d fails)" begin
+# At lmax = 128 the references are `₀Y_ℓ0(θ) = N_ℓ P_ℓ(cosθ)` from the Legendre three-term recurrence
+# and the adjoint identity.
+Test.@testset "spin transforms at large lmax" begin
     Random.seed!(77)
     lmax = 128
     shp = (lmax + 1, 2lmax + 1)

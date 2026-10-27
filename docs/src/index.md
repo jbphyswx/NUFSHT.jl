@@ -1,5 +1,9 @@
 # NUFSHT.jl
 
+```@meta
+CurrentModule = NUFSHT
+```
+
 **Non-Uniform Fast Spherical Harmonic Transforms** — native Julia implementation of the
 Double Fourier Sphere (DFS) + NUFFT algorithm for spherical harmonic transforms at
 arbitrary scattered (colatitude, longitude) points.

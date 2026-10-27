@@ -1,8 +1,7 @@
-using Documenter
-using NUFSHT
-using FastSphericalHarmonics
+using Documenter: Documenter
+using NUFSHT: NUFSHT
 
-makedocs(;
+Documenter.makedocs(;
     modules  = [NUFSHT],
     sitename = "NUFSHT.jl",
     authors  = "jbphyswx",
@@ -16,10 +15,10 @@ makedocs(;
         "Algorithm" => "algorithm.md",
         "API"       => "api.md",
     ],
-    warnonly = [:missing_docs, :docs_block],
+    warnonly = false,
 )
 
-deploydocs(;
+Documenter.deploydocs(;
     repo   = "github.com/jbphyswx/NUFSHT.jl",
     target = "build",
     branch = "gh-pages",

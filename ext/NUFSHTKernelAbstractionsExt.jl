@@ -5,10 +5,11 @@ Device-generic methods for the array-indexed steps of the transform, as KernelAb
 dispatched on `GPUArraysCore.AbstractGPUArray`. They run on any KernelAbstractions backend (CUDA, ROCm,
 Metal, oneAPI, the CPU backend) and take precedence over the host methods for a device array.
 
-The kernels cover the scalar mode assembly and its adjoint, the spin ring S-step and its adjoint, the
-solver's per-column steps, the weighted strengths and Hermitian projection of an analysis, the
-scalar ↔ spin-0 conversions and the spectral filter. The NUFFT goes through the `_nufft_*` functions to
-FlowTransformBindings, which builds the plan on the nodes' device.
+Device nodes build a [`NUFSHT.RingNUSHTplan`](@ref) for a scalar field, so every plan on a device runs
+the ring S-step. The kernels cover that step and its adjoint, the real-field fit's packing, the weighted
+strengths and Hermitian projection of an analysis, the scalar ↔ spin-0 conversions, the spectral filter
+and the direct-sum NUFFT. A fast NUFFT goes through the `_nufft_*` functions to FlowTransformBindings,
+which builds the plan on the nodes' device.
 
 Loaded by `using KernelAbstractions` (with `GPUArraysCore`).
 """
@@ -30,49 +31,13 @@ NUFSHT._make_plan(::Type{FE}, θ, φ, lmax, b::ComputationalBackends.GPUBackend;
 NUFSHT._make_spin_plan(::Type{FE}, θ, φ, lmax, s, b::ComputationalBackends.GPUBackend; kwargs...) where {FE} =
     NUFSHT._build_spin_plan(FE, _on_device(b, θ), _on_device(b, φ), lmax, s; kwargs...)
 
-# Kernel launches are asynchronous on device backends (CUDA/ROCm/…), so results are synchronized before
-# the host reads them.
-@inline function _sync(backend)
-    KernelAbstractions.synchronize(backend)
-    return nothing
-end
+# A scalar plan over device nodes runs on the ring S-step, whose every step has a kernel here.
+NUFSHT._build_plan(::Type{FE}, θ::GPUArraysCore.AbstractGPUArray, φ, lmax; kwargs...) where {FE<:Number} =
+    NUFSHT._build_ring_plan(FE, θ, φ, lmax; kwargs...)
 
-# ── Device scalar mode assembly (F) ─────────────────────────────────────────────
-# Both directions of `src/Modes.jl` are per-element gathers, so each is one workitem per output
-# element with no atomics and no fill pass, calling the `_mode_entry`/`_mode_adjoint_entry` the host
-# loops call. The plan buffers are `(…, …, B)`, so `ndrange` is the whole output including the batch
-# axis.
-
-@kernel function _modes_kern!(Z, @Const(G), lmax, offθ, offφ, n0, nm, h)
-    r, c, b = @index(Global, NTuple)
-    @inbounds Z[r, c, b] = NUFSHT._mode_entry(eltype(Z), G, lmax, r, c, b, offθ, offφ, n0, nm, h)
-end
-
-@kernel function _modes_adj_kern!(G, @Const(Z), lmax, offθ, offφ, fold, n0, nm, h)
-    i, j, b = @index(Global, NTuple)
-    @inbounds G[i, j, b] = NUFSHT._modes_out(eltype(G),
-        NUFSHT._mode_adjoint_entry(eltype(Z), Z, lmax, i, j, b, offθ, offφ, fold, n0, nm, h))
-end
-
-function NUFSHT._assemble_modes!(Z::GPUArraysCore.AbstractGPUArray, G, lmax::Integer)
-    n0, nm, h = NUFSHT._mode_norms(real(eltype(Z)))
-    offθ = NUFSHT._folded(Z, lmax) ? 1 : size(Z, 1) ÷ 2 + 1
-    backend = KernelAbstractions.get_backend(Z)
-    _modes_kern!(backend)(Z, G, Int(lmax), offθ, size(Z, 2) ÷ 2 + 1, n0, nm, h;
-                          ndrange = size(Z))
-    _sync(backend)
-    return Z
-end
-
-function NUFSHT._assemble_modes_adjoint!(G::GPUArraysCore.AbstractGPUArray, Z, lmax::Integer)
-    n0, nm, h = NUFSHT._mode_norms(real(eltype(Z)))
-    fold = NUFSHT._folded(Z, lmax)
-    backend = KernelAbstractions.get_backend(G)
-    _modes_adj_kern!(backend)(G, Z, Int(lmax), fold ? 1 : size(Z, 1) ÷ 2 + 1, size(Z, 2) ÷ 2 + 1,
-                              fold, n0, nm, h; ndrange = size(G))
-    _sync(backend)
-    return G
-end
+# Kernel launches are asynchronous on device backends (CUDA/ROCm/…) and run in order on the task's queue,
+# and a copy to the host waits for the queue, so no launch here synchronizes. cuFINUFFT issues on the
+# CUDA default stream, which CUDA orders against CUDA.jl's task streams (created blocking).
 
 # ── Device spin S-step: the ring recurrence of `src/RingEngine.jl` ──────────────────
 # Forward: one workitem per (ring, order, column) carries `d^ℓ_{m,−s}` up the degrees and writes its
@@ -105,7 +70,7 @@ end
 function _ring_coeff_tables(::Type{R}, lmax::Int, n::Int) where {R}
     A, Cp, Cm, Γ = (zeros(R, lmax + 1, lmax + 1) for _ in 1:4)
     for μ in 0:lmax, ℓ in max(μ, abs(n)):lmax
-        α, c₊, c₋, γ = NUFSHT._ring_coeffs(promote_type(R, Float64), ℓ, μ, n)
+        α, _, γ, c₊, c₋ = NUFSHT.FTB.wigner_d_coeffs(promote_type(R, Float64), ℓ, μ, n)
         A[ℓ + 1, μ + 1] = α; Cp[ℓ + 1, μ + 1] = c₊; Cm[ℓ + 1, μ + 1] = c₋; Γ[ℓ + 1, μ + 1] = γ
     end
     return A, Cp, Cm, Γ
@@ -142,9 +107,8 @@ end
 # One degree up from `(y, e)` at a ring on side `pos`, by the host's step.
 @inline function _ring_device_step(A, Cp, Cm, Γ, ℓ::Int, m::Int, pos::Bool, u, y, e)
     α, c₊, c₋, γ = _ring_table_coeffs(A, Cp, Cm, Γ, ℓ, m)
-    σα, c, σγ, σ = NUFSHT._ring_signed(pos, α, c₊, c₋, γ)
-    e′ = NUFSHT._ring_e(σα, c, σγ, u, y, e)
-    return NUFSHT._ring_y(σ, y, e′), e′
+    σα, c, σγ, σ = NUFSHT.FTB.wigner_d_signed(pos, α, c₊, c₋, γ)
+    return NUFSHT.FTB.wigner_d_step(σα, c, σγ, σ, u, y, e)
 end
 
 @kernel function _ring_forward_kern!(C, @Const(sf), @Const(u), @Const(pos), @Const(lc), @Const(ls),
@@ -153,7 +117,7 @@ end
     j, i, b = @index(Global, NTuple)
     R = eltype(u)
     m = i - lmax - 1
-    up, dn = NUFSHT._ring_bounds(R)
+    up, dn = NUFSHT.FTB.wigner_d_bounds(R)
     @inbounds begin
         y, k = NUFSHT._ring_start(R, lC[i], p1[i], p2[i], sg[i], lc[j], ls[j])
         uj = u[j]; pj = pos[j]
@@ -163,9 +127,7 @@ end
             c = Complex{R}(sf[ℓ + 1, i, b]) * NUFSHT._ring_norm(R, ℓ)
             acc += c * (y * NUFSHT._ring_weight(k, dn))
             yn, en = _ring_device_step(A, Cp, Cm, Γ, ℓ, m, pj, uj, y, e)
-            big = (k < Int32(0)) & (abs(yn) > up)
-            sc = ifelse(big, dn, one(R))
-            e = en * sc; y = yn * sc; k += Int32(big)
+            y, e, k = NUFSHT.FTB.wigner_d_rescale(yn, en, k, up, dn)
         end
         C[j, i, b] = acc
         if 1 < j < nring
@@ -225,17 +187,15 @@ end
         @inbounds begin
             R = eltype(u)
             m = i - lmax - 1
-            up, dn = NUFSHT._ring_bounds(R)
+            up, dn = NUFSHT.FTB.wigner_d_bounds(R)
             on = ℓ >= max(abs(m), abs(s))
             v = ifelse(on, st[1] * NUFSHT._ring_weight(kk[1], dn), zero(R))
             sr[t] = v * st[3]; si[t] = v * st[4]
             if on
                 jj = min((blk - 1) * WG + t, nring)
-                k = kk[1]
                 yn, en = _ring_device_step(A, Cp, Cm, Γ, ℓ, m, pos[jj], u[jj], st[1], st[2])
-                big = (k < Int32(0)) & (abs(yn) > up)
-                sc = ifelse(big, dn, one(R))
-                st[2] = en * sc; st[1] = yn * sc; kk[1] = k + Int32(big)
+                y, e, k = NUFSHT.FTB.wigner_d_rescale(yn, en, kk[1], up, dn)
+                st[1] = y; st[2] = e; kk[1] = k
             end
         end
         @synchronize
@@ -276,7 +236,6 @@ function NUFSHT._assemble_G_impl!(G::GPUArraysCore.AbstractGPUArray, sf, plan::N
                                  ndrange = (eng.nring, 2lmax + 1, plan.B))
     w.bwd * w.C
     _ring_modes_kern!(backend)(G, w.C, eng.N, _row_origin(G, lmax); ndrange = size(G))
-    _sync(backend)
     return G
 end
 
@@ -293,47 +252,12 @@ function NUFSHT._assemble_G_adjoint_impl!(sf::GPUArraysCore.AbstractGPUArray, Ĝ
                                                eng.p2, eng.sg, w.A, w.Cp, w.Cm, w.Γ, lmax, plan.s, eng.nring,
                                                Val(w.wg); ndrange = (nblk * w.wg, 2lmax + 1, plan.B))
     _ring_blocks_kern!(backend)(_as3(sf, lmax), w.P, nblk; ndrange = (lmax + 1, 2lmax + 1, plan.B))
-    _sync(backend)
     return sf
 end
 
-# ── Device solver steps ─────────────────────────────────────────────────────────
-# The column-wise steps of `nusht_solve!` and `nusht_solve_spin!` that are NUFSHT's own, as broadcasts
-# over the first `n` columns; FlowTransformBindings supplies the generic column updates and norms.
-# `_cols` flattens a batch buffer to (stride, columns), so one method serves point space and
-# coefficient space.
+# The first `n` columns of a batch buffer flattened to (stride, columns), so one method serves point
+# space and coefficient space.
 @inline _cols(A, n) = view(reshape(A, :, size(A, ndims(A))), :, 1:n)
-
-# ── Device pack/unpack between the packed solver vectors and the plan's full layout ──────────────
-# The scalar solver carries its vectors packed to the `l ≤ lmax` slots, so crossing to and from the
-# plan's `(Nθ, Nφ, B)` layout is a gather/scatter by index vector, here a broadcast over reshaped views.
-function NUFSHT._pack_coeffs!(dst::GPUArraysCore.AbstractGPUArray, src, idx, srclen::Integer,
-                              n::Integer)
-    _cols(dst, n) .= view(reshape(src, srclen, :), idx, 1:n)
-    return dst
-end
-
-function NUFSHT._unpack_coeffs!(dst::GPUArraysCore.AbstractGPUArray, src, idx, dstlen::Integer,
-                                n::Integer)
-    fill!(dst, zero(eltype(dst)))
-    view(reshape(dst, dstlen, :), idx, 1:n) .= _cols(src, n)
-    return dst
-end
-
-function NUFSHT._col_pbp_pack!(v::GPUArraysCore.AbstractGPUArray, wfull, β, idx,
-                               fulllen::Integer, n::Integer)
-    _cols(v, n) .= view(reshape(wfull, fulllen, :), idx, 1:n) .+
-                   reshape(view(β, 1:n), 1, :) .* _cols(v, n)
-    return v
-end
-
-function NUFSHT._write_solution!(C::GPUArraysCore.AbstractGPUArray, x, idx, full::Integer,
-                                 slot::Integer, dstcol::Integer)
-    col = view(reshape(C, full, :), :, dstcol)
-    fill!(col, zero(eltype(C)))
-    view(col, idx) .= view(reshape(x, length(idx), :), :, slot)
-    return C
-end
 
 # ── Device Hermitian pack/unpack (the real-field spin solve) ─────────────────────
 # A real spin-0 field's solver vectors are packed to `(lmax+1)²` real values per column. Each output
@@ -358,7 +282,6 @@ function NUFSHT._unpack_herm!(sf::GPUArraysCore.AbstractGPUArray, p, lmax::Integ
     backend = KernelAbstractions.get_backend(sf)
     _unpack_herm_kern!(backend)(_as3(sf, lmax), p, Int(lmax), NUFSHT._herm_len(lmax), 0, 0;
                                 ndrange = (lmax + 1, 2lmax + 1, B))
-    _sync(backend)
     return sf
 end
 
@@ -367,7 +290,6 @@ function NUFSHT._pack_herm!(p::GPUArraysCore.AbstractGPUArray, g, lmax::Integer,
     backend = KernelAbstractions.get_backend(p)
     K = NUFSHT._herm_len(lmax)
     _pack_herm_kern!(backend)(p, _as3(g, lmax), Int(lmax), K, β; ndrange = (K, B))
-    _sync(backend)
     return p
 end
 
@@ -378,11 +300,10 @@ function NUFSHT._write_solution!(C::GPUArraysCore.AbstractGPUArray, x, plan::NUF
     backend = KernelAbstractions.get_backend(C)
     _unpack_herm_kern!(backend)(_as3(C, lmax), x, lmax, NUFSHT._herm_len(lmax), Int(slot) - 1,
                                 Int(dstcol) - 1; ndrange = (lmax + 1, 2lmax + 1, 1))
-    _sync(backend)
     return C
 end
 
-# ── Device real↔complex field copy (scalar type-2/type-1 bracket) ───────────────
+# ── Device real↔complex field copy ──────────────────────────────────────────────
 # `f` may be `(M,)` or `(M,B)`; `fbuf` is `(M,B)` and equal length — a `reshape`d broadcast handles
 # either shape (the `src` versions are CPU scalar loops). Dispatched on the plan buffer `fbuf`.
 function NUFSHT._copy_real!(f, fbuf::GPUArraysCore.AbstractGPUArray)       # f = real(fbuf)
@@ -443,44 +364,86 @@ function NUFSHT._hermitian_part!(sf::GPUArraysCore.AbstractGPUArray, plan::NUFSH
     lmax = plan.lmax
     backend = KernelAbstractions.get_backend(sf)
     _hermitian_part_kern!(backend)(_as3(sf, lmax), Int(lmax); ndrange = (lmax + 1, lmax + 1, plan.B))
-    _sync(backend)
     return sf
 end
 
 function NUFSHT._scalar_to_spin0_pairs!(sf::GPUArraysCore.AbstractGPUArray, C, lmax::Int, B::Int)
     backend = KernelAbstractions.get_backend(sf)
     _scalar_to_spin0_kern!(backend)(_as3(sf, lmax), _as3(C, lmax), lmax; ndrange = (lmax + 1, lmax + 1, B))
-    _sync(backend)
     return sf
 end
 
 function NUFSHT._spin0_to_scalar_pairs!(C::GPUArraysCore.AbstractGPUArray, sf, lmax::Int, B::Int)
     backend = KernelAbstractions.get_backend(C)
     _spin0_to_scalar_kern!(backend)(_as3(C, lmax), _as3(sf, lmax), lmax; ndrange = (lmax + 1, lmax + 1, B))
-    _sync(backend)
     return C
 end
 
-# ── Device spectral filter (× H(ℓ)) ─────────────────────────────────────────────
-# `C` is `(lmax+1, 2lmax+1, B)`, multiplied by the transfer matrix broadcast across the batch. The
-# matrix depends only on the filter, `lmax`, the element type and the array type, so each is built and
-# moved to the device once and kept here.
-const _TRANSFER_CACHE = Dict{Tuple{Any,Int,DataType,DataType},Any}()
-const _TRANSFER_LOCK = ReentrantLock()
+# ── Device direct-sum NUFFT ─────────────────────────────────────────────────────
+# Both directions are gathers: one workitem per output value, summing over the other side, each phase
+# `e^{is(k₁x + k₂y)}` formed exactly, as the host direct sum's tables hold it.
+@inline _ds_freq(::Type{R}, i::Int, n::Int) where {R} =
+    R(NUFSHT.FTB.mode_frequency(NUFSHT.FTB.CenteredModes(), i, n))
 
-function _device_transfer(C, filter, lmax)
-    RT = real(eltype(C))
-    key = (filter, lmax, RT, typeof(C))
-    return Base.lock(_TRANSFER_LOCK) do
-        get!(_TRANSFER_CACHE, key) do
-            H = NUFSHT._transfer_matrix(filter, lmax, RT)
-            reshape(NUFSHT._to_like(C, H), size(H, 1), size(H, 2), 1)
+@kernel function _ds_type2_kern!(vals, @Const(modes), @Const(x), @Const(y), n1, n2, s)
+    j, b = @index(Global, NTuple)
+    R = eltype(x)
+    acc = zero(eltype(vals))
+    @inbounds begin
+        xj = x[j]; yj = y[j]
+        for i2 in 1:n2
+            col = zero(eltype(vals))
+            for i1 in 1:n1
+                col += modes[i1, i2, b] * cis(s * _ds_freq(R, i1, n1) * xj)
+            end
+            acc += col * cis(s * _ds_freq(R, i2, n2) * yj)
         end
+        vals[j, b] = acc
     end
 end
 
+@kernel function _ds_type1_kern!(modes, @Const(vals), @Const(x), @Const(y), n1, n2, s, M)
+    i1, i2, b = @index(Global, NTuple)
+    R = eltype(x)
+    k1 = s * _ds_freq(R, i1, n1); k2 = s * _ds_freq(R, i2, n2)
+    acc = zero(eltype(modes))
+    @inbounds for j in 1:M
+        acc += vals[j, b] * cis(k1 * x[j] + k2 * y[j])
+    end
+    @inbounds modes[i1, i2, b] = acc
+end
+
+# The struct's bounds are restated, so the signature is a subtype of the host method's and dispatch
+# prefers it.
+function NUFSHT._nufft_exec!(p::NUFSHT.DirectSumNUFFTPlan{T,<:GPUArraysCore.AbstractGPUArray{T,1}}, input,
+                             output) where {T<:AbstractFloat}
+    M = length(p.x)
+    backend = KernelAbstractions.get_backend(p.x)
+    if p.type == 2
+        modes = reshape(input, p.n1, p.n2, :)
+        vals = reshape(output, M, :)
+        _ds_type2_kern!(backend)(vals, modes, p.x, p.y, p.n1, p.n2, T(p.iflag); ndrange = size(vals))
+    else
+        vals = reshape(input, M, :)
+        modes = reshape(output, p.n1, p.n2, :)
+        _ds_type1_kern!(backend)(modes, vals, p.x, p.y, p.n1, p.n2, T(p.iflag), M; ndrange = size(modes))
+    end
+    return output
+end
+
+# ── Device spectral filter (× H(ℓ)) ─────────────────────────────────────────────
+# `H(ℓ)` for the `2lmax + 1` degrees the array holds, evaluated on the host in `C`'s real type, and one
+# workitem per slot scaling it by its degree's value.
+@kernel function _transfer_kern!(C, @Const(h))
+    i, j, b = @index(Global, NTuple)
+    @inbounds C[i, j, b] *= h[NUFSHT._slot_degree(i, j) + 1]
+end
+
 function NUFSHT.apply_transfer!(C::GPUArraysCore.AbstractGPUArray, filter, lmax)
-    C .*= _device_transfer(C, filter, lmax)
+    RT = real(eltype(C))
+    h = NUFSHT._to_like(C, [RT(NUFSHT.kernel_transfer(filter, ℓ)) for ℓ in 0:(2lmax)])
+    C3 = _as3(C, lmax)
+    _transfer_kern!(KernelAbstractions.get_backend(C))(C3, h; ndrange = size(C3))
     return C
 end
 

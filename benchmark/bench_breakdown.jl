@@ -74,7 +74,7 @@ function run(lmax, M, FE, be, tol = 1e-8)
     # S: load the coefficient slice and apply the butterfly, exactly as nusht_type2! does.
     _, tS = timed(() -> (copyto!(p.F, C); NUFSHT._sph_evaluate!(p)), 5)
     # F: the mode assembly alone.
-    _, tF = timed(() -> NUFSHT._assemble_modes!(p.Fhat, p.F, lmax), 5)
+    _, tF = timed(() -> NUFSHT._assemble_modes!(p.Fhat, p.F, lmax, NUFSHT._folded(p)), 5)
     # N: the NUFFT alone.
     _, tN = timed(() -> NUFSHT._nufft_exec!(NUFSHT._nufft2(p), p.Fhat, NUFSHT._fbuf(p)), 5)
     _, t2 = timed(() -> NUFSHT.nusht_type2!(f, C, p), 5)

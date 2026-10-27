@@ -44,7 +44,7 @@ function main()
             "lmax", "ring steps", "S FastTr.", "(cold)", "S ring s=0", "(cold)",
             "ring/FT", "verdict")
 
-    for lmax in (32, 64, 128, 256, 512)
+    for lmax in (64, 256, 512, 1024)
         # A handful of points: the NUFFT is not timed here, but a plan needs nodes.
         M = 64
         Random.seed!(1)

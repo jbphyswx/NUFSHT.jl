@@ -331,3 +331,30 @@ Test.@testset "nusht_analyze!: quadrature and fit" begin
     Test.@test relerr(C[:, :, 1][idx], A \ g) < 1e-6
     NUFSHT.close!(p)
 end
+
+# `nusht_filter_renorm!` divides by the filtered mask where it is at least `threshold` and writes zero
+# below, so a higher threshold zeroes a superset of the points; a literal threshold serves a Float32 plan.
+Test.@testset "nusht_filter_renorm! zeroes the points below threshold" begin
+    lmax = 8; M = 4 * (lmax + 1)^2
+    θ, φ = fib_points(M)
+    mask = cos.(θ) .< 0.4
+    filt = NUFSHT.gaussian_from_scale(2500e3)
+    for T in (Float64, Float32)
+        p = NUFSHT.make_plan(T, T.(θ), T.(φ), lmax; nthreads = 1)
+        m = T.(mask)
+        f = T.(synth_ref(rand_coeffs(lmax, 71), lmax, θ, φ)) .* m
+        ws = FTB.LSMRWorkspace(p)
+        num = zeros(T, M); NUFSHT.nusht_filter!(num, f, filt, p; ws)
+        zeroed = map((0.05, 0.6)) do t
+            out = copy(num); mf = zeros(T, M)
+            NUFSHT.nusht_filter_renorm!(out, m, filt, p; mask_filt = mf, ws, threshold = t)
+            below = abs.(mf) .< T(t)
+            Test.@test any(below) && !all(below)
+            Test.@test all(iszero, out[below])
+            Test.@test out[.!below] == num[.!below] ./ mf[.!below]
+            below
+        end
+        Test.@test all(zeroed[1] .<= zeroed[2]) && count(zeroed[2]) > count(zeroed[1])
+        NUFSHT.close!(p)
+    end
+end

@@ -2,10 +2,11 @@
 #
 #   julia --project=test test/gpu_cuda.jl
 #
-# Device plans (KernelAbstractions kernels for the mode assembly, the spin recurrence and the solver's
-# column primitives; FlowTransformBindings' NUFFT on the nodes' device) are scored against host plans
-# on the same points, for both NUFFT libraries, and each device solve against the coefficients its
-# field was synthesised from.
+# Device plans (KernelAbstractions kernels for the ring S-step, the conversions and the solver's packing;
+# FlowTransformBindings' NUFFT on the nodes' device) are scored against host plans on the same points,
+# for both NUFFT libraries, and each device solve against the coefficients its field was synthesised
+# from. A device scalar plan is a `RingNUSHTplan`, whose adjoint writes zero above degree `lmax`, so
+# adjoints are compared at the degrees `l ≤ lmax`.
 using Test: Test
 using Random: Random
 using CUDA: CUDA
@@ -65,7 +66,7 @@ Test.@testset "CUDA scalar transforms equal host: $(nameof(typeof(nufft)))" for 
 
         pc = NUFSHT.make_plan(θ, φ, lmax; tol = 1e-10, ntrans = B, nufft)
         pg = NUFSHT.make_plan(CUDA.CuArray(θ), CUDA.CuArray(φ), lmax; tol = 1e-10, ntrans = B, nufft)
-        Test.@test pg.F isa CUDA.CuArray && pg.nodes.fbuf isa CUDA.CuArray
+        Test.@test pg isa NUFSHT.RingNUSHTplan && pg.sf isa CUDA.CuArray
 
         fc = zeros(M, B); NUFSHT.nusht_type2!(fc, C, pc)
         fg = CUDA.zeros(M, B); NUFSHT.nusht_type2!(fg, CUDA.CuArray(C), pg)
@@ -74,6 +75,7 @@ Test.@testset "CUDA scalar transforms equal host: $(nameof(typeof(nufft)))" for 
         g = randn(M, B)
         Cc = zeros(N, Nφ, B); NUFSHT.nusht_type1!(Cc, g, pc)
         Cg = CUDA.zeros(N, Nφ, B); NUFSHT.nusht_type1!(Cg, CUDA.CuArray(g), pg)
+        NUFSHT.apply_transfer!(Cc, NUFSHT.TopHatTransfer(lmax), lmax)
         Test.@test relerr(Array(Cg), Cc) < 1e-8
 
         filt = NUFSHT.gaussian_from_scale(2000e3)
@@ -89,8 +91,7 @@ Test.@testset "CUDA scalar transforms equal host: $(nameof(typeof(nufft)))" for 
     end
 end
 
-# Single precision: each batch slice crosses between the plan's element type on the device and the
-# double-precision sphere step on the host, in both directions.
+# Single precision: the device plan runs every step in Float32, the host plan its sphere step in Float64.
 Test.@testset "CUDA single-precision scalar transforms equal host: $(nameof(typeof(nufft)))" for nufft in LIBRARIES
     Random.seed!(13)
     lmax, B = 16, 2
@@ -110,6 +111,7 @@ Test.@testset "CUDA single-precision scalar transforms equal host: $(nameof(type
         g = randn(FE, M, B)
         Cc = zeros(FE, N, Nφ, B); NUFSHT.nusht_type1!(Cc, g, pc)
         Cg = CUDA.zeros(FE, N, Nφ, B); NUFSHT.nusht_type1!(Cg, CUDA.CuArray(g), pg)
+        NUFSHT.apply_transfer!(Cc, NUFSHT.TopHatTransfer(lmax), lmax)
         Test.@test relerr(Array(Cg), Cc) < 1e-4
         NUFSHT.close!(pc); NUFSHT.close!(pg)
     end

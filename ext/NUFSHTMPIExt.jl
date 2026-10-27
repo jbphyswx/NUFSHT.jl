@@ -33,7 +33,7 @@ using MPI: MPI
 
 # `nusht_type1!(C, f_local, plan, MPIBackend(; comm))`: `A†` is a sum over points, so each rank adds
 # its own points' contribution and the sum lands in `C` on every rank.
-function NUFSHT._point_share_adjoint!(C, f_local, plan::NUFSHT.NUSHTplan,
+function NUFSHT._point_share_adjoint!(C, f_local, plan::NUFSHT.AbstractScalarNUSHTplan,
                                       execution::ComputationalBackends.AbstractMPIBackend)
     NUFSHT._nusht_true_adjoint!(C, f_local, plan)   # local A† (sum over this rank's points)
     MPI.Allreduce!(C, +, _comm(execution))          # sum contributions across ranks → A†f
@@ -63,7 +63,7 @@ A NUSHT plan whose points are divided among the ranks of a communicator: this ra
 points `own = (rank+1):nranks:M`, and the synthesis of those points. Every rank holds the whole field
 and the coefficients, and the transforms take and return the whole field.
 """
-struct MPINUSHTplan{P<:NUFSHT.NUSHTplan, O<:AbstractRange{Int}, L<:AbstractMatrix, C}
+struct MPINUSHTplan{P<:NUFSHT.AbstractScalarNUSHTplan, O<:AbstractRange{Int}, L<:AbstractMatrix, C}
     plan::P
     own::O
     npts::Int
@@ -87,7 +87,7 @@ function NUFSHT._make_plan(::Type{FE}, θ_nodes, φ_nodes, lmax, execution::Comp
     own = (MPI.Comm_rank(comm) + 1):nranks:M
     plan = NUFSHT._make_plan(FE, θ_nodes[own], φ_nodes[own], lmax,
                              ComputationalBackends.local_backend(execution); kwargs...)
-    local_out = NUFSHT._zeros_like(plan.F, eltype(plan.F), length(own), plan.B)
+    local_out = NUFSHT._zeros_like(NUFSHT._fbuf(plan), NUFSHT._field_eltype(plan), length(own), plan.B)
     return MPINUSHTplan(plan, own, M, local_out, comm)
 end
 

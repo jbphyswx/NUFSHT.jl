@@ -28,10 +28,6 @@
 # The θ-frequency row `i` of an order-`m` column carries, and whether that column is a sine series.
 @inline _theta_freq(i::Integer, am::Integer) = iseven(am) ? i - 1 : i
 
-# Whether the mode array holds the `kθ ≥ 0` half (`lmax+2` rows) of the centered `-(lmax+1) … lmax+1`
-# (`2lmax+3` rows). A real field's array is Hermitian, so every backend stores the half, and the plan
-# supplies the other.
-@inline _folded(Z, lmax::Integer) = size(Z, 1) == lmax + 2
 
 # The three normalizations every element needs, formed once per call.
 @inline _mode_norms(::Type{RT}) where {RT} =
@@ -109,19 +105,19 @@ The θ axis has odd length `2lmax+3`, so it has no self-paired Nyquist row and n
 end
 
 """
-    _assemble_modes!(Z, G, lmax)
+    _assemble_modes!(Z, G, lmax, fold)
 
 `G` (bivariate Fourier coefficients, `sph2fourier` layout, `(lmax+1, 2lmax+1, B)`) → `Z`, the complex
 mode array with `Z[kθ+offθ, kφ+offφ]` the coefficient of `exp(i(kθ·θ + kφ·φ))`, exactly. The device
 method is a `@kernel` over the same `_mode_entry`.
 
-`Z` may be the full `(2lmax+3, 2lmax+1, B)` array or the folded `(lmax+2, …)` half (`_folded`). Every
-entry is written, so `Z` needs no `fill!`.
+`Z` is the full `(2lmax+3, 2lmax+1, B)` array, or with `fold` the `kθ ≥ 0` half (`lmax+2` rows) a real
+field's Hermitian array stores (`_folded`). Every entry is written, so `Z` needs no `fill!`.
 """
-function _assemble_modes!(Z, G, lmax::Integer)
+function _assemble_modes!(Z, G, lmax::Integer, fold::Bool)
     CT = eltype(Z)
     n0, nm, h = _mode_norms(real(CT))
-    offθ = _folded(Z, lmax) ? 1 : size(Z, 1) ÷ 2 + 1
+    offθ = fold ? 1 : size(Z, 1) ÷ 2 + 1
     offφ = size(Z, 2) ÷ 2 + 1
     # `r` innermost: `Z` is written straight down its columns, and a fixed `c` fixes `|m|`, so the two
     # `G` columns read are fixed too and `i` marches with `r`.
@@ -132,17 +128,16 @@ function _assemble_modes!(Z, G, lmax::Integer)
 end
 
 """
-    _assemble_modes_adjoint!(G, Z, lmax)
+    _assemble_modes_adjoint!(G, Z, lmax, fold)
 
 Exact Euclidean adjoint of [`_assemble_modes!`](@ref), one entry of `G` per `_mode_adjoint_entry`. A
 real `G` takes the real part, which is the adjoint of the
 real→complex embedding; a complex one does not. The device method is a `@kernel` over the same
 per-element map.
 """
-function _assemble_modes_adjoint!(G, Z, lmax::Integer)
+function _assemble_modes_adjoint!(G, Z, lmax::Integer, fold::Bool)
     CT = eltype(Z)
     n0, nm, h = _mode_norms(real(CT))
-    fold = _folded(Z, lmax)
     offθ = fold ? 1 : size(Z, 1) ÷ 2 + 1
     offφ = size(Z, 2) ÷ 2 + 1
     GE = eltype(G)

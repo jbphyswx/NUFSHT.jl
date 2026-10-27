@@ -24,6 +24,7 @@ Test.@testset "NUFSHT.jl" begin
     include("test_ka.jl")
     include("test_threaded.jl")
     include("test_distributed.jl")
+    include("test_jet.jl")
 
     Test.@testset "Aqua quality checks" begin
         Aqua.test_all(NUFSHT; deps_compat=(check_extras=false,))

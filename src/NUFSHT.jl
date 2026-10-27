@@ -16,7 +16,8 @@ Double Fourier Sphere (DFS) + nuFFT spherical harmonic transforms at arbitrary s
 
 A [`NUSHTplan`](@ref) owns persistent NUFFT plans (built once over the nodes) and every work buffer, so
 repeated transforms — filtering, or the hundreds of matvecs in [`nusht_solve!`](@ref) — allocate
-nothing and never re-plan. All calls transform a batch of `B = plan.B` co-located fields (`ntrans`);
+nothing and never re-plan. On device nodes the scalar plan is a [`RingNUSHTplan`](@ref), whose **S**
+is the ring S-step of a spin-0 plan, as every spin plan's is. All calls transform a batch of `B = plan.B` co-located fields (`ntrans`);
 `B = 1` methods accept plain vectors/matrices. The NUFFT is FlowTransformBindings' (NonuniformFFTs or
 FINUFFT), or the in-core direct sum.
 
@@ -78,19 +79,22 @@ function plot_field end
 # An entry hands the backend to an internal function that dispatches on it; the extensions add their
 # methods to those internal functions.
 
-@inline _omt_loaded() = Base.get_extension(@__MODULE__, :NUFSHTOhMyThreadsExt) !== nothing
+# Whether collections of independent problems can run on threads; NUFSHTOhMyThreadsExt adds the method
+# for `_ThreadedCollections`.
+struct _ThreadedCollections end
+_threaded_collections_available(::Any) = false
 
 """
     _resolve_execution(execution) -> AbstractExecutionBackend
 
-NUFSHT's resolution of `AutoBackend` for a farm: `ThreadedBackend` when Julia has more than one thread
-and the OhMyThreads extension is loaded, otherwise `SerialBackend`. Every other backend is returned
-as given.
+NUFSHT's resolution of `AutoBackend` for a collection of independent problems: `ThreadedBackend` when
+Julia has more than one thread and the OhMyThreads extension is loaded, otherwise `SerialBackend`. Every
+other backend is returned as given.
 """
 @inline _resolve_execution(execution::ComputationalBackends.AbstractExecutionBackend) = execution
 @inline _resolve_execution(::ComputationalBackends.AbstractAutoBackend) =
-    (Threads.nthreads() > 1 && _omt_loaded()) ? ComputationalBackends.ThreadedBackend() :
-                                                ComputationalBackends.SerialBackend()
+    (Threads.nthreads() > 1 && _threaded_collections_available(_ThreadedCollections())) ?
+        ComputationalBackends.ThreadedBackend() : ComputationalBackends.SerialBackend()
 
 # Backends under which a plan over one process's points is applied as built.
 const _OneProcess = Union{ComputationalBackends.AbstractLocalBackend, ComputationalBackends.AbstractAutoBackend}
@@ -118,27 +122,26 @@ _execution_unavailable(execution, what) = throw(ArgumentError(
 @inline _npts(plan::AbstractNUSHTplan) = length(_θnodes(plan))
 @inline _slicelen(plan::NUSHTplan) = plan.Nθ * plan.Nφ
 
-@inline function _assert_coeffs(C, plan::NUSHTplan)
-    @assert length(C) == plan.Nθ * plan.Nφ * plan.B "coefficient array has $(length(C)) entries, expected $(plan.Nθ*plan.Nφ*plan.B) = Nθ·Nφ·B"
+@noinline _length_mismatch(what, got::Int, expected::Int, shape) =
+    throw(DimensionMismatch("$what has $got entries; the plan takes $expected = $shape"))
+
+@inline function _check_coeffs(C, plan::AbstractScalarNUSHTplan)
+    n = prod(coefficient_size(plan))
+    length(C) == n || _length_mismatch("coefficient array", length(C), n, "(lmax+1)·(2lmax+1)·B")
+    return nothing
 end
-@inline function _assert_field(f, plan::NUSHTplan)
-    @assert length(f) == _npts(plan) * plan.B "field array has $(length(f)) entries, expected $(_npts(plan)*plan.B) = M·B"
+@inline function _check_field(f, plan::AbstractScalarNUSHTplan)
+    n = _npts(plan) * plan.B
+    length(f) == n || _length_mismatch("field array", length(f), n, "M·B")
+    return nothing
 end
 
 # Copy batch slice `b` of a linear `(Nθ·Nφ·B)` array `A` to or from the dense `(Nθ,Nφ)` scratch `Fslice`
-# by offset, allocating nothing; through the host slice `stage` when there is one (`_slice_stage`).
-@inline _load_slice!(Fslice, ::Nothing, A, plan::NUSHTplan, b) =
+# by offset, converting the element type and allocating nothing.
+@inline _load_slice!(Fslice, A, plan::NUSHTplan, b) =
     copyto!(Fslice, 1, A, (b - 1) * _slicelen(plan) + 1, _slicelen(plan))
-@inline function _load_slice!(Fslice, stage::AbstractArray, A, plan::NUSHTplan, b)
-    copyto!(stage, 1, A, (b - 1) * _slicelen(plan) + 1, _slicelen(plan))
-    return copyto!(Fslice, stage)
-end
-@inline _store_slice!(A, Fslice, ::Nothing, plan::NUSHTplan, b) =
+@inline _store_slice!(A, Fslice, plan::NUSHTplan, b) =
     copyto!(A, (b - 1) * _slicelen(plan) + 1, Fslice, 1, _slicelen(plan))
-@inline function _store_slice!(A, Fslice, stage::AbstractArray, plan::NUSHTplan, b)
-    copyto!(stage, Fslice)
-    return copyto!(A, (b - 1) * _slicelen(plan) + 1, stage, 1, _slicelen(plan))
-end
 
 # Real-part extraction `fbuf → f` and field load `f → fbuf` (real↔complex), shape-agnostic (`f` may be
 # `(M,)` or `(M,B)`; `fbuf` is `(M,B)` — equal length). Host: zero-alloc scalar loop. Device methods
@@ -210,9 +213,9 @@ function _pool_columns!(op!::F, own::Tuple, pool::AbstractVector, k::Integer) wh
     return nothing
 end
 
-# A scalar plan's per-column sphere operation, `op!(slice, stage, P, P', b)`, over its first `k` columns.
+# A scalar plan's per-column sphere operation, `op!(slice, P, P', b)`, over its first `k` columns.
 function _sph_columns!(op!::F, plan::NUSHTplan, k::Integer) where {F}
-    _pool_columns!(op!, (plan.Fslice, plan.Fstage, plan.sph_plan, plan.sph_plan_adj), plan.sph_pool, k)
+    _pool_columns!(op!, (plan.Fslice, plan.sph_plan, plan.sph_plan_adj), plan.sph_pool, k)
     return plan
 end
 
@@ -220,10 +223,10 @@ end
 # the DFS bivariate Fourier series, which `_assemble_modes!` hands to the NUFFT; no equiangular grid is
 # formed.
 function _sph_evaluate!(plan::NUSHTplan, k::Integer = plan.B)
-    _sph_columns!(plan, k) do sl, st, P, _Padj, b
-        _load_slice!(sl, st, plan.F, plan, b)
+    _sph_columns!(plan, k) do sl, P, _Padj, b
+        _load_slice!(sl, plan.F, plan, b)
         _ft_lmul!(P, sl, plan)
-        _store_slice!(plan.F, sl, st, plan, b)
+        _store_slice!(plan.F, sl, plan, b)
     end
     return plan
 end
@@ -255,17 +258,19 @@ end
 # and a binding holding either width is a `Union` that boxes a large immutable on every transform, so
 # each width is read only inside the branch that selected it, where its type is concrete.
 @inline _with_narrowed(f::F, plan::NUSHTplan, k::Integer) where {F} =
-    _with_pool_entry(f, plan.size_pool, k, kk -> _build_width!(plan, kk))
+    _with_pool_entry(f, plan.size_pool, k, function (kk, ::Type{E}) where {E}
+        return _build_width!(plan, kk, E)
+    end)
 
 # F·N (forward): bivariate Fourier coefficients → complex mode array → type-2 NUFFT into `fbuf`.
 # `_assemble_modes!` produces the modes the NUFFT evaluates. The full width never reads the pool.
 function _dfn_synthesis!(plan::NUSHTplan, k::Integer = plan.B)
     if k == plan.B
-        _fold_weights!(_assemble_modes!(plan.Fhat, plan.F, plan.lmax), plan)
+        _fold_weights!(_assemble_modes!(plan.Fhat, plan.F, plan.lmax, _folded(plan)), plan)
         _nufft_exec!(_nufft2(plan), plan.Fhat, _fbuf(plan))
         _rephase!(_fbuf(plan), _θshift(plan))
     else
-        _fold_weights!(_assemble_modes!(_pfx(plan.Fhat, k), _pfx(plan.F, k), plan.lmax), plan)
+        _fold_weights!(_assemble_modes!(_pfx(plan.Fhat, k), _pfx(plan.F, k), plan.lmax, _folded(plan)), plan)
         _with_narrowed(plan, k) do e
             _nufft_exec!(e.nufft_type2, _pfx(plan.Fhat, k), _pfx(_fbuf(plan), k))
         end
@@ -280,13 +285,13 @@ function _dfn_analysis!(plan::NUSHTplan, k::Integer = plan.B)
     if k == plan.B
         _rephase_conj!(_fbuf(plan), _θshift(plan))
         _nufft_exec!(_require_analysis(plan.nodes.nufft_type1), _fbuf(plan), plan.Fhat)
-        _assemble_modes_adjoint!(plan.F, plan.Fhat, plan.lmax)
+        _assemble_modes_adjoint!(plan.F, plan.Fhat, plan.lmax, _folded(plan))
     else
         _rephase_conj!(_pfx(_fbuf(plan), k), _θshift(plan))
         _with_narrowed(plan, k) do e
             _nufft_exec!(_require_analysis(e.nufft_type1), _pfx(_fbuf(plan), k), _pfx(plan.Fhat, k))
         end
-        _assemble_modes_adjoint!(_pfx(plan.F, k), _pfx(plan.Fhat, k), plan.lmax)
+        _assemble_modes_adjoint!(_pfx(plan.F, k), _pfx(plan.Fhat, k), plan.lmax, _folded(plan))
     end
     return plan
 end
@@ -303,12 +308,13 @@ scattered points, writing values into `f`. Batched: `C` is `(Nθ, Nφ)` / `(Nθ,
 length-`M` / `(M, B)`.
 
 Algorithm `A = N·F·S`: `plan_sph2fourier` to the bivariate Fourier series (S) → assemble the complex
-mode array (F) → NUFFT type 2 (N).
+mode array (F) → NUFFT type 2 (N). A [`RingNUSHTplan`](@ref) converts `C` to spin-0 coefficients and
+synthesizes those, reading only the slots of degree `l ≤ lmax`.
 """
 function nusht_type2!(f, C, plan::NUSHTplan{T}, k::Integer = plan.B,
                       kdfn::Integer = k) where {T}
-    _assert_coeffs(C, plan)
-    _assert_field(f, plan)
+    _check_coeffs(C, plan)
+    _check_field(f, plan)
     copyto!(plan.F, C)
     _sph_evaluate!(plan, k)
     _dfn_synthesis!(plan, kdfn)
@@ -325,11 +331,11 @@ end
 
 **Type 1 (adjoint):** given field values `f` at the `M` scattered points, apply `A†` and write the
 result to `C`. This is the exact Euclidean adjoint of [`nusht_type2!`](@ref), its transpose, so `A†A`
-is Hermitian positive semidefinite and usable by an iterative solver. It carries no quadrature weights
-and fills every slot of `C`, the supernumerary ones included; [`nusht_analyze!`](@ref) gives the
-coefficients of `f`.
+is Hermitian positive semidefinite and usable by an iterative solver. It carries no quadrature weights.
+On a [`NUSHTplan`](@ref) it fills every slot of `C`, the supernumerary ones included; a
+[`RingNUSHTplan`](@ref) writes zero in those. [`nusht_analyze!`](@ref) gives the coefficients of `f`.
 """
-nusht_type1!(C, f, plan::NUSHTplan) = _nusht_true_adjoint!(C, f, plan)
+nusht_type1!(C, f, plan::AbstractScalarNUSHTplan) = _nusht_true_adjoint!(C, f, plan)
 
 """
     nusht_type1!(C, f_local, plan, execution) -> C
@@ -339,12 +345,13 @@ under `MPIBackend(; comm)` (with MPI loaded) each rank's share, summed over the 
 `C` on every rank. A local or `AutoBackend()` backend names this process alone, and gives
 `nusht_type1!(C, f_local, plan)`.
 """
-nusht_type1!(C, f_local, plan::NUSHTplan, execution::ComputationalBackends.AbstractExecutionBackend) =
+nusht_type1!(C, f_local, plan::AbstractScalarNUSHTplan,
+             execution::ComputationalBackends.AbstractExecutionBackend) =
     _point_share_adjoint!(C, f_local, plan, execution)
 
 # `A†f` over the points of every process `execution` names; NUFSHTMPIExt adds `MPIBackend`.
-_point_share_adjoint!(C, f, plan::NUSHTplan, ::_OneProcess) = _nusht_true_adjoint!(C, f, plan)
-_point_share_adjoint!(C, f, plan::NUSHTplan, e::ComputationalBackends.AbstractExecutionBackend) =
+_point_share_adjoint!(C, f, plan::AbstractScalarNUSHTplan, ::_OneProcess) = _nusht_true_adjoint!(C, f, plan)
+_point_share_adjoint!(C, f, plan::AbstractScalarNUSHTplan, e::ComputationalBackends.AbstractExecutionBackend) =
     _execution_unavailable(e, "a point-decomposed adjoint")
 
 """
@@ -355,8 +362,8 @@ The exact Euclidean adjoint of `nusht_type2!`: type-1 NUFFT, the transpose of th
 """
 function _nusht_true_adjoint!(C, f, plan::NUSHTplan{T}, k::Integer = plan.B,
                              kdfn::Integer = k) where {T}
-    _assert_field(f, plan)
-    _assert_coeffs(C, plan)
+    _check_field(f, plan)
+    _check_coeffs(C, plan)
     _copy_field!(_fbuf(plan), f)
     return _strengths_adjoint!(C, plan, k, kdfn)
 end
@@ -364,10 +371,10 @@ end
 # `A†` applied to the plan's strengths buffer, into `C`.
 function _strengths_adjoint!(C, plan::NUSHTplan, k::Integer, kdfn::Integer)
     _dfn_analysis!(plan, kdfn)
-    _sph_columns!(plan, k) do sl, st, _P, Padj, b
-        _load_slice!(sl, st, plan.F, plan, b)
+    _sph_columns!(plan, k) do sl, _P, Padj, b
+        _load_slice!(sl, plan.F, plan, b)
         _ft_lmul!(Padj, sl, plan)
-        _store_slice!(C, sl, st, plan, b)
+        _store_slice!(C, sl, plan, b)
     end
     return C
 end
@@ -392,8 +399,8 @@ end
 [`nusht_filter!`](@ref) is a solve followed by this, and so re-fits per filter; use the pair when
 filtering one field at several scales, since the fit is the expensive half.
 """
-function nusht_synthesize!(f_out, C, filter, plan::NUSHTplan)
-    _assert_coeffs(C, plan)
+function nusht_synthesize!(f_out, C, filter, plan::AbstractScalarNUSHTplan)
+    _check_coeffs(C, plan)
     scratch = _filter_scratch(plan)
     C === scratch || copyto!(scratch, C)
     apply_transfer!(scratch, filter, plan.lmax)
@@ -433,7 +440,7 @@ FTB.lsmr_ncolumns(plan::AbstractNUSHTplan) = plan.B
 FTB.lsmr_allocate_domain(plan::NUSHTplan{T,FE}) where {T,FE} =
     (_valid(plan); _zeros_like(plan.F, FE, _coefflen(plan), plan.B))
 FTB.lsmr_allocate_range(plan::NUSHTplan{T,FE}) where {T,FE} = _zeros_like(_fbuf(plan), FE, _npts(plan), plan.B)
-FTB.lsmr_check_solution(C, plan::NUSHTplan, ws) = _assert_coeffs(C, plan)
+FTB.lsmr_check_solution(C, plan::NUSHTplan, ws) = _check_coeffs(C, plan)
 
 # `u ← A v + c u`: `u` is scaled first and the synthesis, which lands in the plan's strengths buffer,
 # is added to it.
@@ -554,8 +561,8 @@ at `0`), or when its Krylov process ends exactly; `residual` is the largest `‖
 coefficients (`M` below `(lmax+1)²`, or clustered) make `A` rank deficient, and a column then stops on
 `conlim` with `converged == false`.
 """
-nusht_solve!(C, f, plan::NUSHTplan; ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan), weights = nothing,
-             kwargs...) =
+nusht_solve!(C, f, plan::AbstractScalarNUSHTplan; ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan),
+             weights = nothing, kwargs...) =
     _solve!(C, f, _weighted(plan, weights), ws; kwargs...)
 
 """
@@ -568,11 +575,12 @@ on every rank of `comm`. A local or `AutoBackend()` backend names this process a
 `nusht_solve!(C, f_local, plan)`. The keywords are those of `nusht_solve!(C, f, plan)`; the second form
 takes this process's weighted operator built once.
 """
-nusht_solve!(C, f_local, plan::NUSHTplan, execution::ComputationalBackends.AbstractExecutionBackend;
+nusht_solve!(C, f_local, plan::AbstractScalarNUSHTplan, execution::ComputationalBackends.AbstractExecutionBackend;
              ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan), weights = nothing, kwargs...) =
     _solve!(C, f_local, _weighted(_point_share(plan, execution), weights), ws; kwargs...)
 
-nusht_solve!(C, f_local, op::FTB.RangeWeighted{<:NUSHTplan}, execution::ComputationalBackends.AbstractExecutionBackend;
+nusht_solve!(C, f_local, op::FTB.RangeWeighted{<:AbstractScalarNUSHTplan},
+             execution::ComputationalBackends.AbstractExecutionBackend;
              ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(op), kwargs...) =
     _solve!(C, f_local, _weighted_share(op, execution), ws; kwargs...)
 
@@ -589,16 +597,23 @@ _point_share(op, e::ComputationalBackends.AbstractExecutionBackend) =
 _weighted_share(op::FTB.RangeWeighted, ::_OneProcess) = op
 _weighted_share(op::FTB.RangeWeighted, execution) = FTB.RangeWeighted(_point_share(op.op, execution), op)
 
-nusht_solve!(C, f, op::FTB.RangeWeighted{<:NUSHTplan}; ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(op),
-             kwargs...) =
+nusht_solve!(C, f, op::FTB.RangeWeighted{<:AbstractScalarNUSHTplan};
+             ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(op), kwargs...) =
     _solve!(C, f, op, ws; kwargs...)
 
-# The fit through `op`: a plan, or a plan's share of the points (`_PointShare`).
+# The fit through `op`: a plan, or a plan's share of the points (`_PointShare`), either weighted.
 function _solve!(C, f, op, ws::FTB.LSMRWorkspace{T}; maxiter::Integer = 500, rtol::Real = 1e-6,
                  conlim::Real = 0) where {T}
     info = FTB.lsmr!(C, op, f, ws; maxiter, rtol, conlim = conlim > 0 ? conlim : inv(eps(T)))
+    _finish_solution!(C, op)
     return (; C, iterations = info.iterations, residual = info.residual, converged = info.converged)
 end
+
+# The solution in `C` once every column is written: a plan whose `lsmr_write!` lands elsewhere moves it
+# into `C` here (`RingNUSHTplan`).
+_finish_solution!(C, _) = C
+_finish_solution!(C, op::FTB.RangeWeighted) = _finish_solution!(C, op.op)
+_finish_solution!(C, s::_PointShare) = _finish_solution!(C, s.plan)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Analysis: the coefficients of a sampled field, by a quadrature or by the fit
@@ -636,8 +651,8 @@ nusht_analyze!(C, f_local, plan::AbstractNUSHTplan, execution::ComputationalBack
     _analyze!(C, f_local, plan, weights, execution; kwargs...)
 
 # The fit without weights (the spin plan's methods are in Spin.jl), the quadrature with them.
-_analyze!(C, f, plan::NUSHTplan, ::Nothing; kwargs...) = nusht_solve!(C, f, plan; kwargs...)
-_analyze!(C, f, plan::NUSHTplan, ::Nothing, execution; kwargs...) =
+_analyze!(C, f, plan::AbstractScalarNUSHTplan, ::Nothing; kwargs...) = nusht_solve!(C, f, plan; kwargs...)
+_analyze!(C, f, plan::AbstractScalarNUSHTplan, ::Nothing, execution; kwargs...) =
     nusht_solve!(C, f, plan, execution; kwargs...)
 
 function _analyze!(C, f, plan::AbstractNUSHTplan, w::AbstractArray; ws = nothing, maxiter = nothing,
@@ -660,7 +675,7 @@ _point_share_quadrature!(C, f, w, plan::AbstractNUSHTplan, ::_OneProcess) = _qua
 _point_share_quadrature!(C, f, w, plan::AbstractNUSHTplan, e::ComputationalBackends.AbstractExecutionBackend) =
     _execution_unavailable(e, "a point-decomposed analysis")
 
-@inline function _assert_weights(w, plan::AbstractNUSHTplan)
+@inline function _check_weights(w, plan::AbstractNUSHTplan)
     length(w) == _npts(plan) || throw(DimensionMismatch(
         "weights has $(length(w)) entries for the plan's $(_npts(plan)) points"))
     return nothing
@@ -683,9 +698,9 @@ end
 # `Σⱼ wⱼ fⱼ Yₖ(xⱼ)` over the real harmonics `Yₖ` of degree `l ≤ lmax`, the supernumerary slots zeroed:
 # the adjoint of the weighted strengths, then the projection onto those degrees, the top hat at `lmax`.
 function _quadrature!(C, f, w, plan::NUSHTplan)
-    _assert_field(f, plan)
-    _assert_coeffs(C, plan)
-    _assert_weights(w, plan)
+    _check_field(f, plan)
+    _check_coeffs(C, plan)
+    _check_weights(w, plan)
     _copy_weighted!(_fbuf(plan), f, w)
     _strengths_adjoint!(C, plan, plan.B, plan.B)
     return apply_transfer!(C, TopHatTransfer(plan.lmax), plan.lmax)
@@ -707,7 +722,7 @@ The filter is `A H A⁺`, with `A⁺` the least-squares fit. At scattered points
 transpose of the synthesis, and `A H A†` is a smoothing; the two agree only on a quadrature grid. The
 fit is iterative, so hold a `ws` and reuse it across calls.
 """
-function nusht_filter!(f_out, f_in, filter, plan::NUSHTplan;
+function nusht_filter!(f_out, f_in, filter, plan::AbstractScalarNUSHTplan;
                        ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan), kwargs...)
     scratch = _filter_scratch(plan)
     nusht_solve!(scratch, f_in, plan; ws = ws, kwargs...)
@@ -716,17 +731,18 @@ function nusht_filter!(f_out, f_in, filter, plan::NUSHTplan;
 end
 
 """
-    nusht_filter_renorm!(f_out, mask, filter, plan; mask_filt=similar(f_out), ws, C_mask=nothing)
+    nusht_filter_renorm!(f_out, mask, filter, plan; mask_filt=similar(f_out), ws, C_mask=nothing,
+                         threshold=0.01)
 
 Renormalise the output of `nusht_filter!` to correct for land/ocean masking: divide by the
 filtered mask (the fraction of kernel weight over ocean). `f_out` must have been produced by
-`nusht_filter!(f_out, f .* mask, filter, plan)`. Points where the filtered mask is below `0.01`
+`nusht_filter!(f_out, f .* mask, filter, plan)`. Points where the filtered mask is below `threshold`
 are set to 0. Pass a reusable `mask_filt` scratch (shaped like `f_out`) to run allocation-free.
 """
-function nusht_filter_renorm!(f_out, mask, filter, plan::NUSHTplan{T};
+function nusht_filter_renorm!(f_out, mask, filter, plan::AbstractScalarNUSHTplan{T};
                               mask_filt = similar(f_out),
                               ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan),
-                              C_mask = nothing) where {T}
+                              C_mask = nothing, threshold::Real = 0.01) where {T}
     # `C_mask` holds the mask's coefficients, which do not depend on the filter's scale, so a multi-scale
     # caller fits them once; `nothing` fits the mask here.
     if C_mask === nothing
@@ -736,14 +752,14 @@ function nusht_filter_renorm!(f_out, mask, filter, plan::NUSHTplan{T};
     else
         nusht_synthesize!(mask_filt, C_mask, filter, plan)
     end
-    threshold = T(0.01)
     # `mask_filt` is shaped like `f_out` → a single fused broadcast, zero-alloc + device-safe.
-    f_out .= ifelse.(abs.(mask_filt) .>= threshold, f_out ./ mask_filt, zero(T))
+    f_out .= ifelse.(abs.(mask_filt) .>= T(threshold), f_out ./ mask_filt, zero(T))
     return f_out
 end
 
 include("Spin.jl")
 include("RingEngine.jl")
+include("RingPlan.jl")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Collections of independent problems, split across an execution backend
@@ -752,9 +768,11 @@ include("RingEngine.jl")
 # `SerialBackend` loops here, `ThreadedBackend` in NUFSHTOhMyThreadsExt.
 
 @inline function _check_farm(outs, ins, plans)
-    @assert length(outs) == length(ins) == length(plans) "outs, ins and plans must have equal length"
+    length(outs) == length(ins) == length(plans) || _unequal_lengths("outputs, inputs and plans")
     return nothing
 end
+
+@noinline _unequal_lengths(what) = throw(DimensionMismatch("$what must have equal lengths"))
 
 """
     nusht_type2!(fs, Cs, plans; execution = AutoBackend()) -> fs
@@ -946,11 +964,11 @@ nusht_type2(θs, φs, Cs, lmax;
     _nodeset_type2(θs, φs, Cs, lmax, _resolve_execution(execution); kwargs...)
 
 function _nodeset_type2(θs, φs, Cs, lmax, ::ComputationalBackends.AbstractLocalBackend; kwargs...)
-    @assert length(θs) == length(φs) == length(Cs) "θs, φs and Cs must have equal length"
+    length(θs) == length(φs) == length(Cs) || _unequal_lengths("θs, φs and Cs")
     return map(eachindex(θs)) do i
         plan = make_plan(θs[i], φs[i], lmax; kwargs...)
         try
-            f = zeros(eltype(plan.F), length(θs[i]))
+            f = zeros(_field_eltype(plan), length(θs[i]))
             nusht_type2!(f, Cs[i], plan)
             return f
         finally
@@ -974,11 +992,11 @@ nusht_solve(θs, φs, fs, lmax;
 
 function _nodeset_solve(θs, φs, fs, lmax, ::ComputationalBackends.AbstractLocalBackend;
                         rtol = 1e-6, maxiter = 500, kwargs...)
-    @assert length(θs) == length(φs) == length(fs) "θs, φs and fs must have equal length"
+    length(θs) == length(φs) == length(fs) || _unequal_lengths("θs, φs and fs")
     return map(eachindex(fs)) do i
         plan = make_plan(θs[i], φs[i], lmax; kwargs...)
         try
-            C = zeros(eltype(plan.F), lmax + 1, 2lmax + 1)
+            C = zeros(_field_eltype(plan), lmax + 1, 2lmax + 1)
             nusht_solve!(C, fs[i], plan; rtol = rtol, maxiter = maxiter)
             return C
         finally

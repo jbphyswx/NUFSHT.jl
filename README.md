@@ -120,9 +120,9 @@ only when you load their trigger package, so a plain `using NUFSHT` never pulls 
   NUFFT's memory against the default `2.0`, slows synthesis, and leaves analysis slightly *faster*. Use
   it when a dataset does not otherwise fit.
 - **Mixed precision.** `Float32` and `ComplexF32` are supported. The sphere plans FastTransforms
-  provides are `Float64`/`ComplexF64` only, so single-precision scalar plans run their S-step through a
-  double-precision slice buffer, and everything else, the ring S-step of single-precision spin plans
-  included, runs at the requested precision.
+  provides are `Float64`/`ComplexF64` only, so single-precision scalar plans on the host run their
+  S-step through a double-precision slice buffer, and everything else runs at the requested precision:
+  spin plans, and scalar plans on a device, whose S-step is the ring S-step.
 - **Parallel extensions** (each keyed on its trigger package, selected by the `execution` keyword):
   - `using OhMyThreads` — thread-parallel over independent problems (one plan per task),
     `nusht_type2!(fs, Cs, plans; execution = ThreadedBackend())`.
@@ -140,14 +140,18 @@ only when you load their trigger package, so a plain `using NUFSHT` never pulls 
   > that variable unset, calls from tasks run on one OpenMP thread. A plan runs FastTransforms at its
   > own thread count, the OhMyThreads farm and the per-column loop's tasks on one thread each, a
   > Distributed worker at its own thread count.
-- **GPU** (`using KernelAbstractions` with the device array package). The array-indexed steps (the
-  ring S-step of every device spin plan and the per-column solver primitives) are KA `@kernel`s,
-  **written once, run on any backend**; the ring S-step's FFTs are the device array package's
-  (`AbstractFFTs` plans, CUFFT on `CuArray`). FlowTransformBindings builds the NUFFT on the nodes'
-  device: NonuniformFFTs on their KernelAbstractions backend, FINUFFT as cuFINUFFT on `CuArray` nodes
-  (`using CUDA, FINUFFT`). A device node set, or `execution = GPUBackend(b)` with host nodes, yields a
-  device-resident plan (buffers `similar` to the nodes). The device kernels are validated against the
-  CPU path on `JLArrays`; end-to-end GPU parity is in `test/gpu_cuda.jl`, to run on NVIDIA hardware.
+- **GPU** (`using KernelAbstractions` with the device array package). A device node set, or
+  `execution = GPUBackend(b)` with host nodes, yields a device-resident plan (buffers `similar` to the
+  nodes), and every step of its transforms runs on the device. A scalar plan there is a
+  `RingNUSHTplan`: the ring S-step of a spin-0 plan, its coefficients converted to and from the scalar
+  layout, with the synthesis, adjoint, fits and filters of the host plan; it reads only the
+  coefficient slots of degree `l ≤ lmax`, and its adjoint writes zero in the others. The array-indexed
+  steps (the ring S-step, the conversions, the fits' packing, the filter and the direct-sum NUFFT) are
+  KA `@kernel`s, **written once, run on any backend**; the ring S-step's FFTs are the device array
+  package's (`AbstractFFTs` plans, `cuFFT` on `CuArray`). FlowTransformBindings builds the NUFFT on the
+  nodes' device: NonuniformFFTs on their KernelAbstractions backend, FINUFFT as cuFINUFFT on `CuArray`
+  nodes (`using CUDA, FINUFFT`). The device kernels are validated against the CPU path on `JLArrays`;
+  end-to-end GPU parity is in `test/gpu_cuda.jl`, to run on NVIDIA hardware.
 
 ## Algorithm
 
@@ -174,8 +178,8 @@ reflection encodes: the DFS extension of `Y_lm` in θ is `sin^|m|θ · Q(cosθ)`
 `Σ_ℓ ₛf_ℓm N_ℓ d^ℓ_{m,−s}(θ)` on `lmax + 2` or more equispaced colatitudes by the three-term
 recurrence of `d^ℓ_{m,−s}` in `ℓ`, held in scaled form where it is exponentially small, then one FFT
 per order gives its column of the bivariate Fourier series. The orders run on separate tasks, in the
-plan's precision, with a relative error below `lmax eps` in Float32 and below `10⁻¹²` in Float64 at
-lmax 1024.)
+plan's precision, with a relative error of order `lmax eps` in Float32 and `lmax^{3/2} eps` in Float64.
+A scalar plan over device nodes uses this S-step too, through a spin-0 plan.)
 
 ### The real fast path
 
@@ -350,7 +354,7 @@ nusht_filter_renorm!(f_out, mask, filt, plan)   # divide by filtered mask
 
 | Function | Description |
 |----------|-------------|
-| `make_plan([FE,] θ, φ, lmax; execution, tol)` | Construct pre-allocated plan for M scattered points; `FE` real or complex |
+| `make_plan([FE,] θ, φ, lmax; execution, tol)` | Construct pre-allocated plan for M scattered points; `FE` real or complex; a `NUSHTplan` on the host, a `RingNUSHTplan` on a device |
 | `plan_memory(plan)` | Per-field byte breakdown of what the plan holds, plus the total |
 | `allocate_coefficients(plan)` | A zeroed coefficient array of `coefficient_size(plan)`, on the plan's device |
 | `nusht_type2!(f, C, plan)` | Synthesis: SH coefficients → scattered field values |

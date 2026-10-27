@@ -6,21 +6,35 @@
 using FFTW: FFTW
 using FastTransforms: FastTransforms
 
-export AbstractNUSHTplan, NUSHTplan, make_plan, close!, set_nodes!, plan_memory
+export AbstractNUSHTplan, AbstractScalarNUSHTplan, NUSHTplan, make_plan, close!, set_nodes!, plan_memory
 export coefficient_size, allocate_coefficients
 export AbstractNodeSet, FixedCountNodes, VariableCountNodes
+export AbstractPointCount, FixedCount, VariableCount
 export AbstractPlanDirections, SynthesisOnly, SynthesisAndAnalysis
 
 # A NUFFT plan over `nodes = (x, y)` with its points set, through the bindings in NUFFT.jl; an
-# `upsampfac` of `0` takes the library's own oversampling.
+# `upsampfac` of `nothing` takes the library's own oversampling.
 #
-# `dtype` is the precision; `strengths` is the element type of the non-uniform data, and a real one
-# selects a real-data transform on a backend that has one (`_real_capable`). A backend without one
-# ignores it.
+# `T` is the precision; `Z` is the element type of the non-uniform data, and a real one selects a
+# real-data transform on a backend that has one (`_real_capable`). A backend without one ignores it.
 @inline _make_nufft(backend, nodes::NTuple{2,AbstractVector}, type, n_modes, iflag, B, tol, ::Type{T},
                     nthreads, upsampfac, ::Type{Z} = Complex{T}) where {T,Z} =
-    _nufft_makeplan(backend, nodes, type, n_modes, iflag, B, tol;
-                    dtype = T, strengths = Z, nthreads = nthreads, upsampfac = upsampfac)
+    _nufft_makeplan(backend, nodes, type, n_modes, iflag, B, tol, T, Z, nthreads, upsampfac)
+
+# The oversampling factor a NUFFT plan is built with: `nothing` for the library's own.
+@inline _upsampfac(::Nothing) = nothing
+@inline _upsampfac(σ::Real) = Float64(σ)
+
+function _check_nodes(θ_nodes, φ_nodes)
+    length(θ_nodes) == length(φ_nodes) || throw(DimensionMismatch(
+        "θ_nodes has $(length(θ_nodes)) points and φ_nodes $(length(φ_nodes))"))
+    return nothing
+end
+
+function _check_ntrans(ntrans::Integer)
+    ntrans ≥ 1 || throw(ArgumentError("ntrans is the number of fields per call, at least 1; got $ntrans"))
+    return Int(ntrans)
+end
 
 # Backend-generic zeroed buffer shaped like `ref` (host `Array` for CPU nodes, device array for GPU
 # nodes) — used so a device node set yields device-resident plan buffers.
@@ -129,17 +143,19 @@ realness — is read back off the plan when a width is built. `narrowable` is
 [`_width_narrowable`](@ref) of the backend; how the widths are stored is [`_nufft_size_pool`](@ref)'s.
 """
 _pool_recipe(backend, nt, uf) =
-    (backend = backend, nt = Int(nt), uf = Float64(uf), narrowable = _width_narrowable(backend))
+    (backend = backend, nt = Int(nt), uf = uf, narrowable = _width_narrowable(backend))
 
 """
-    _build_width!(plan, k) -> entry
+    _build_width!(plan, k, E) -> E
 
-Build and cache the NUFFT plan pair for working width `k`, returning it.
+Build the NUFFT plan pair for working width `k` as the pool entry type `E`, whose handle types the
+library plan is asserted to (`_make_nufft_as`).
 
-Mutates `plan.size_pool`, so it is not safe to call concurrently on a shared plan — the same
-restriction a plan already carries, since a NUFFT plan cannot be executed concurrently either.
+Called on a pool miss, which stores the entry in `plan.size_pool`, so it is not safe to call
+concurrently on a shared plan — the same restriction a plan already carries, since a NUFFT plan cannot
+be executed concurrently either.
 """
-function _build_width!(plan, k::Integer)
+function _build_width!(plan, k::Integer, ::Type{E}) where {E<:NamedTuple}
     r = plan.pool_recipe
     T = real(eltype(plan.Fhat))
     θn, φn = _θnufft(plan), _φnodes(plan)
@@ -148,28 +164,29 @@ function _build_width!(plan, k::Integer)
     # stores half, a complex half-height one is built at the stored size.
     Z = eltype(_fbuf(plan))
     n_modes = Int64[Z <: Real ? 2plan.lmax + 3 : size(plan.Fhat, 1), plan.Nφ]
-    n2 = _make_nufft(r.backend, (θn, φn), 2, n_modes, +1, k, plan.tol, T, r.nt, r.uf, Z)
+    n2 = _make_nufft_as(fieldtype(E, :nufft_type2), r.backend, (θn, φn), 2, n_modes, +1, k, plan.tol, T,
+                        r.nt, r.uf, Z)
     n1 = if plan.nodes.nufft_type1 === nothing
         nothing                                   # mirror the plan's own directions
     elseif _nufft_share_directions(r.backend)
         _nufft_as_type1(n2)                       # same plan, opposite direction
     else
         _make_nufft(r.backend, (θn, φn), 1, n_modes, -1, k, plan.tol, T, r.nt, r.uf, Z)
-    end
-    return (k = Int(k), nufft_type2 = n2, nufft_type1 = n1)
+    end::fieldtype(E, :nufft_type1)
+    return E((Int(k), n2, n1))
 end
 
 """
     _pool_lookup!(pool, k, build) -> entry
 
-The plan pair for working width `k` in a `Vector` pool, built by `build(k)` and stored on a miss.
-`build(k)` returns the pool's element type.
+The plan pair for working width `k` in a `Vector` pool, built by `build(k, E)` as the pool's element
+type `E` and stored on a miss.
 """
 function _pool_lookup!(pool::AbstractVector{E}, k::Integer, build) where {E}
     @inbounds for e in pool
         e.k == k && return e
     end
-    e = build(k)::E
+    e = build(k, E)::E
     push!(pool, e)
     return e
 end
@@ -177,19 +194,25 @@ end
 # A pool of one typed slot per width (`_typed_width_slots`): the width that is used lands in its slot
 # and stays there for the plan's life. The walk is over a tuple, so it unrolls. Slots of different
 # widths hold different concrete types, so the entry is passed to `f`, which each arm then calls on one
-# concrete type.
-#
-# Both arms reach `f` through something that strips `Nothing` — the `=== nothing` test on a hit, and
-# `something` after a miss has filled the slot — so `f` is specialised on the slot's own entry type.
+# concrete type: the slot's on a hit, the type `_fill_slot!` builds as on a miss.
 @inline function _with_pool_entry(f::F, pool::Tuple, k::Integer, build) where {F}
     slot = first(pool)
     slot.k == k || return _with_pool_entry(f, Base.tail(pool), k, build)
     e = slot.pair[]
     e === nothing || return f(e)
-    slot.pair[] = build(k)
-    return f(something(slot.pair[]))
+    return f(_fill_slot!(slot.pair, k, build))
 end
-_with_pool_entry(f::F, ::Tuple{}, k::Integer, build) where {F} = f(build(k))
+
+# A solve narrows only to the pool's widths (`_fit_width`), so running off the end is a caller's width.
+@noinline _with_pool_entry(f::F, ::Tuple{}, k::Integer, build) where {F} = throw(ArgumentError(
+    "width $k is not one of the plan's NUFFT widths, the powers of two below its batch size and the " *
+    "batch size"))
+
+function _fill_slot!(slot::Base.RefValue{Union{Nothing,E}}, k::Integer, build) where {E}
+    e = build(k, E)::E
+    slot[] = e
+    return e
+end
 
 # One element type, so there is no union to split and the plain lookup serves. `build` only passes
 # through here, so it takes a type parameter to be specialized on.
@@ -216,44 +239,43 @@ function _release_width!(slot)
 end
 
 """
-    _sph_pool(Fslice, Fstage, P, Padj, nslots, n)
+    _sph_pool(Fslice, P, Padj, nslots, n)
 
-One `Fslice`, one staging slice like `Fstage` and one set of sphere plans per task for `nslots` tasks,
-for threading the per-column sphere loops, the first entry the plan's own `(Fslice, Fstage, P, Padj)`
-and the rest built at the plan's thread count `n`. A FastTransforms plan is not safe to apply
-concurrently, and the loop's slice buffers are shared, so all of them have to be replicated. Empty when
-there is nothing to thread, so a single-threaded plan pays nothing.
+One `Fslice` and one set of sphere plans per task for `nslots` tasks, for threading the per-column
+sphere loops, the first entry the plan's own `(Fslice, P, Padj)` and the rest built at the plan's thread
+count `n`. A FastTransforms plan is not safe to apply concurrently, and the loop's slice buffer is
+shared, so both have to be replicated. Empty when there is nothing to thread, so a single-threaded plan
+pays nothing.
 
 Index the result by task chunk. A spawned task owns its chunk index for its whole life, while tasks
 migrate between threads, so two tasks keyed by `Threads.threadid()` can share an entry.
 """
-function _sph_pool(Fslice, Fstage, P, Padj, nslots::Integer, n::Integer)
-    pool = Tuple{typeof(Fslice), typeof(Fstage), typeof(P), typeof(Padj)}[]
+function _sph_pool(Fslice, P, Padj, nslots::Integer, n::Integer)
+    pool = Tuple{typeof(Fslice), typeof(P), typeof(Padj)}[]
     nslots <= 1 && return pool
-    push!(pool, (Fslice, Fstage, P, Padj))
+    push!(pool, (Fslice, P, Padj))
     for _ in 2:nslots
-        push!(pool, (similar(Fslice), _fresh_stage(Fstage), _build_sph_plans(Fslice, n)...))
+        push!(pool, (similar(Fslice), _build_sph_plans(Fslice, n)...))
     end
     return pool
 end
 
-_fresh_stage(::Nothing) = nothing
-_fresh_stage(stage::AbstractArray) = similar(stage)
-
-# The host slice a coefficient array copies through on its way to and from `Fslice`: one of the array's
-# own element type for a device array whose element type differs from the slice's, so the transfer
-# moves the array's precision and `copyto!` converts on the host; `nothing` where `copyto!` between the
-# two converts in place (a host array, or one element type).
-_slice_stage(F, Fslice) =
-    (F isa Array || eltype(F) === eltype(Fslice)) ? nothing : similar(Fslice, eltype(F))
-
 """
     AbstractNUSHTplan
 
-Supertype of [`NUSHTplan`](@ref) and [`SpinNUSHTplan`](@ref); both carry an
-[`AbstractNodeSet`](@ref) in their `nodes` field, so the node-set operations are written once.
+Supertype of the plans over one process's points: the scalar plans ([`AbstractScalarNUSHTplan`](@ref))
+and [`SpinNUSHTplan`](@ref).
 """
 abstract type AbstractNUSHTplan end
+
+"""
+    AbstractScalarNUSHTplan{T,FE} <: AbstractNUSHTplan
+
+Supertype of the scalar plans, [`NUSHTplan`](@ref) and [`RingNUSHTplan`](@ref), of precision `T` and
+field element type `FE`, whose coefficients are in FastTransforms' `sph_mode` layout. The scalar
+transforms, fits, analyses and filters take either.
+"""
+abstract type AbstractScalarNUSHTplan{T<:AbstractFloat,FE<:Number} <: AbstractNUSHTplan end
 
 """
     AbstractNodeSet
@@ -264,9 +286,31 @@ NUFFT handles, which own the loaded point tables and so belong with the points.
 Both concrete forms let the nodes **move** freely (that only rewrites array contents). They differ in
 whether the *count* may change, which is the only thing that requires rebinding a field:
 [`FixedCountNodes`](@ref) is immutable, [`VariableCountNodes`](@ref) is not. `make_plan`'s
-`variable_npts` keyword picks one; the immutable form is the default.
+`point_count` keyword picks one; the immutable form is the default.
 """
 abstract type AbstractNodeSet end
+
+"""
+    AbstractPointCount
+
+The `point_count` of [`make_plan`](@ref) and [`make_spin_plan`](@ref): [`FixedCount`](@ref) or
+[`VariableCount`](@ref).
+"""
+abstract type AbstractPointCount end
+
+"""
+    FixedCount() <: AbstractPointCount
+
+A plan over a [`FixedCountNodes`](@ref) set, the default.
+"""
+struct FixedCount <: AbstractPointCount end
+
+"""
+    VariableCount() <: AbstractPointCount
+
+A plan over a [`VariableCountNodes`](@ref) set, whose count [`set_nodes!`](@ref) may change.
+"""
+struct VariableCount <: AbstractPointCount end
 
 """
     FixedCountNodes <: AbstractNodeSet
@@ -289,7 +333,7 @@ end
 
 Node set whose three point-sized fields are assignable, so [`set_nodes!`](@ref) also accepts a
 different number of points. The NUFFT handles stay `const`; setting their points updates the count in
-place. Request one with `make_plan(…; variable_npts = true)`.
+place. Request one with `make_plan(…; point_count = VariableCount())`.
 """
 mutable struct VariableCountNodes{RV,SV,CT2,N1,N2} <: AbstractNodeSet
     θ_nodes::RV
@@ -301,8 +345,8 @@ mutable struct VariableCountNodes{RV,SV,CT2,N1,N2} <: AbstractNodeSet
     const nufft_type1::N1               # `Nothing` for a synthesis-only plan; see `directions`
 end
 
-_node_set(::Val{false}, θ, φ, θn, θs, fbuf, p2, p1) = FixedCountNodes(θ, φ, θn, θs, fbuf, p2, p1)
-_node_set(::Val{true}, θ, φ, θn, θs, fbuf, p2, p1) = VariableCountNodes(θ, φ, θn, θs, fbuf, p2, p1)
+_node_set(::FixedCount, θ, φ, θn, θs, fbuf, p2, p1) = FixedCountNodes(θ, φ, θn, θs, fbuf, p2, p1)
+_node_set(::VariableCount, θ, φ, θn, θs, fbuf, p2, p1) = VariableCountNodes(θ, φ, θn, θs, fbuf, p2, p1)
 
 # Re-point the analysis plan with the nodes. A derived handle shares the plan just pointed, and a
 # synthesis-only plan has none.
@@ -361,8 +405,6 @@ Fields:
   transform, only the `kθ ≥ 0` half is stored (`lmax+2` rows) and that backend supplies the rest.
 - `Fslice`: `(Nθ, Nφ)` scratch `Matrix` each batch slice is `copyto!`-ed through for the S-step.
   FastTransforms has no `Float32` sphere plan, so it stays double precision and the copy converts.
-  `Fstage`: the host `(Nθ, Nφ)` slice of element type `FE` a device plan of another precision copies
-  through, or `nothing` (see `_slice_stage`).
 - `sph_plan`, `sph_plan_adj`: FastTransforms `plan_sph2fourier` (P) and its adjoint on a `(Nθ, Nφ)`
   slice. `P` alone is the whole S-step — its output is already the bivariate Fourier series, so
   synthesis is `P·C` → assemble → one NUFFT, with no equiangular grid in between.
@@ -372,11 +414,14 @@ type-1 handle (`iflag = -1`, adjoint N†). `iflag = +1` supplies the reconstruc
 modes need no conjugate-transpose. The axis convention is `x = θ`, `y = φ`, and both mode axes are in
 `FlowTransformBindings.CenteredModes()` order, the signed wavenumber ranges above, so nothing is shifted
 per point.
+
+FastTransforms runs on the host, so a `NUSHTplan` holds host arrays; [`make_plan`](@ref) builds a
+[`RingNUSHTplan`](@ref) for device nodes.
 """
 struct NUSHTplan{T<:AbstractFloat, FE<:Number, AT3<:AbstractArray{FE,3},
-                 AT2<:AbstractMatrix, STG<:Union{Nothing,AbstractMatrix}, CT3<:AbstractArray{Complex{T},3},
+                 AT2<:AbstractMatrix, CT3<:AbstractArray{Complex{T},3},
                  ND<:AbstractNodeSet, SP, SPADJ, SPL, SZP, RCP,
-                 FT, IV<:AbstractVector{Int}} <: AbstractNUSHTplan
+                 FT, IV<:AbstractVector{Int}} <: AbstractScalarNUSHTplan{T,FE}
     lmax::Int
     Nθ::Int
     Nφ::Int
@@ -388,7 +433,6 @@ struct NUSHTplan{T<:AbstractFloat, FE<:Number, AT3<:AbstractArray{FE,3},
     F::AT3
     Fhat::CT3
     Fslice::AT2
-    Fstage::STG                   # see _slice_stage
     sph_plan::SP
     sph_plan_adj::SPADJ           # sph_plan' (P'), stored to keep the adjoint alloc-free
     sph_pool::SPL                 # per-task slice + plans for the threaded column loops; see _sph_pool
@@ -403,13 +447,16 @@ end
 The coefficient scratch filtering scales in, so the caller's array is left unmodified. Allocated on the
 first filter call and reused after; a plan that never filters holds none.
 """
-@inline function _filter_scratch(plan::NUSHTplan)
+@inline function _filter_scratch(plan::AbstractScalarNUSHTplan)
     c = plan.C[]
     c === nothing || return c
-    fresh = _zeros_like(plan.F, eltype(plan.F), plan.Nθ, plan.Nφ, plan.B)
+    fresh = allocate_coefficients(plan)
     plan.C[] = fresh
     return fresh
 end
+
+# The element type of the fields a scalar plan synthesizes and analyses.
+@inline _field_eltype(::AbstractScalarNUSHTplan{T,FE}) where {T,FE} = FE
 
 """
     coefficient_size(plan) -> NTuple{3,Int}
@@ -444,23 +491,23 @@ function plan_memory(plan::NUSHTplan)
     F      = Base.summarysize(plan.F)
     Fhat   = Base.summarysize(plan.Fhat)
     Fslice = Base.summarysize(plan.Fslice)
-    Fstage = plan.Fstage === nothing ? 0 : Base.summarysize(plan.Fstage)
     fbuf   = Base.summarysize(_fbuf(plan))
     nodes  = Base.summarysize(_θnodes(plan)) + Base.summarysize(_φnodes(plan))
     pool   = Base.summarysize(plan.size_pool)
     # The first entry of a nonempty pool is the plan's own slice and plans, counted above.
     sph    = sum(Base.summarysize, view(plan.sph_pool, 2:length(plan.sph_pool)); init = 0)
     valid  = slot(plan.valid)
-    return (; C, F, Fhat, Fslice, Fstage, fbuf, nodes, size_pool = pool, sph_pool = sph, valid,
-            total = C + F + Fhat + Fslice + Fstage + fbuf + nodes + pool + sph + valid)
+    return (; C, F, Fhat, Fslice, fbuf, nodes, size_pool = pool, sph_pool = sph, valid,
+            total = C + F + Fhat + Fslice + fbuf + nodes + pool + sph + valid)
 end
 
 """
     make_plan([FE = float(eltype(θ_nodes)),] θ_nodes, φ_nodes, lmax; execution = AutoBackend(), tol=1e-8, ntrans=1, …)
 
-Construct a `NUSHTplan` for `M` scattered points at colatitudes `θ_nodes ∈ [0,π]` and longitudes
+Construct a scalar plan for `M` scattered points at colatitudes `θ_nodes ∈ [0,π]` and longitudes
 `φ_nodes ∈ [0,2π)`, up to spherical harmonic degree `lmax`, transforming `ntrans` co-located fields
-per call. Builds the NUFFT plans over the nodes once; [`close!`](@ref) frees them.
+per call: a [`NUSHTplan`](@ref) for host nodes, a [`RingNUSHTplan`](@ref) for device nodes. Builds the
+NUFFT plans over the nodes once; [`close!`](@ref) frees them.
 
 `FE` is the field element type, positional as it is for `zeros(T, …)`. A real `FE` asserts the field
 values are real, so the mode array is conjugate-symmetric in `kθ`; on a NUFFT backend with a real-data
@@ -471,7 +518,8 @@ Keyword arguments:
 - `execution`: where the plan runs, a `ComputationalBackends` backend. `SerialBackend()` runs it on one
   thread and `ThreadedBackend()` on `Threads.nthreads()`; `AutoBackend()`, the default, runs it on the
   host at `nthreads`. `GPUBackend(b)` puts the nodes, and so the plan, in `b`'s memory (with
-  KernelAbstractions and GPUArraysCore). `DistributedBackend(inner)` divides the points among the worker
+  KernelAbstractions and GPUArraysCore), as device nodes passed under any other local backend do.
+  `DistributedBackend(inner)` divides the points among the worker
   processes and `MPIBackend(inner)` among the ranks of its communicator (with Distributed, MPI), each
   share's plan built under `inner` with the other keywords; both plans take and return the whole field.
 - `tol`: NUFFT accuracy tolerance, raised to `eps(T)`.
@@ -488,7 +536,8 @@ Keyword arguments:
   parallelises over Julia's own threads and so reaches only `1` and `Threads.nthreads()` — a count it
   cannot deliver is an error.
 - `upsampfac`: the NUFFT's oversampling factor; `nothing` takes the library's own.
-- `variable_npts`: let [`set_nodes!`](@ref) change the point count ([`VariableCountNodes`](@ref)).
+- `point_count`: [`FixedCount`](@ref) (default) or [`VariableCount`](@ref), which lets
+  [`set_nodes!`](@ref) change the point count.
 - `directions`: [`SynthesisAndAnalysis`](@ref) (default) or [`SynthesisOnly`](@ref).
 """
 make_plan(::Type{FE}, θ_nodes, φ_nodes, lmax;
@@ -506,14 +555,13 @@ function _build_plan(
     tol = 1e-8,
     ntrans::Integer = 1,
     nufft::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
-    variable_npts::Bool = false,
+    point_count::AbstractPointCount = FixedCount(),
     directions::AbstractPlanDirections = SynthesisAndAnalysis(),
     nthreads::Union{Nothing,Integer} = nothing,
     upsampfac::Union{Nothing,Real} = nothing,
 ) where {FE<:Number}
-    @assert length(θ_nodes) == length(φ_nodes)
-    B = Int(ntrans)
-    @assert B ≥ 1
+    _check_nodes(θ_nodes, φ_nodes)
+    B = _check_ntrans(ntrans)
     T = real(FE)
     T <: AbstractFloat ||
         throw(ArgumentError("field element type must be a float or complex float, got $FE"))
@@ -555,16 +603,15 @@ function _build_plan(
     θ_shift = (fold && !r2c) ?
         _to_like(θ, Complex{T}.(cis.(T(Nkstore ÷ 2) .* θ))) : nothing
 
-    # FastTransforms runs on the host, on one dense `(Nθ, Nφ)` `Matrix` of Float64 or ComplexF64 (it has
-    # no Float32 sphere plans). Each batch slice is copied through `Fslice`, host↔device for a device
-    # plan, converting precision; every other buffer runs at `FE`.
+    # FastTransforms runs on one dense `(Nθ, Nφ)` `Matrix` of Float64 or ComplexF64 (it has no Float32
+    # sphere plans). Each batch slice is copied through `Fslice`, converting precision; every other
+    # buffer runs at `FE`.
     Fslice = zeros(realfield ? Float64 : ComplexF64, Nθ, Nφ)
-    Fstage = _slice_stage(F, Fslice)
     ntasks = _task_count(nthreads)
     sph_plan, sph_plan_adj = _build_sph_plans(Fslice, ntasks)
     # Replicated only when there is something to thread, so a single-threaded plan pays no build cost
     # and no memory. Capped at `B`: more tasks than columns cannot help.
-    sph_pool = _sph_pool(Fslice, Fstage, sph_plan, sph_plan_adj, min(ntasks, B), ntasks)
+    sph_pool = _sph_pool(Fslice, sph_plan, sph_plan_adj, min(ntasks, B), ntasks)
 
     # iflag +1 for synthesis (type 2): reconstruction uses the +i (inverse-DFT) sign, so the raw
     # FFT modes need no conjugation — an axis swap takes the place of a conjugate-transpose
@@ -574,7 +621,7 @@ function _build_plan(
     # built at the stored size.
     n_modes = Int64[r2c ? Nk : Nkstore, Nφ]
     nt = nthreads === nothing ? 0 : Int(nthreads)
-    uf = upsampfac === nothing ? 0.0 : Float64(upsampfac)
+    uf = _upsampfac(upsampfac)
     # Where a backend's plan carries no direction, one object serves both and the second is a handle
     # onto it — that halves the oversampled grid and the sorted point copy the plan owns, and its
     # points are already set.
@@ -588,13 +635,13 @@ function _build_plan(
     size_pool = _nufft_size_pool(nub, nufft_type2, nufft_type1,
                                  pool_recipe.narrowable ? _pool_sizes(B) : Int[])
 
-    nodes = _node_set(Val(variable_npts), θ, φ, θ, θ_shift, fbuf, nufft_type2, nufft_type1)
+    nodes = _node_set(point_count, θ, φ, θ, θ_shift, fbuf, nufft_type2, nufft_type1)
 
     IV = typeof(similar(θ, Int, 0))
-    return NUSHTplan{T, FE, typeof(F), typeof(Fslice), typeof(Fstage), typeof(Fhat), typeof(nodes),
+    return NUSHTplan{T, FE, typeof(F), typeof(Fslice), typeof(Fhat), typeof(nodes),
                      typeof(sph_plan), typeof(sph_plan_adj),
                      typeof(sph_pool), typeof(size_pool), typeof(pool_recipe), typeof(tol64), IV}(
-        lmax, Nθ, Nφ, B, tol64, ntasks, nodes, C, F, Fhat, Fslice, Fstage,
+        lmax, Nθ, Nφ, B, tol64, ntasks, nodes, C, F, Fhat, Fslice,
         sph_plan, sph_plan_adj, sph_pool, size_pool, pool_recipe,
         Base.RefValue{Union{Nothing,IV}}(nothing),
     )
@@ -643,13 +690,13 @@ are rebuilt, and any reduced-width plan pair a batched solve cached is released,
 new nodes if a later solve narrows again.
 
 The points may move anywhere. Changing how *many* there are additionally needs the plan's
-point-indexed buffers to be replaced, which requires `make_plan(…; variable_npts = true)`; a plan
-built with the default [`FixedCountNodes`](@ref) throws a `DimensionMismatch`.
+point-indexed buffers to be replaced, which requires `make_plan(…; point_count = VariableCount())`; a
+plan built with the default [`FixedCountNodes`](@ref) throws a `DimensionMismatch`.
 
 With the count unchanged and no reduced-width plans cached, this rewrites array contents only.
 """
 function set_nodes!(plan::AbstractNUSHTplan, θ_nodes, φ_nodes)
-    @assert length(θ_nodes) == length(φ_nodes)
+    _check_nodes(θ_nodes, φ_nodes)
     _set_nodes!(plan.nodes, θ_nodes, φ_nodes)
     _sync_θshift!(_θshift(plan), _θnufft(plan), _shift_offset(plan))
     _nufft_setpts!(_nufft2(plan), _θnufft(plan), _φnodes(plan))
@@ -671,36 +718,16 @@ end
 @inline _sync_θshift!(s::AbstractVector, θ, N0) = (s .= cis.(N0 .* θ); s)
 
 """
-    _valid_mask(proto, T, lmax)
-
-`1` at the `(lmax+1)^2` slots holding degrees `l ≤ lmax`, `0` at the `lmax(lmax+1)` supernumerary ones
-holding `lmax < l ≤ lmax+|m|`. The index rule is FastTransforms' own (`sphones`): column 1 carries
-`m = 0` for every degree, and the column pair `2j, 2j+1` carries `m = ∓j` for `l = j … lmax`, so it
-occupies only its first `lmax+1-j` rows.
-
-Shaped `(Nθ, Nφ, 1)` to broadcast over the batch, and built in the plan's array type so applying it is
-device-resident and allocation-free.
-"""
-function _valid_mask(proto, ::Type{T}, lmax::Integer) where {T}
-    Nθ, Nφ = lmax + 1, 2lmax + 1
-    H = zeros(T, Nθ, Nφ, 1)
-    H[:, 1, 1] .= one(T)
-    for j in 1:lmax
-        H[1:(Nθ - j), 2j, 1] .= one(T)
-        H[1:(Nθ - j), 2j + 1, 1] .= one(T)
-    end
-    return _to_like(proto, H)
-end
-
-"""
     _valid_indices(proto, lmax) -> AbstractVector{Int}
 
 Linear positions, within one coefficient column, of the `(lmax+1)^2` slots holding degrees
-`l ≤ lmax`, the set [`_valid_mask`](@ref) marks, as indices.
+`l ≤ lmax`, in the plan's array type. The index rule is FastTransforms' own (`sphones`): column 1
+carries `m = 0` for every degree, and the column pair `2j, 2j+1` carries `m = ∓j` for `l = j … lmax`, so
+it occupies only its first `lmax+1-j` rows; the other `lmax(lmax+1)` slots hold the supernumerary
+degrees `lmax < l ≤ lmax+|m|`.
 
-The solver's vectors are packed to these, `(K, B)` with `K = (lmax+1)^2`, where the full layout holds
-`lmax(lmax+1)` more entries per column; every reduction and update of the iteration runs over the packed
-length. Built in the plan's array type so packing is device-resident.
+The solver's vectors are packed to these, `(K, B)` with `K = (lmax+1)^2`, so every reduction and update
+of the iteration runs over the packed length.
 """
 function _valid_indices(proto, lmax::Integer)
     Nθ = lmax + 1
@@ -752,6 +779,11 @@ end
 # it matches the buffer.
 @inline _shift_offset(plan::NUSHTplan{T}) where {T} = T(size(plan.Fhat, 1) ÷ 2)
 
+# Whether the plan's mode array holds the `kθ ≥ 0` half (`lmax+2` rows) of the centered
+# `-(lmax+1) … lmax+1` (`2lmax+3` rows): a real field's array is Hermitian, so its plan stores the half on
+# every backend, and supplies the other.
+@inline _folded(::NUSHTplan{T,FE}) where {T,FE} = FE <: Real
+
 # Same count: rewrite contents, no allocation, works on either node-set form.
 function _set_nodes_inplace!(nd, θ_nodes, φ_nodes)
     copyto!(nd.θ_nodes, θ_nodes)
@@ -763,7 +795,7 @@ function _set_nodes!(nd::FixedCountNodes, θ_nodes, φ_nodes)
     M = length(nd.θ_nodes)
     length(θ_nodes) == M || throw(DimensionMismatch(
         "this plan holds $M points and its node set has a fixed count, but got $(length(θ_nodes)). " *
-        "Build it with variable_npts = true to allow the count to change."))
+        "Build it with point_count = VariableCount() to allow the count to change."))
     return _set_nodes_inplace!(nd, θ_nodes, φ_nodes)
 end
 

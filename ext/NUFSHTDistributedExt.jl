@@ -45,13 +45,13 @@ end
 
 function NUFSHT._nodeset_type2(θs, φs, Cs, lmax, execution::ComputationalBackends.AbstractDistributedBackend;
                                tol = 1e-8, kwargs...)
-    @assert length(θs) == length(φs) == length(Cs) "θs, φs and Cs must have equal length"
+    length(θs) == length(φs) == length(Cs) || NUFSHT._unequal_lengths("θs, φs and Cs")
     inner = ComputationalBackends.local_backend(execution)
     kw = (; tol, kwargs...)
     NUFSHT._plan_threads(inner, get(kw, :nthreads, nothing))   # a count `inner` refuses raises here
     return _farm(collect(zip(θs, φs, Cs))) do (θ, φ, C)
         _problem(θ, φ, lmax, inner, kw) do plan
-            f = zeros(eltype(plan.F), length(θ))
+            f = zeros(NUFSHT._field_eltype(plan), length(θ))
             NUFSHT.nusht_type2!(f, C, plan)
             f
         end
@@ -60,13 +60,13 @@ end
 
 function NUFSHT._nodeset_solve(θs, φs, fs, lmax, execution::ComputationalBackends.AbstractDistributedBackend;
                                tol = 1e-8, rtol = 1e-6, maxiter = 500, kwargs...)
-    @assert length(θs) == length(φs) == length(fs) "θs, φs and fs must have equal length"
+    length(θs) == length(φs) == length(fs) || NUFSHT._unequal_lengths("θs, φs and fs")
     inner = ComputationalBackends.local_backend(execution)
     kw = (; tol, kwargs...)
     NUFSHT._plan_threads(inner, get(kw, :nthreads, nothing))
     return _farm(collect(zip(θs, φs, fs))) do (θ, φ, f)
         _problem(θ, φ, lmax, inner, kw) do plan
-            C = zeros(eltype(plan.F), lmax + 1, 2lmax + 1)
+            C = zeros(NUFSHT._field_eltype(plan), lmax + 1, 2lmax + 1)
             NUFSHT.nusht_solve!(C, f, plan; rtol = rtol, maxiter = maxiter)
             C
         end
@@ -117,7 +117,7 @@ function _part_plan(::Type{FE}, θ, φ, lmax, inner, kwargs) where {FE}
     end
     return (; plan, ws = FTB.LSMRWorkspace(plan), nthreads = n)
 end
-_part_info(f) = (p = fetch(f).plan; (NUFSHT.coefficient_size(p), p.B, eltype(p.F), p.tol))
+_part_info(f) = (p = fetch(f).plan; (NUFSHT.coefficient_size(p), p.B, p.tol))
 
 # `make_plan(FE, θ, φ, lmax; execution::DistributedBackend, kwargs...)`: the `M` points in contiguous
 # blocks, one per worker process (with none, the caller's over all of them), each worker's plan built
@@ -138,12 +138,13 @@ function NUFSHT._make_plan(::Type{FE}, θ_nodes, φ_nodes, lmax,
     NUFSHT._plan_threads(inner, get(kw, :nthreads, nothing))
     parts = [Distributed.remotecall(_part_plan, w, FE, collect(θ_nodes[blocks[k]]), collect(φ_nodes[blocks[k]]),
                                     lmax, inner, kw) for (k, w) in enumerate(ws)]
-    infos = Vector{Tuple{NTuple{3,Int},Int,DataType,Float64}}(undef, nw)
+    infos = Vector{Tuple{NTuple{3,Int},Int,Float64}}(undef, nw)
     @sync for (k, w) in enumerate(ws)
         @async infos[k] = Distributed.remotecall_fetch(_part_info, w, parts[k])
     end
-    csize, B, CE, tol = first(infos)
-    return DistributedNUSHTplan{FE,CE,typeof(parts),typeof(ws),typeof(blocks),typeof(tol)}(
+    csize, B, tol = first(infos)
+    # A scalar plan's coefficients have the field's element type.
+    return DistributedNUSHTplan{FE,FE,typeof(parts),typeof(ws),typeof(blocks),typeof(tol)}(
         parts, ws, blocks, M, Int(lmax), B, csize, tol)
 end
 
@@ -166,7 +167,7 @@ _put_rows!(f::AbstractMatrix, block, v) = (f[block, :] .= v; f)
 
 # The field at this worker's points, a vector or a column per transform like the caller's.
 _block_field(p, nrows::Int, batched::Bool) =
-    batched ? zeros(eltype(p.F), nrows, p.B) : zeros(eltype(p.F), nrows)
+    batched ? zeros(NUFSHT._field_eltype(p), nrows, p.B) : zeros(NUFSHT._field_eltype(p), nrows)
 
 function _part_synthesis(f, C, filter, nrows::Int, batched::Bool)
     part = fetch(f)

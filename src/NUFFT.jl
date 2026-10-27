@@ -99,7 +99,7 @@ function _warn_if_directsum(requested, resolved, M::Integer, K::Integer)
 end
 
 _nufft_makeplan(backend::SpectralBackends.AbstractSpectralBackend, nodes, type, n_modes, iflag,
-                ntrans, tol; kwargs...) = throw(ArgumentError(
+                ntrans, tol, ::Type, ::Type, nthreads, upsampfac) = throw(ArgumentError(
     "NUFSHT's NUFFT takes SpectralBackends.DirectSumSpectralBackend(), " *
     "FlowTransformBindings.NonuniformFFTsBackend() or FlowTransformBindings.FINUFFTBackend(); got " *
     "$(nameof(typeof(backend)))"))
@@ -120,21 +120,34 @@ end
 
 Base.show(io::IO, h::_FTBNUFFT) = print(io, "_FTBNUFFT(type ", h.type, ", ", h.plan, ")")
 
-# `strengths` is the element type of the non-uniform data, so a real one builds the real-data plan.
-# A thread count `0` takes the session's `Threads.nthreads()`, and an oversampling factor `0` the
-# library's default.
-function _nufft_makeplan(backend::_FTBLibrary, nodes::NTuple{2,AbstractVector}, type, n_modes, iflag,
-                         ntrans, tol; dtype = Float64, strengths = Complex{dtype},
-                         nthreads = nothing, upsampfac = nothing)
+# `_nufft_makeplan(backend, nodes, type, n_modes, iflag, ntrans, tol, T, Z, nthreads, upsampfac)`: `T` is
+# the precision and `Z` the element type of the non-uniform data, so a real `Z` builds the real-data
+# plan. A thread count `0` takes the session's `Threads.nthreads()`, and an oversampling factor
+# `nothing` the library's default.
+_nufft_makeplan(backend::_FTBLibrary, nodes::NTuple{2,AbstractVector}, type, n_modes, iflag, ntrans, tol,
+                ::Type{T}, ::Type{Z}, nthreads::Integer, upsampfac::Union{Nothing,Float64}) where {T,Z} =
+    _FTBNUFFT(_ftb_plan(backend, nodes, type, n_modes, iflag, ntrans, tol, Z, nthreads, upsampfac), Int(type),
+              false)
+
+function _ftb_plan(backend::_FTBLibrary, nodes::NTuple{2,AbstractVector}, type, n_modes, iflag, ntrans, tol,
+                   ::Type{Z}, nthreads::Integer, upsampfac::Union{Nothing,Float64}) where {Z}
     iflag == (type == 2 ? 1 : -1) || throw(ArgumentError(
         "a type-$type NUFFT runs with iflag $(type == 2 ? 1 : -1); got $iflag"))
-    nt = (nthreads === nothing || nthreads == 0) ? Threads.nthreads() : Int(nthreads)
-    uf = (upsampfac === nothing || upsampfac == 0) ? nothing : Float64(upsampfac)
-    p = FTB.plan_nufft(backend, strengths, nodes, (Int(n_modes[1]), Int(n_modes[2]));
-                       ntrans = Int(ntrans), tol = tol, order = FTB.CenteredModes(), nthreads = nt,
-                       upsampfac = uf)
-    return _FTBNUFFT(p, Int(type), false)
+    nt = nthreads == 0 ? Threads.nthreads() : Int(nthreads)
+    return FTB.plan_nufft(backend, Z, nodes, (Int(n_modes[1]), Int(n_modes[2]));
+                          ntrans = Int(ntrans), tol = tol, order = FTB.CenteredModes(), nthreads = nt,
+                          upsampfac = upsampfac)
 end
+
+# A handle of the type `H` a width's pool slot holds: the library plan is asserted to `H`'s plan type
+# before it is wrapped.
+_make_nufft_as(::Type{_FTBNUFFT{P}}, backend::_FTBLibrary, nodes, type, n_modes, iflag, ntrans, tol,
+               ::Type{T}, nthreads, upsampfac, ::Type{Z}) where {P,T,Z} =
+    _FTBNUFFT{P}(_ftb_plan(backend, nodes, type, n_modes, iflag, ntrans, tol, Z, nthreads, upsampfac)::P,
+                 Int(type), false)
+_make_nufft_as(::Type{H}, backend, nodes, type, n_modes, iflag, ntrans, tol, ::Type{T}, nthreads,
+               upsampfac, ::Type{Z}) where {H,T,Z} =
+    _make_nufft(backend, nodes, type, n_modes, iflag, ntrans, tol, T, nthreads, upsampfac, Z)::H
 
 _nufft_as_type1(h::_FTBNUFFT) = _FTBNUFFT(h.plan, 1, true)
 _nufft_derived(h::_FTBNUFFT) = h.derived
@@ -174,16 +187,16 @@ struct DirectSumNUFFTPlan{T<:AbstractFloat, V<:AbstractVector{T}, S<:AbstractMat
 end
 
 function _nufft_makeplan(::SpectralBackends.AbstractDirectSumSpectralBackend, nodes::NTuple{2,AbstractVector},
-                         type, n_modes, iflag, ntrans, tol;
-                         dtype = Float64, nthreads = nothing, kwargs...)
-    nt = (isnothing(nthreads) || nthreads == 0) ? Threads.nthreads() : Int(nthreads)
+                         type, n_modes, iflag, ntrans, tol, ::Type{T}, ::Type, nthreads::Integer,
+                         upsampfac) where {T}
+    nt = nthreads == 0 ? Threads.nthreads() : Int(nthreads)
     nt ≥ 1 || throw(ArgumentError("nthreads must be positive (or 0 for all threads), got $nthreads"))
-    x = similar(first(nodes), dtype, length(first(nodes)))
+    x = similar(first(nodes), T, length(first(nodes)))
     n1, n2 = Int(n_modes[1]), Int(n_modes[2])
-    ex = Matrix{Complex{dtype}}(undef, n1, nt)
-    ey = Matrix{Complex{dtype}}(undef, n2, nt)
-    p = DirectSumNUFFTPlan{dtype, typeof(x), typeof(ex)}(Int(type), n1, n2, Int(iflag), Int(ntrans), nt,
-                                                         x, similar(x), ex, ey)
+    ex = Matrix{Complex{T}}(undef, n1, nt)
+    ey = Matrix{Complex{T}}(undef, n2, nt)
+    p = DirectSumNUFFTPlan{T, typeof(x), typeof(ex)}(Int(type), n1, n2, Int(iflag), Int(ntrans), nt,
+                                                     x, similar(x), ex, ey)
     return _nufft_setpts!(p, nodes...)
 end
 
