@@ -6,17 +6,16 @@ export RingNUSHTplan
 """
     RingNUSHTplan{T,FE}
 
-A scalar plan whose S-step is the ring engine of a spin-0 [`SpinNUSHTplan`](@ref), every step in the
-plan's precision `T`, on the host or on the nodes' device; [`make_plan`](@ref) builds one for device
-nodes. Its coefficients are a scalar plan's, `(lmax+1, 2lmax+1, B)` in the `sph_mode` layout, and pass
-through the spin-0 layout by [`scalar_to_spin0!`](@ref) and [`spin0_to_scalar!`](@ref). It takes every
-scalar transform, fit, analysis and filter a [`NUSHTplan`](@ref) takes. Its synthesis reads only the
-slots of degree `l ≤ lmax`, and its adjoint writes zero in the others.
+A scalar transform through a spin-0 plan, in precision `T`, on the host or the nodes' device.
+[`make_plan`](@ref) builds one for device nodes and for [`TensorProduct`](@ref) grids. Its coefficients
+are `(lmax+1, 2lmax+1, B)` in the `sph_mode` layout and pass through the spin-0 layout by
+[`scalar_to_spin0!`](@ref) and [`spin0_to_scalar!`](@ref). It supports scalar transforms, fits, analyses
+and filters. Synthesis reads the slots of degree `l ≤ lmax`; the adjoint writes zero in the others.
 
 Fields: `lmax`, `B` and `tol` as a `NUSHTplan`'s; `spin`, the spin-0 plan; `sf`, the spin-0 coefficients
-the conversions pass through; `C`, the filter scratch, empty until the first filter call.
+the conversions pass through; `C`, the filter scratch.
 """
-struct RingNUSHTplan{T<:AbstractFloat, FE<:Number, P<:SpinNUSHTplan{T}, CT3<:AbstractArray{Complex{T},3},
+struct RingNUSHTplan{T<:AbstractFloat, FE<:Number, P<:AbstractSpinNUSHTplan{T}, CT3<:AbstractArray{Complex{T},3},
                      AT3<:AbstractArray{FE,3}, FT} <: AbstractScalarNUSHTplan{T,FE}
     lmax::Int
     B::Int
@@ -41,6 +40,7 @@ allocate_coefficients(plan::RingNUSHTplan{T,FE}) where {T,FE} =
 
 @inline _θnodes(plan::RingNUSHTplan) = _θnodes(plan.spin)
 @inline _fbuf(plan::RingNUSHTplan) = _fbuf(plan.spin)
+@inline _npts(plan::RingNUSHTplan) = _npts(plan.spin)
 
 set_nodes!(plan::RingNUSHTplan, θ_nodes, φ_nodes) = (set_nodes!(plan.spin, θ_nodes, φ_nodes); plan)
 close!(plan::RingNUSHTplan) = close!(plan.spin)
@@ -56,12 +56,16 @@ function plan_memory(plan::RingNUSHTplan)
     sf      = Base.summarysize(plan.sf)
     G       = Base.summarysize(sp.G)
     fbuf    = Base.summarysize(_fbuf(sp))
-    nodes   = Base.summarysize(_θnodes(sp)) + Base.summarysize(_φnodes(sp)) + Base.summarysize(_θnufft(sp))
+    nodes   = _spin_node_memory(sp)
     engine  = Base.summarysize(sp.engine)
-    solve_w = slot(sp.solve_w)
+    solve_w = _spin_solve_memory(sp)
     return (; C, sf, G, fbuf, nodes, engine, solve_w,
             total = C + sf + G + fbuf + nodes + engine + solve_w)
 end
+
+_spin_node_memory(sp::SpinNUSHTplan) =
+    Base.summarysize(_θnodes(sp)) + Base.summarysize(_φnodes(sp)) + Base.summarysize(_θnufft(sp))
+_spin_solve_memory(sp::SpinNUSHTplan) = sp.solve_w[] === nothing ? 0 : Base.summarysize(sp.solve_w[])
 
 function nusht_type2!(f, C, plan::RingNUSHTplan)
     _check_coeffs(C, plan)

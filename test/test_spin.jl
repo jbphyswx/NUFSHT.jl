@@ -326,29 +326,20 @@ _spin_field(sf, s, lmax, θ, φ) =
 Test.@testset "nusht_analyze!: spin quadrature and fit" begin
     lmax = 6
     θ, φ, w = gauss_legendre_grid(lmax)
-    M = length(θ)
-
-    sf = _spin_coeffs(lmax, 1, 71)
-    f = _spin_field(sf, 1, lmax, θ, φ)
-    p = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 1; tol = 1e-13, nthreads = 1)
-    S = NUFSHT.allocate_coefficients(p)
-    res = NUFSHT.nusht_analyze!(S, f, p; weights = w)
-    Test.@test res.iterations == 0 && res.converged
-    Test.@test relerr(S[:, :, 1], sf) < 1e-10
-    _, _, _, conv = NUFSHT.nusht_analyze!(S, f, p; rtol = 1e-12, maxiter = 400)
-    Test.@test conv
-    Test.@test relerr(S[:, :, 1], sf) < 1e-9
-    NUFSHT.close!(p)
-
-    sh = _spin_coeffs(lmax, 0, 72; hermitian = true)
-    f0 = real.(_spin_field(sh, 0, lmax, θ, φ))
-    for be in (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend(),
-               NUFSHT.SpectralBackends.DirectSumSpectralBackend())
-        p0 = NUFSHT.make_spin_plan(Float64, θ, φ, lmax, 0; tol = 1e-13, nthreads = 1, nufft = be)
-        S0 = NUFSHT.allocate_coefficients(p0)
-        NUFSHT.nusht_analyze!(S0, f0, p0; weights = w)
-        Test.@test relerr(S0[:, :, 1], sh) < 1e-10
-        NUFSHT.close!(p0)
+    θaxis = θ[1:(lmax + 1)]
+    φaxis = range(0.0; step = 2π / (2lmax + 1), length = 2lmax + 1)
+    for (FE, s) in ((ComplexF64, 1), (Float64, 0))
+        sf = _spin_coeffs(lmax, s, 71 + s; hermitian = FE <: Real)
+        values = _spin_field(sf, s, lmax, θ, φ)
+        f = FE <: Real ? real.(values) : values
+        p = NUFSHT.make_spin_plan(FE, θaxis, φaxis, lmax, s, NUFSHT.TensorProduct(); nthreads = 1)
+        S = NUFSHT.allocate_coefficients(p)
+        res = NUFSHT.nusht_analyze!(S, f, p; weights = w)
+        Test.@test res.iterations == 0 && res.converged
+        Test.@test relerr(S[:, :, 1], sf) < 1e-10
+        _, _, _, conv = NUFSHT.nusht_analyze!(S, f, p; rtol = 1e-12, maxiter = 400)
+        Test.@test conv && relerr(S[:, :, 1], sf) < 1e-9
+        NUFSHT.close!(p)
     end
 end
 
@@ -518,10 +509,12 @@ end
 # `⟨A x, y⟩ = ⟨x, A† y⟩` with a batch of two: complex fields, and a real spin-0 field with Hermitian
 # coefficients, whose adjoint is taken over the reals.
 Test.@testset "spin adjoint identity" begin
-    lmax, B, M = 32, 2, 900
-    θ, φ = iid_points(M, 990)
+    lmax, B = 32, 2
+    θ = collect(range(0.0, π; length = lmax + 2))
+    φ = range(0.37; step = 2π / (2lmax + 1), length = 2lmax + 1)
+    M = length(θ) * length(φ)
     for (FE, s) in ((ComplexF64, 1), (ComplexF64, -2), (Float64, 0))
-        p = NUFSHT.make_spin_plan(FE, θ, φ, lmax, s; tol = 1e-12, ntrans = B, nthreads = 1)
+        p = NUFSHT.make_spin_plan(FE, θ, φ, lmax, s, NUFSHT.TensorProduct(); ntrans = B, nthreads = 1)
         x = cat((_spin_coeffs(lmax, s, 991 + b; hermitian = FE <: Real) for b in 1:B)...; dims = 3)
         Random.seed!(993)
         y = FE <: Real ? randn(M, B) : randn(ComplexF64, M, B)

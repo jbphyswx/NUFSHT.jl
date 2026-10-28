@@ -52,6 +52,8 @@ Index into the dense `(lmax+1, 2lmax+1)` spin coefficient array for degree `ℓ`
 """
 @inline spin_coeff_index(ℓ::Integer, m::Integer, lmax::Integer) = CartesianIndex(ℓ + 1, m + lmax + 1)
 
+abstract type AbstractSpinNUSHTplan{T<:AbstractFloat} <: AbstractNUSHTplan end
+
 """
     SpinNUSHTplan{T}
 
@@ -64,7 +66,7 @@ colatitudes by the recurrence of `d^ℓ_{m,−s}` in `ℓ`, then one FFT per ord
 `lmax^{3/2} eps(T)` in wider precisions.
 """
 struct SpinNUSHTplan{T<:AbstractFloat, CT3<:AbstractArray{Complex{T},3}, ND<:AbstractNodeSet, E,
-                     FT} <: AbstractNUSHTplan
+                     FT} <: AbstractSpinNUSHTplan{T}
     lmax::Int
     s::Int
     B::Int
@@ -237,8 +239,8 @@ function _fold_weights_adjoint!(G, ::SpinNUSHTplan{T}, ::FoldedReal) where {T}
     return G
 end
 
-coefficient_size(plan::SpinNUSHTplan) = (plan.lmax + 1, 2plan.lmax + 1, plan.B)
-allocate_coefficients(plan::SpinNUSHTplan{T}) where {T} =
+coefficient_size(plan::AbstractSpinNUSHTplan) = (plan.lmax + 1, 2plan.lmax + 1, plan.B)
+allocate_coefficients(plan::AbstractSpinNUSHTplan{T}) where {T} =
     _zeros_like(plan.G, Complex{T}, coefficient_size(plan)...)
 
 Base.show(io::IO, plan::SpinNUSHTplan{T}) where {T} =
@@ -246,14 +248,14 @@ Base.show(io::IO, plan::SpinNUSHTplan{T}) where {T} =
 
 @inline _parity(::Type{T}, k::Integer) where {T} = ifelse(iseven(k), one(T), -one(T))
 
-@inline _spin_npts(plan::SpinNUSHTplan) = length(_θnodes(plan))
+@inline _spin_npts(plan::AbstractSpinNUSHTplan) = _npts(plan)
 
-@inline function _check_spin_coeffs(sf, plan::SpinNUSHTplan)
+@inline function _check_spin_coeffs(sf, plan::AbstractSpinNUSHTplan)
     n = (plan.lmax + 1) * (2plan.lmax + 1) * plan.B
     length(sf) == n || _length_mismatch("spin coefficient array", length(sf), n, "(lmax+1)·(2lmax+1)·B")
     return nothing
 end
-@inline function _check_spin_field(f, plan::SpinNUSHTplan)
+@inline function _check_spin_field(f, plan::AbstractSpinNUSHTplan)
     n = _spin_npts(plan) * plan.B
     length(f) == n || _length_mismatch("spin field array", length(f), n, "M·B")
     return nothing
@@ -332,9 +334,9 @@ end
 
 # The orthogonal projection onto the coefficients of a real spin-0 field,
 # `sf[ℓ,-m] = (-1)^m conj(sf[ℓ,m])`, in place; the identity on a complex-field plan.
-_hermitian_part!(sf, plan::SpinNUSHTplan) = _hermitian_part!(sf, plan, _fold_kind(plan))
-_hermitian_part!(sf, ::SpinNUSHTplan, ::FullModes) = sf
-function _hermitian_part!(sf, plan::SpinNUSHTplan, ::Union{FoldedComplex,FoldedReal})
+_hermitian_part!(sf, plan::AbstractSpinNUSHTplan) = _hermitian_part!(sf, plan, _fold_kind(plan))
+_hermitian_part!(sf, ::AbstractSpinNUSHTplan, ::FullModes) = sf
+function _hermitian_part!(sf, plan::AbstractSpinNUSHTplan, ::Union{FoldedComplex,FoldedReal})
     lmax = plan.lmax
     for b in 1:plan.B, ℓ in 0:lmax, m in 0:ℓ
         _hermitian_pair!(sf, ℓ, m, lmax, b)
@@ -376,19 +378,19 @@ end
 @noinline _build_solve_w!(plan::SpinNUSHTplan{T}) where {T} =
     (plan.solve_w[] = _zeros_like(plan.G, Complex{T}, coefficient_size(plan)...))
 
-FTB.lsmr_allocate_domain(plan::SpinNUSHTplan{T}) where {T} =
+FTB.lsmr_allocate_domain(plan::AbstractSpinNUSHTplan{T}) where {T} =
     (_solve_w(plan); _hermitian_domain(plan) ? _zeros_like(plan.G, T, _herm_len(plan.lmax), plan.B) :
                                                _zeros_like(plan.G, Complex{T}, coefficient_size(plan)...))
-FTB.lsmr_allocate_range(plan::SpinNUSHTplan) =
+FTB.lsmr_allocate_range(plan::AbstractSpinNUSHTplan) =
     _zeros_like(_fbuf(plan), eltype(_fbuf(plan)), _spin_npts(plan), plan.B)
-FTB.lsmr_check_solution(sf, plan::SpinNUSHTplan, ws) = _check_spin_coeffs(sf, plan)
+FTB.lsmr_check_solution(sf, plan::AbstractSpinNUSHTplan, ws) = _check_spin_coeffs(sf, plan)
 
 # The caller's `sf` is the full complex array whatever the iterate is, so a packed solution expands on
 # the way out.
-FTB.lsmr_write!(sf, plan::SpinNUSHTplan, x, k, j) = _write_solution!(sf, x, plan, k, j, _fold_kind(plan))
-_write_solution!(C, x, plan::SpinNUSHTplan, slot::Integer, dstcol::Integer, ::FullModes) =
+FTB.lsmr_write!(sf, plan::AbstractSpinNUSHTplan, x, k, j) = _write_solution!(sf, x, plan, k, j, _fold_kind(plan))
+_write_solution!(C, x, plan::AbstractSpinNUSHTplan, slot::Integer, dstcol::Integer, ::FullModes) =
     FTB.colcopy!(C, dstcol, x, slot, plan.B)
-function _write_solution!(C, x, plan::SpinNUSHTplan, slot::Integer, dstcol::Integer,
+function _write_solution!(C, x, plan::AbstractSpinNUSHTplan, slot::Integer, dstcol::Integer,
                           ::Union{FoldedComplex,FoldedReal})
     lmax = plan.lmax
     K = _herm_len(lmax)
@@ -431,7 +433,7 @@ A real field's coefficients are Hermitian, `sf[ℓ,-m] = (-1)^m conj(sf[ℓ,m])`
 array holds. A solve runs on that subspace. Off it the operator's values are set by the backend's fold,
 so a fit over the whole array has no unique answer.
 """
-@inline _hermitian_domain(plan::SpinNUSHTplan) = _hermitian_domain(_fold_kind(plan))
+@inline _hermitian_domain(plan::AbstractSpinNUSHTplan) = _hermitian_domain(_fold_kind(plan))
 @inline _hermitian_domain(::FullModes) = false
 @inline _hermitian_domain(::Union{FoldedComplex,FoldedReal}) = true
 
@@ -525,17 +527,17 @@ function FTB.lsmr_forward!(u, plan::SpinNUSHTplan, v, c, n)
     return _add_out!(u, _fbuf(plan), plan, n)
 end
 
-@inline _av_coeffs(v, plan::SpinNUSHTplan) = _av_coeffs(v, plan, _fold_kind(plan))
-@inline _av_coeffs(v, ::SpinNUSHTplan, ::FullModes) = v
-@inline _av_coeffs(v, plan::SpinNUSHTplan, ::Union{FoldedComplex,FoldedReal}) =
+@inline _av_coeffs(v, plan::AbstractSpinNUSHTplan) = _av_coeffs(v, plan, _fold_kind(plan))
+@inline _av_coeffs(v, ::AbstractSpinNUSHTplan, ::FullModes) = v
+@inline _av_coeffs(v, plan::AbstractSpinNUSHTplan, ::Union{FoldedComplex,FoldedReal}) =
     _unpack_herm!(_solve_w(plan), v, plan.lmax, plan.B)
 
-_adjoint_full!(plan::SpinNUSHTplan, u, n::Integer) = nusht_type1_spin!(_solve_w(plan), u, plan)
+_adjoint_full!(plan::AbstractSpinNUSHTplan, u, n::Integer) = nusht_type1_spin!(_solve_w(plan), u, plan)
 
 # `v ← w + c v`, a real field's `w` packed onto the Hermitian subspace.
-_fold!(v, plan::SpinNUSHTplan, w, c, n::Integer) = _fold!(v, plan, w, c, n, _fold_kind(plan))
-_fold!(v, plan::SpinNUSHTplan, w, c, n::Integer, ::FullModes) = FTB.colxpby!(v, w, c, n, plan.B)
-_fold!(v, plan::SpinNUSHTplan, w, c, n::Integer, ::Union{FoldedComplex,FoldedReal}) =
+_fold!(v, plan::AbstractSpinNUSHTplan, w, c, n::Integer) = _fold!(v, plan, w, c, n, _fold_kind(plan))
+_fold!(v, plan::AbstractSpinNUSHTplan, w, c, n::Integer, ::FullModes) = FTB.colxpby!(v, w, c, n, plan.B)
+_fold!(v, plan::AbstractSpinNUSHTplan, w, c, n::Integer, ::Union{FoldedComplex,FoldedReal}) =
     _pack_herm!(v, w, plan.lmax, n, c)
 
 """
@@ -561,25 +563,25 @@ That subspace exists only at `s = 0`: conjugation maps spin `s` to `-s`
 is determined, and the solve throws. Its synthesis and adjoint are exact. [`nusht_analyze!`](@ref)
 takes the same plans, with quadrature weights or by this fit.
 """
-function nusht_solve_spin!(sf, f, plan::SpinNUSHTplan; ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan),
+function nusht_solve_spin!(sf, f, plan::AbstractSpinNUSHTplan; ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan),
                            weights = nothing, kwargs...)
     _check_spin_solvable(plan)
     return _solve!(sf, f, _weighted(plan, weights), ws; kwargs...)
 end
 
-function nusht_solve_spin!(sf, f, op::FTB.RangeWeighted{<:SpinNUSHTplan};
+function nusht_solve_spin!(sf, f, op::FTB.RangeWeighted{<:AbstractSpinNUSHTplan};
                            ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(op), kwargs...)
     _check_spin_solvable(op.op)
     return _solve!(sf, f, op, ws; kwargs...)
 end
 
-function nusht_solve_spin!(sf, f_local, plan::SpinNUSHTplan, execution::ComputationalBackends.AbstractExecutionBackend;
+function nusht_solve_spin!(sf, f_local, plan::AbstractSpinNUSHTplan, execution::ComputationalBackends.AbstractExecutionBackend;
                            ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(plan), weights = nothing, kwargs...)
     _check_spin_solvable(plan)
     return _solve!(sf, f_local, _weighted(_point_share(plan, execution), weights), ws; kwargs...)
 end
 
-function nusht_solve_spin!(sf, f_local, op::FTB.RangeWeighted{<:SpinNUSHTplan},
+function nusht_solve_spin!(sf, f_local, op::FTB.RangeWeighted{<:AbstractSpinNUSHTplan},
                            execution::ComputationalBackends.AbstractExecutionBackend;
                            ws::FTB.LSMRWorkspace = FTB.LSMRWorkspace(op), kwargs...)
     _check_spin_solvable(op.op)
@@ -587,11 +589,11 @@ function nusht_solve_spin!(sf, f_local, op::FTB.RangeWeighted{<:SpinNUSHTplan},
 end
 
 # `nusht_analyze!` without weights on a spin plan: the fit.
-_analyze!(sf, f, plan::SpinNUSHTplan, ::Nothing; kwargs...) = nusht_solve_spin!(sf, f, plan; kwargs...)
-_analyze!(sf, f, plan::SpinNUSHTplan, ::Nothing, execution; kwargs...) =
+_analyze!(sf, f, plan::AbstractSpinNUSHTplan, ::Nothing; kwargs...) = nusht_solve_spin!(sf, f, plan; kwargs...)
+_analyze!(sf, f, plan::AbstractSpinNUSHTplan, ::Nothing, execution; kwargs...) =
     nusht_solve_spin!(sf, f, plan, execution; kwargs...)
 
-function _check_spin_solvable(plan::SpinNUSHTplan)
+function _check_spin_solvable(plan::AbstractSpinNUSHTplan)
     (_hermitian_domain(plan) && plan.s != 0) && throw(ArgumentError(
         "a spin-$(plan.s) field cannot be real — conjugation maps spin s to spin -s — so a " *
         "real-field plan at s ≠ 0 has no coefficient subspace on which a fit or an analysis is " *

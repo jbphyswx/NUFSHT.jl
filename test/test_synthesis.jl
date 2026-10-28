@@ -24,7 +24,8 @@ Test.@testset "nusht_type2! accuracy: synthesis vs sph_evaluate on the sph_point
     θ_nodes = vec([θ for θ in pts[1], φ in pts[2]])
     φ_nodes = vec([φ for θ in pts[1], φ in pts[2]])
 
-    plan = NUFSHT.make_plan(θ_nodes, φ_nodes, lmax; tol = 1e-12)
+    φaxis = range(0.0; step = 2π / length(pts[2]), length = length(pts[2]))
+    plan = NUFSHT.make_plan(pts[1], φaxis, lmax, NUFSHT.TensorProduct())
     C_true = rand_coeffs(lmax, 123)
     f_exact = vec(FastSphericalHarmonics.sph_evaluate(C_true))
     f_synth = zeros(length(θ_nodes))

@@ -760,6 +760,7 @@ end
 include("Spin.jl")
 include("RingEngine.jl")
 include("RingPlan.jl")
+include("TensorProduct.jl")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Collections of independent problems, split across an execution backend

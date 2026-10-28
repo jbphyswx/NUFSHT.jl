@@ -45,17 +45,17 @@ const _RING_MIN_WORK = 50_000            # ring steps of a transform below which
 """
     _RingEngine
 
-The ring S-step of a spin plan in the plan's precision `R`: the circle's sample count `N`; per ring `u`
+The latitude recurrence of a spin plan in the plan's precision `R`: per ring `u`
 and `pos`, `u = 1 − x` where `pos` (`σ = 1`) and `1 + x` elsewhere, `pos` shared by the rings of a host
 chunk, and `x + xl`, the ring cosine to twice `R`'s precision (all padded to a whole number of chunks);
 `log2 cos(θ_j/2)` and `log2 sin(θ_j/2)` in `S`, the
 precision of the starting values; and per order `m` the constants of
 `d^{ℓ0}_{m,−s}(θ) = sg · 2^{lC + p1 log2 cos(θ/2) + p2 log2 sin(θ/2)}`. `work` holds one
-[`_RingWork`](@ref) per task on the host, and the device buffers and FFT plans of a device plan.
+latitude workspace per task on the host, with [`_RingWork`](@ref) adding the circle FFTs for a
+scattered-node transform; device plans hold their buffers and FFT plans in `work`.
 """
 struct _RingEngine{R<:AbstractFloat, S<:AbstractFloat, V<:AbstractVector{R}, VB<:AbstractVector{Bool},
                    VS<:AbstractVector{S}, VI<:AbstractVector{Int32}, W}
-    N::Int
     nring::Int
     every::Int             # steps between scale checks of a host chunk; see _ring_check_interval
     u::V
@@ -131,16 +131,15 @@ _ring_check_interval(::Type{R}, lmax::Integer) where {R} =
 const _RING_DEGREES = 16                 # degrees the adjoint carries every ring through per sweep
 
 """
-    _RingWork
+    _LatitudeWork
 
 One host task's buffers for the ring S-step: the step coefficients `A`, `Cp`, `Cm`, `Γ` (`α`, `c₊`, `c₋`,
 `γ`) of an order and the weighted coefficients `cr`, `ci` of up to two batch columns, `(lmax+1)` long;
 the ring values `Fr`, `Fi` of those columns; the adjoint's ring state `Ys`, `Es`, `Ks` between sweeps and
-its per-lane sums `Q` over a sweep's degrees, `(lane, degree, re/im, column)`; and the circle `circ`
-with its in-place FFTs.
+its per-lane sums `Q` over a sweep's degrees, `(lane, degree, re/im, column)`.
 """
-struct _RingWork{R, VR<:AbstractVector{R}, MR<:AbstractMatrix{R}, VK<:AbstractVector{Int32},
-                 AR<:AbstractArray{R,4}, VC<:AbstractVector{Complex{R}}, PF, PB}
+struct _LatitudeWork{R, VR<:AbstractVector{R}, MR<:AbstractMatrix{R}, VK<:AbstractVector{Int32},
+                     AR<:AbstractArray{R,4}}
     A::VR
     Cp::VR
     Cm::VR
@@ -153,19 +152,33 @@ struct _RingWork{R, VR<:AbstractVector{R}, MR<:AbstractMatrix{R}, VK<:AbstractVe
     Es::VR
     Ks::VK
     Q::AR
+end
+
+"""
+    _RingWork
+
+One host task's latitude recurrence workspace and circle buffer with its FFT plans.
+"""
+struct _RingWork{R,W<:_LatitudeWork{R},VC<:AbstractVector{Complex{R}},PF,PB}
+    latitude::W
     circ::VC
     fwd::PF
     bwd::PB
 end
 
-function _ring_work(::Type{R}, lmax::Int, N::Int, padded::Int) where {R}
+function _latitude_work(::Type{R}, lmax::Int, padded::Int) where {R}
     L = lmax + 1
+    return _LatitudeWork(zeros(R, L), zeros(R, L), zeros(R, L), zeros(R, L),
+                         zeros(R, L, 2), zeros(R, L, 2), zeros(R, padded, 2), zeros(R, padded, 2),
+                         zeros(R, padded), zeros(R, padded), zeros(Int32, padded),
+                         zeros(R, _ring_lanes(R), _RING_DEGREES, 2, 2))
+end
+
+function _ring_work(::Type{R}, lmax::Int, N::Int, padded::Int) where {R}
     circ = zeros(Complex{R}, N)
     fwd = FFTW.plan_fft!(circ; flags = FFTW.MEASURE, num_threads = 1)
     bwd = FFTW.plan_bfft!(circ; flags = FFTW.MEASURE, num_threads = 1)
-    return _RingWork(zeros(R, L), zeros(R, L), zeros(R, L), zeros(R, L), zeros(R, L, 2), zeros(R, L, 2),
-                     zeros(R, padded, 2), zeros(R, padded, 2), zeros(R, padded), zeros(R, padded),
-                     zeros(Int32, padded), zeros(R, _ring_lanes(R), _RING_DEGREES, 2, 2), circ, fwd, bwd)
+    return _RingWork(_latitude_work(R, lmax, padded), circ, fwd, bwd)
 end
 
 # Rings padded to whole chunks.
@@ -183,15 +196,15 @@ function _ring_engine(::AbstractArray{R}, lmax::Int, s::Int, ntasks::Int) where 
     padded = _ring_padded(R, lmax)
     t = _ring_tables(R, S, lmax, s, padded)
     work = [_ring_work(R, lmax, t.N, padded) for _ in 1:ntasks]
-    return _RingEngine(t.N, t.nring, _ring_check_interval(R, lmax), t.u, t.pos, t.x, t.xl, t.lc, t.ls, t.lC,
+    return _RingEngine(t.nring, _ring_check_interval(R, lmax), t.u, t.pos, t.x, t.xl, t.lc, t.ls, t.lC,
                        t.p1, t.p2, t.sg, work)
 end
 
 Base.show(io::IO, e::_RingEngine{R}) where {R} =
-    print(io, "_RingEngine{", R, "}(N=", e.N, ", rings=", e.nring, ")")
+    print(io, "_RingEngine{", R, "}(rings=", e.nring, ")")
 
 # Tasks one transform runs on: the plan's, fewer when the ring steps are too few to divide.
-@inline _ring_tasks(plan::SpinNUSHTplan, eng::_RingEngine) =
+@inline _ring_tasks(plan::AbstractSpinNUSHTplan, eng::_RingEngine) =
     min(length(eng.work), max(1, ((plan.lmax + 1)^2 * eng.nring * plan.B) ÷ _RING_MIN_WORK))
 
 @inline _lanes(f::F, ::Type{R}) where {F,R} = ntuple(f, Val(_ring_lanes(R)))
@@ -237,10 +250,10 @@ end
     @inbounds(eng.pos[j0 + 1]) ? f(Val(true)) : f(Val(false))
 
 # Forward: `Fr + iFi` of the chunk's rings for `G` batch columns, `Σ_ℓ (cr + i ci)[ℓ] d^ℓ`.
-@inline _ring_chunk!(w::_RingWork, eng::_RingEngine, i::Int, ℓ0::Int, lmax::Int, j0::Int, g::Val) =
+@inline _ring_chunk!(w::_LatitudeWork, eng::_RingEngine, i::Int, ℓ0::Int, lmax::Int, j0::Int, g::Val) =
     _ring_side(side -> _ring_chunk!(w, eng, i, ℓ0, lmax, j0, g, side), eng, j0)
 
-@inline function _ring_chunk!(w::_RingWork, eng::_RingEngine{R}, i::Int, ℓ0::Int, lmax::Int, j0::Int,
+@inline function _ring_chunk!(w::_LatitudeWork, eng::_RingEngine{R}, i::Int, ℓ0::Int, lmax::Int, j0::Int,
                               ::Val{G}, side::Val) where {R,G}
     u, y, k = _ring_chunk_start(eng, i, j0)
     up, dn = FTB.wigner_d_bounds(R)
@@ -288,10 +301,10 @@ end
 
 # Adjoint: degrees `ℓb … ℓb + nb − 1` of the chunk's rings, from the state left by the previous sweep,
 # their sums `Σ_rings d^ℓ (Fr + iFi)` added per lane into `Q[:, ℓ − ℓb + 1, :, g]`.
-@inline _ring_chunk_adjoint!(w::_RingWork, eng::_RingEngine, ℓb::Int, nb::Int, j0::Int, g::Val) =
+@inline _ring_chunk_adjoint!(w::_LatitudeWork, eng::_RingEngine, ℓb::Int, nb::Int, j0::Int, g::Val) =
     _ring_side(side -> _ring_chunk_adjoint!(w, eng, ℓb, nb, j0, g, side), eng, j0)
 
-@inline function _ring_chunk_adjoint!(w::_RingWork, eng::_RingEngine{R}, ℓb::Int, nb::Int, j0::Int,
+@inline function _ring_chunk_adjoint!(w::_LatitudeWork, eng::_RingEngine{R}, ℓb::Int, nb::Int, j0::Int,
                                       ::Val{G}, side::Val) where {R,G}
     up, dn = FTB.wigner_d_bounds(R)
     u = _ring_geometry(eng, j0)
@@ -350,7 +363,7 @@ end
 
 # `sf[:, m, b … b + G − 1]` for order index `i`: every ring's state at `ℓ0`, then the degrees in sweeps
 # of `_RING_DEGREES`, each sweep's per-lane sums reduced and scaled by `N_ℓ`.
-function _ring_adjoint_sums!(sf, w::_RingWork{R}, eng::_RingEngine, i::Int, b::Int, ℓ0::Int, lmax::Int,
+function _ring_adjoint_sums!(sf, w::_LatitudeWork{R}, eng::_RingEngine, i::Int, b::Int, ℓ0::Int, lmax::Int,
                              ::Val{G}) where {R,G}
     CT = eltype(sf)
     @inbounds for g in 1:G, ℓ in 0:(ℓ0 - 1)
@@ -383,7 +396,7 @@ end
 
 # The step coefficients of order `m` from `ℓ0` to `lmax`.
 # The plain form reads `β` from `Cp`.
-function _ring_order_coeffs!(w::_RingWork{R}, m::Int, n::Int, ℓ0::Int, lmax::Int) where {R}
+function _ring_order_coeffs!(w::_LatitudeWork{R}, m::Int, n::Int, ℓ0::Int, lmax::Int) where {R}
     F = promote_type(R, Float64)
     @inbounds for ℓ in ℓ0:lmax
         α, β, γ, c₊, c₋ = FTB.wigner_d_coeffs(F, ℓ, m, n)
@@ -396,7 +409,7 @@ end
 @inline _ring_norm(::Type{R}, ℓ::Int) where {R} = sqrt(R(2ℓ + 1) / (4 * R(π)))
 
 # `N_ℓ sf[ℓ, m, b]` into slot `g` of the weighted coefficients.
-function _ring_weights!(w::_RingWork{R}, sf, i::Int, b::Int, g::Int, ℓ0::Int, lmax::Int) where {R}
+function _ring_weights!(w::_LatitudeWork{R}, sf, i::Int, b::Int, g::Int, ℓ0::Int, lmax::Int) where {R}
     @inbounds for ℓ in ℓ0:lmax
         c = Complex{R}(sf[ℓ + 1, i, b]) * _ring_norm(R, ℓ)
         w.cr[ℓ + 1, g] = real(c); w.ci[ℓ + 1, g] = imag(c)
@@ -408,9 +421,10 @@ end
 # backward FFT, and the rows of the plan's layout scaled by `1/N`.
 function _ring_modes!(G, w::_RingWork{R}, eng::_RingEngine, plan::SpinNUSHTplan, kind, m::Int, b::Int,
                       g::Int) where {R}
-    N = eng.N; nring = eng.nring; circ = w.circ
+    nring = eng.nring; circ = w.circ; N = length(circ)
+    lat = w.latitude
     @inbounds for j in 1:nring
-        circ[j] = complex(w.Fr[j, g], w.Fi[j, g])
+        circ[j] = complex(lat.Fr[j, g], lat.Fi[j, g])
     end
     σ = _parity(R, m + plan.s)
     @inbounds for j in (nring + 1):N
@@ -430,7 +444,8 @@ end
 # rows absent from the layout counting as zero.
 function _ring_rings!(w::_RingWork{R}, eng::_RingEngine, Ĝ, plan::SpinNUSHTplan, kind, m::Int, b::Int,
                       g::Int) where {R}
-    N = eng.N; nring = eng.nring; circ = w.circ
+    nring = eng.nring; circ = w.circ; N = length(circ)
+    lat = w.latitude
     col = m + plan.lmax + 1
     fill!(circ, zero(Complex{R}))
     @inbounds for mp in _mprange(plan.lmax, kind)
@@ -440,14 +455,14 @@ function _ring_rings!(w::_RingWork{R}, eng::_RingEngine, Ĝ, plan::SpinNUSHTplan
     σ = _parity(R, m + plan.s)
     inv = one(R) / N
     @inbounds begin
-        w.Fr[1, g] = real(circ[1]) * inv; w.Fi[1, g] = imag(circ[1]) * inv
+        lat.Fr[1, g] = real(circ[1]) * inv; lat.Fi[1, g] = imag(circ[1]) * inv
         for j in 2:(nring - 1)
             h = (circ[j] + σ * circ[N - j + 2]) * inv
-            w.Fr[j, g] = real(h); w.Fi[j, g] = imag(h)
+            lat.Fr[j, g] = real(h); lat.Fi[j, g] = imag(h)
         end
-        w.Fr[nring, g] = real(circ[nring]) * inv; w.Fi[nring, g] = imag(circ[nring]) * inv
-        for j in (nring + 1):size(w.Fr, 1)
-            w.Fr[j, g] = zero(R); w.Fi[j, g] = zero(R)
+        lat.Fr[nring, g] = real(circ[nring]) * inv; lat.Fi[nring, g] = imag(circ[nring]) * inv
+        for j in (nring + 1):size(lat.Fr, 1)
+            lat.Fr[j, g] = zero(R); lat.Fi[j, g] = zero(R)
         end
     end
     return w
@@ -458,20 +473,21 @@ function _ring_forward_order!(G, sf, plan::SpinNUSHTplan, eng::_RingEngine{R}, w
     lmax = plan.lmax; n = -plan.s
     ℓ0 = max(abs(m), abs(n))
     i = m + lmax + 1
-    _ring_order_coeffs!(w, m, n, ℓ0, lmax)
+    lat = w.latitude
+    _ring_order_coeffs!(lat, m, n, ℓ0, lmax)
     b = 1
     while b <= plan.B
         if b < plan.B
-            _ring_weights!(w, sf, i, b, 1, ℓ0, lmax); _ring_weights!(w, sf, i, b + 1, 2, ℓ0, lmax)
+            _ring_weights!(lat, sf, i, b, 1, ℓ0, lmax); _ring_weights!(lat, sf, i, b + 1, 2, ℓ0, lmax)
             for j0 in 0:_ring_lanes(R):(length(eng.u) - 1)
-                _ring_chunk!(w, eng, i, ℓ0, lmax, j0, Val(2))
+                _ring_chunk!(lat, eng, i, ℓ0, lmax, j0, Val(2))
             end
             _ring_modes!(G, w, eng, plan, kind, m, b, 1); _ring_modes!(G, w, eng, plan, kind, m, b + 1, 2)
             b += 2
         else
-            _ring_weights!(w, sf, i, b, 1, ℓ0, lmax)
+            _ring_weights!(lat, sf, i, b, 1, ℓ0, lmax)
             for j0 in 0:_ring_lanes(R):(length(eng.u) - 1)
-                _ring_chunk!(w, eng, i, ℓ0, lmax, j0, Val(1))
+                _ring_chunk!(lat, eng, i, ℓ0, lmax, j0, Val(1))
             end
             _ring_modes!(G, w, eng, plan, kind, m, b, 1)
             b += 1
@@ -484,16 +500,17 @@ function _ring_adjoint_order!(sf, Ĝ, plan::SpinNUSHTplan, eng::_RingEngine, w::
     lmax = plan.lmax; n = -plan.s
     ℓ0 = max(abs(m), abs(n))
     i = m + lmax + 1
-    _ring_order_coeffs!(w, m, n, ℓ0, lmax)
+    lat = w.latitude
+    _ring_order_coeffs!(lat, m, n, ℓ0, lmax)
     b = 1
     while b <= plan.B
         if b < plan.B
             _ring_rings!(w, eng, Ĝ, plan, kind, m, b, 1); _ring_rings!(w, eng, Ĝ, plan, kind, m, b + 1, 2)
-            _ring_adjoint_sums!(sf, w, eng, i, b, ℓ0, lmax, Val(2))
+            _ring_adjoint_sums!(sf, lat, eng, i, b, ℓ0, lmax, Val(2))
             b += 2
         else
             _ring_rings!(w, eng, Ĝ, plan, kind, m, b, 1)
-            _ring_adjoint_sums!(sf, w, eng, i, b, ℓ0, lmax, Val(1))
+            _ring_adjoint_sums!(sf, lat, eng, i, b, ℓ0, lmax, Val(1))
             b += 1
         end
     end

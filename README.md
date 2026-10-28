@@ -64,6 +64,32 @@ The scalar plans use FastTransforms' real harmonics (no Condon–Shortley phase)
 `spin0_to_scalar!(C, sf)` convert between the two coefficient arrays, so both plans synthesize the same
 field.
 
+## Tensor-product grids
+
+Pass `TensorProduct()` with separate colatitude and longitude axes to use latitude degree sums and
+longitude FFTs. Longitudes cover a full circle at equal spacing, with the endpoint excluded, and
+number at least `2lmax + 1`. The field layout is `(length(θ), length(φ), ntrans)`, latitude first.
+
+```julia
+using NUFSHT: NUFSHT
+using FlowTransformBindings: FlowTransformBindings as FTB
+
+lmax = 32
+q = FTB.gauss_legendre(Float64, lmax + 1)
+θ = acos.(q.μ)
+φ = range(0.0; step = 2π / (2lmax + 1), length = 2lmax + 1)
+plan = NUFSHT.make_plan(Float64, θ, φ, lmax, NUFSHT.TensorProduct())
+C = NUFSHT.allocate_coefficients(plan)
+f = zeros(length(θ), length(φ), 1)
+NUFSHT.nusht_type2!(f, C, plan)
+w = repeat(q.w, length(φ)) .* step(φ)
+NUFSHT.nusht_analyze!(C, f, plan; weights = w)
+```
+
+`make_spin_plan(FE, θ, φ, lmax, s, TensorProduct())` uses the spin coefficient layout. Both forms
+support batches, quadrature analysis, least-squares fits, host execution and device execution through
+KernelAbstractions. The axes are fixed at construction.
+
 ## Installation
 
 ```julia

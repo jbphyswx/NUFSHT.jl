@@ -12,6 +12,8 @@ AbstractNUSHTplan
 AbstractScalarNUSHTplan
 NUSHTplan
 RingNUSHTplan
+TensorProduct
+TensorProductSpinPlan
 close!
 set_nodes!
 plan_memory
@@ -75,6 +77,7 @@ spin0_to_scalar!
 NUFSHT.wigner_d
 NUFSHT._RingEngine
 NUFSHT._RingWork
+NUFSHT._LatitudeWork
 NUFSHT._ring_tables
 NUFSHT._ring_check_interval
 ```

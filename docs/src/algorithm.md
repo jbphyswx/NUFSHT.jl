@@ -207,6 +207,18 @@ analysis are therefore the scalar plan's, every step in the plan's precision on 
 conversion reads only the slots of degree ``\ell \leq l_\text{max}``, and the adjoint writes zero in the
 supernumerary ones.
 
+## Tensor-product grids
+
+With `TensorProduct()`, the supplied colatitudes are the latitude rings. The same recurrence evaluates
+``F_m(\theta_i) = \sum_\ell {}_s f_{\ell m} N_\ell d^\ell_{m,-s}(\theta_i)`` on each ring, then a longitude
+FFT evaluates ``\sum_m F_m(\theta_i)e^{im\varphi_j}``. A phase ``e^{im\varphi_0}`` accounts for the
+longitude origin. The adjoint reverses those operations, with the latitude recurrence summing each
+degree over the supplied rings. Scalar coefficients pass through the spin-0 conversion.
+
+Gauss–Legendre latitude weights times the longitude spacing give an exact analysis rule for a field
+of degree at most `lmax` when there are at least `lmax + 1` latitudes and `2lmax + 1` longitudes.
+Fields have layout `(nlatitude, nlongitude, ntrans)`; coefficients retain their scalar or spin layout.
+
 ## References
 
 - Merilees, P.E. (1973): The pseudospectral approximation applied to the shallow water equations on a sphere. *Atmosphere*, 11(1), 13–20.

@@ -31,6 +31,13 @@ NUFSHT._make_plan(::Type{FE}, θ, φ, lmax, b::ComputationalBackends.GPUBackend;
 NUFSHT._make_spin_plan(::Type{FE}, θ, φ, lmax, s, b::ComputationalBackends.GPUBackend; kwargs...) where {FE} =
     NUFSHT._build_spin_plan(FE, _on_device(b, θ), _on_device(b, φ), lmax, s; kwargs...)
 
+function NUFSHT._tensor_product_plan(::Type{FE}, θ, φ, lmax::Int, s::Int,
+                                     b::ComputationalBackends.GPUBackend, directions;
+                                     ntrans, nthreads) where {FE}
+    nthreads === nothing || nthreads == 1 || throw(ArgumentError("device plans take nthreads = 1"))
+    return NUFSHT._build_tensor_product_plan(FE, _on_device(b, θ), φ, lmax, s, 1, directions, Int(ntrans))
+end
+
 # A scalar plan over device nodes runs on the ring S-step, whose every step has a kernel here.
 NUFSHT._build_plan(::Type{FE}, θ::GPUArraysCore.AbstractGPUArray, φ, lmax; kwargs...) where {FE<:Number} =
     NUFSHT._build_ring_plan(FE, θ, φ, lmax; kwargs...)
@@ -48,22 +55,26 @@ NUFSHT._build_plan(::Type{FE}, θ::GPUArraysCore.AbstractGPUArray, φ, lmax; kwa
 # Launches on one backend run in order, so only a host read needs a sync.
 
 """
-    _RingDevice
+    _LatitudeDevice
 
-A device ring engine's buffers: the circle `C`, `(N, 2lmax+1, B)`; the adjoint's per-block degree sums
+A device latitude recurrence's buffers: the values `C`, `(N, 2lmax+1, B)`; the adjoint's per-block degree sums
 `P`, `(lmax+1, nblk, 2lmax+1, B)`; the step coefficient tables `A`, `Cp`, `Cm`, `Γ` (`α`, `c₊`, `c₋`,
-`γ`), `(lmax+1, lmax+1)`; the in-place FFTs along the circle; and the adjoint's workgroup width `wg`.
+`γ`), `(lmax+1, lmax+1)`; and the adjoint's workgroup width `wg`.
 """
-struct _RingDevice{CA, PA, MA, PF, PB}
+struct _LatitudeDevice{CA,PA,MA}
     C::CA
     P::PA
     A::MA
     Cp::MA
     Cm::MA
     Γ::MA
+    wg::Int
+end
+
+struct _RingDevice{W,PF,PB}
+    latitude::W
     fwd::PF
     bwd::PB
-    wg::Int
 end
 
 # The coefficient tables of `n = −s` in `R`, formed in `Float64`.
@@ -89,9 +100,26 @@ function NUFSHT._spin_engine(θ::GPUArraysCore.AbstractGPUArray{R}, lmax::Int, s
     C = NUFSHT._zeros_like(θ, Complex{R}, t.N, 2lmax + 1, B)
     wg = min(1024, nextpow(2, nring))
     P = NUFSHT._zeros_like(θ, Complex{R}, lmax + 1, cld(nring, wg), 2lmax + 1, B)
-    work = _RingDevice(C, P, dev(A), dev(Cp), dev(Cm), dev(Γ), NUFSHT.FFTW.plan_fft!(C, 1),
-                       NUFSHT.FFTW.plan_bfft!(C, 1), wg)
-    return NUFSHT._RingEngine(t.N, t.nring, NUFSHT._ring_check_interval(R, lmax), dev(t.u), dev(t.pos),
+    latitude = _LatitudeDevice(C, P, dev(A), dev(Cp), dev(Cm), dev(Γ), wg)
+    work = _RingDevice(latitude, NUFSHT.FFTW.plan_fft!(C, 1), NUFSHT.FFTW.plan_bfft!(C, 1))
+    return NUFSHT._RingEngine(t.nring, NUFSHT._ring_check_interval(R, lmax), dev(t.u), dev(t.pos),
+                              dev(t.x), dev(t.xl), dev(t.lc), dev(t.ls), dev(t.lC), dev(t.p1), dev(t.p2),
+                              dev(t.sg), work)
+end
+
+function NUFSHT._tensor_latitude(θ::GPUArraysCore.AbstractGPUArray{R}, lmax::Int, s::Int, ::Int,
+                                 B::Int) where {R}
+    backend = KernelAbstractions.get_backend(θ)
+    S = KernelAbstractions.supports_float64(backend) ? promote_type(R, Float64) : R
+    nring = length(θ)
+    padded = cld(nring, NUFSHT._ring_lanes(R)) * NUFSHT._ring_lanes(R)
+    t = NUFSHT._tensor_tables(R, S, Array(θ), lmax, s, padded)
+    dev(a) = NUFSHT._to_like(θ, a)
+    A, Cp, Cm, Γ = _ring_coeff_tables(R, lmax, -s)
+    C = NUFSHT._zeros_like(θ, Complex{R}, nring, 2lmax + 1, B)
+    P = NUFSHT._zeros_like(θ, Complex{R}, lmax + 1, cld(nring, 256), 2lmax + 1, B)
+    work = _LatitudeDevice(C, P, dev(A), dev(Cp), dev(Cm), dev(Γ), 256)
+    return NUFSHT._RingEngine(nring, NUFSHT._ring_check_interval(R, lmax), dev(t.u), dev(t.pos),
                               dev(t.x), dev(t.xl), dev(t.lc), dev(t.ls), dev(t.lC), dev(t.p1), dev(t.p2),
                               dev(t.sg), work)
 end
@@ -111,10 +139,10 @@ end
     return NUFSHT.FTB.wigner_d_step(σα, c, σγ, σ, u, y, e)
 end
 
-@kernel function _ring_forward_kern!(C, @Const(sf), @Const(u), @Const(pos), @Const(lc), @Const(ls),
-                                     @Const(lC), @Const(p1), @Const(p2), @Const(sg), @Const(A), @Const(Cp),
-                                     @Const(Cm), @Const(Γ), lmax, s, N, nring)
-    j, i, b = @index(Global, NTuple)
+@inline function _latitude_value(sf, geometry, starts, coefficients, lmax, s, j, i, b)
+    u, pos, lc, ls = geometry
+    lC, p1, p2, sg = starts
+    A, Cp, Cm, Γ = coefficients
     R = eltype(u)
     m = i - lmax - 1
     up, dn = NUFSHT.FTB.wigner_d_bounds(R)
@@ -129,11 +157,60 @@ end
             yn, en = _ring_device_step(A, Cp, Cm, Γ, ℓ, m, pj, uj, y, e)
             y, e, k = NUFSHT.FTB.wigner_d_rescale(yn, en, k, up, dn)
         end
+        return acc
+    end
+end
+
+@kernel function _ring_forward_kern!(C, @Const(sf), @Const(u), @Const(pos), @Const(lc), @Const(ls),
+                                     @Const(lC), @Const(p1), @Const(p2), @Const(sg), @Const(A), @Const(Cp),
+                                     @Const(Cm), @Const(Γ), lmax, s, N, nring)
+    j, i, b = @index(Global, NTuple)
+    acc = _latitude_value(sf, (u, pos, lc, ls), (lC, p1, p2, sg), (A, Cp, Cm, Γ), lmax, s, j, i, b)
+    @inbounds begin
         C[j, i, b] = acc
         if 1 < j < nring
-            C[N - j + 2, i, b] = NUFSHT._parity(R, m + s) * acc
+            C[N - j + 2, i, b] = NUFSHT._parity(real(eltype(C)), i - lmax - 1 + s) * acc
         end
     end
+end
+
+@kernel function _tensor_forward_kern!(G, @Const(sf), @Const(u), @Const(pos), @Const(lc), @Const(ls),
+                                       @Const(lC), @Const(p1), @Const(p2), @Const(sg), @Const(A), @Const(Cp),
+                                       @Const(Cm), @Const(Γ), @Const(phase), lmax, s, nlon)
+    j, i, b = @index(Global, NTuple)
+    col = mod(i - lmax - 1, nlon) + 1
+    acc = _latitude_value(sf, (u, pos, lc, ls), (lC, p1, p2, sg), (A, Cp, Cm, Γ), lmax, s, j, i, b)
+    @inbounds G[j, col, b] = phase[i] * acc
+end
+
+@kernel function _tensor_orders_kern!(C, @Const(G), @Const(phase), lmax, nlon)
+    j, i, b = @index(Global, NTuple)
+    col = mod(i - lmax - 1, nlon) + 1
+    @inbounds C[j, i, b] = conj(phase[i]) * G[j, col, b]
+end
+
+function NUFSHT._tensor_synthesis!(G::GPUArraysCore.AbstractGPUArray, sf, plan, eng::NUFSHT._RingEngine)
+    w = eng.work
+    backend = KernelAbstractions.get_backend(G)
+    fill!(G, zero(eltype(G)))
+    _tensor_forward_kern!(backend)(G, _as3(sf, plan.lmax), eng.u, eng.pos, eng.lc, eng.ls, eng.lC,
+                                   eng.p1, eng.p2, eng.sg, w.A, w.Cp, w.Cm, w.Γ, plan.phase,
+                                   plan.lmax, plan.s, size(G, 2); ndrange = size(w.C))
+    return G
+end
+
+function NUFSHT._tensor_adjoint!(sf::GPUArraysCore.AbstractGPUArray, G, plan, eng::NUFSHT._RingEngine)
+    w = eng.work
+    backend = KernelAbstractions.get_backend(sf)
+    _tensor_orders_kern!(backend)(w.C, G, plan.phase, plan.lmax, size(G, 2); ndrange = size(w.C))
+    nblk = size(w.P, 2)
+    _ring_adjoint_kern!(backend, (256, 1, 1))(w.P, w.C, eng.u, eng.pos, eng.lc, eng.ls, eng.lC, eng.p1,
+                                            eng.p2, eng.sg, w.A, w.Cp, w.Cm, w.Γ, plan.lmax, plan.s,
+                                            eng.nring, Val(256);
+                                            ndrange = (nblk * 256, 2plan.lmax + 1, plan.B))
+    _ring_blocks_kern!(backend)(_as3(sf, plan.lmax), w.P, nblk;
+                                ndrange = (plan.lmax + 1, 2plan.lmax + 1, plan.B))
+    return sf
 end
 
 # Row `r` of the layout holds `m' = r − 1 + mp0`: `mp0 = −lmax` on the full layout, `0` on a folded one.
@@ -229,24 +306,26 @@ end
 
 function NUFSHT._assemble_G_impl!(G::GPUArraysCore.AbstractGPUArray, sf, plan::NUFSHT.SpinNUSHTplan,
                                   eng::NUFSHT._RingEngine)
-    lmax = plan.lmax; w = eng.work
+    lmax = plan.lmax; w = eng.work.latitude
+    N = size(w.C, 1)
     backend = KernelAbstractions.get_backend(G)
     _ring_forward_kern!(backend)(w.C, _as3(sf, lmax), eng.u, eng.pos, eng.lc, eng.ls, eng.lC, eng.p1, eng.p2,
-                                 eng.sg, w.A, w.Cp, w.Cm, w.Γ, lmax, plan.s, eng.N, eng.nring;
+                                 eng.sg, w.A, w.Cp, w.Cm, w.Γ, lmax, plan.s, N, eng.nring;
                                  ndrange = (eng.nring, 2lmax + 1, plan.B))
-    w.bwd * w.C
-    _ring_modes_kern!(backend)(G, w.C, eng.N, _row_origin(G, lmax); ndrange = size(G))
+    eng.work.bwd * w.C
+    _ring_modes_kern!(backend)(G, w.C, N, _row_origin(G, lmax); ndrange = size(G))
     return G
 end
 
 function NUFSHT._assemble_G_adjoint_impl!(sf::GPUArraysCore.AbstractGPUArray, Ĝ, plan::NUFSHT.SpinNUSHTplan,
                                           eng::NUFSHT._RingEngine)
-    lmax = plan.lmax; w = eng.work
+    lmax = plan.lmax; w = eng.work.latitude
+    N = size(w.C, 1)
     backend = KernelAbstractions.get_backend(sf)
     fill!(w.C, zero(eltype(w.C)))
-    _ring_scatter_kern!(backend)(w.C, Ĝ, eng.N, _row_origin(Ĝ, lmax); ndrange = size(Ĝ))
-    w.fwd * w.C
-    _ring_half_kern!(backend)(w.C, lmax, plan.s, eng.N, eng.nring; ndrange = (eng.nring, 2lmax + 1, plan.B))
+    _ring_scatter_kern!(backend)(w.C, Ĝ, N, _row_origin(Ĝ, lmax); ndrange = size(Ĝ))
+    eng.work.fwd * w.C
+    _ring_half_kern!(backend)(w.C, lmax, plan.s, N, eng.nring; ndrange = (eng.nring, 2lmax + 1, plan.B))
     nblk = size(w.P, 2)
     _ring_adjoint_kern!(backend, (w.wg, 1, 1))(w.P, w.C, eng.u, eng.pos, eng.lc, eng.ls, eng.lC, eng.p1,
                                                eng.p2, eng.sg, w.A, w.Cp, w.Cm, w.Γ, lmax, plan.s, eng.nring,
@@ -293,7 +372,7 @@ function NUFSHT._pack_herm!(p::GPUArraysCore.AbstractGPUArray, g, lmax::Integer,
     return p
 end
 
-function NUFSHT._write_solution!(C::GPUArraysCore.AbstractGPUArray, x, plan::NUFSHT.SpinNUSHTplan,
+function NUFSHT._write_solution!(C::GPUArraysCore.AbstractGPUArray, x, plan::NUFSHT.AbstractSpinNUSHTplan,
                                  slot::Integer, dstcol::Integer,
                                  ::Union{NUFSHT.FoldedComplex,NUFSHT.FoldedReal})
     lmax = plan.lmax
@@ -359,7 +438,7 @@ end
     end
 end
 
-function NUFSHT._hermitian_part!(sf::GPUArraysCore.AbstractGPUArray, plan::NUFSHT.SpinNUSHTplan,
+function NUFSHT._hermitian_part!(sf::GPUArraysCore.AbstractGPUArray, plan::NUFSHT.AbstractSpinNUSHTplan,
                                  ::Union{NUFSHT.FoldedComplex,NUFSHT.FoldedReal})
     lmax = plan.lmax
     backend = KernelAbstractions.get_backend(sf)

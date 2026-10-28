@@ -184,12 +184,13 @@ Test.@testset "KernelAbstractions extension: device analysis and spin-0 conversi
     lmax = 6
     θ, φ, w = gauss_legendre_grid(lmax)
     M = length(θ)
-    nb = HostBounceNUFFT()
+    θaxis = θ[1:(lmax + 1)]
+    φaxis = range(0.0; step = 2π / (2lmax + 1), length = 2lmax + 1)
     gpu = ComputationalBackends.GPUBackend(JLArrays.JLBackend())
 
     C = rand_coeffs(lmax, 830)
     f = synth_ref(C, lmax, θ, φ)
-    p = NUFSHT.make_plan(Float64, θ, φ, lmax; execution = gpu, nufft = nb)
+    p = NUFSHT.make_plan(Float64, θaxis, φaxis, lmax, NUFSHT.TensorProduct(); execution = gpu)
     Cd = NUFSHT.allocate_coefficients(p)
     res = no_scalar(() -> NUFSHT.nusht_analyze!(Cd, J(f), p; weights = J(w)))
     Test.@test res.iterations == 0 && res.converged
@@ -217,13 +218,13 @@ Test.@testset "KernelAbstractions extension: device analysis and spin-0 conversi
     end
     f0 = [real(sum(sh[NUFSHT.spin_coeff_index(ℓ, m, lmax)] * NUFSHT.sYlm(0, ℓ, m, θ[j], φ[j])
                    for ℓ in 0:lmax for m in -ℓ:ℓ)) for j in 1:M]
-    p0 = NUFSHT.make_spin_plan(Float64, θ, φ, lmax, 0; execution = gpu, nufft = nb)
+    p0 = NUFSHT.make_spin_plan(Float64, θaxis, φaxis, lmax, 0, NUFSHT.TensorProduct(); execution = gpu)
     S0 = NUFSHT.allocate_coefficients(p0)
-    no_scalar(() -> NUFSHT.nusht_analyze!(S0, J(f0), p0; weights = J(w)))
+    no_scalar(() -> NUFSHT.nusht_analyze!(S0, J(f0), p0; rtol = 1e-12, maxiter = 100))
     Test.@test relerr(Array(S0)[:, :, 1], sh) < 1e-10
     NUFSHT.close!(p0)
 
-    pc = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 0; execution = gpu, nufft = nb)
+    pc = NUFSHT.make_spin_plan(ComplexF64, θaxis, φaxis, lmax, 0, NUFSHT.TensorProduct(); execution = gpu)
     sfd = NUFSHT.allocate_coefficients(pc)
     no_scalar(() -> NUFSHT.scalar_to_spin0!(sfd, J(C)))
     g = J(zeros(ComplexF64, M))
