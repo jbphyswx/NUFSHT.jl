@@ -216,14 +216,14 @@ function _tensor_values!(f, G, ::Type{<:Real})
 end
 
 function _tensor_values!(f, G, ::Type{<:Complex})
-    f .= reshape(G, size(f))
+    copyto!(f, G)
     return f
 end
 
 function nusht_type1_spin!(sf, f, plan::TensorProductSpinPlan)
     _check_spin_coeffs(sf, plan)
     _check_spin_field(f, plan)
-    plan.G .= reshape(f, size(plan.G))
+    copyto!(plan.G, f)
     return _strengths_adjoint!(sf, plan)
 end
 
@@ -262,7 +262,7 @@ function _quadrature!(sf, f, w, plan::TensorProductSpinPlan)
     _check_spin_field(f, plan)
     _check_weights(w, plan)
     _copy_weighted!(_fbuf(plan), f, w)
-    plan.G .= reshape(_fbuf(plan), size(plan.G))
+    copyto!(plan.G, _fbuf(plan))
     _strengths_adjoint!(sf, plan)
     return _hermitian_part!(sf, plan)
 end
